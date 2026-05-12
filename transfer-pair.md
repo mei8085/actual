@@ -400,6 +400,312 @@ if (transferTrans.is_child) {
 
 ---
 
+## 撤销边界场景深度分析
+
+### 1. 配对交易同时删除的边界场景
+
+#### 问题场景
+
+转账配对通过 `transfer_id` 双向绑定：
+- 交易 A 的 `transfer_id` = 交易 B 的 ID
+- 交易 B 的 `transfer_id` = 交易 A 的 ID
+
+当用户**同时选中两笔配对交易并批量删除**时，会发生什么？
+
+#### 执行时序
+
+位置：`packages/loot-core/src/server/transactions/index.ts:94-149`
+
+```
+Step 1: 数据库删除阶段（先于转账处理）
+  ├── 调用 deleteTransaction(A)
+  │   └── 实际上设置 tombstone = 1（软删除）
+  └── 调用 deleteTransaction(B)
+      └── 实际上设置 tombstone = 1
+
+Step 2: 转账后处理阶段
+  ├── 调用 onDelete(A)
+  │   └── 检查 A.transfer_id 非空 → 调用 removeTransfer(A)
+  │       ├── getTransaction(B)
+  │       │   └── 查询 v_transactions 视图
+  │       │       └── 视图过滤条件: tombstone = 0
+  │       │           └── B 已被设置 tombstone=1 → 返回 undefined
+  │       └── transferTrans = undefined
+  │           └── 跳过配对交易处理块
+  └── 调用 onDelete(B)
+      └── 检查 B.transfer_id 非空 → 调用 removeTransfer(B)
+          ├── getTransaction(A)
+          │   └── A 已被设置 tombstone=1 → 返回 undefined
+          └── transferTrans = undefined
+              └── 跳过配对交易处理块
+```
+
+#### 关键代码：软删除机制
+
+位置：`packages/loot-core/src/server/db/index.ts:258-268`
+
+```typescript
+export async function delete_(table, id) {
+  await sendMessages([
+    {
+      dataset: table,
+      row: id,
+      column: 'tombstone',
+      value: 1,           // 关键：不是物理删除，而是打 tombstone 标记
+      timestamp: Timestamp.send(),
+    },
+  ]);
+}
+```
+
+#### 关键代码：getTransaction 的视图过滤
+
+位置：`packages/loot-core/src/server/db/index.ts:781-788`
+
+```typescript
+export async function getTransaction(id: DbViewTransaction['id']) {
+  const rows = await selectWithSchema(
+    'transactions',
+    'SELECT * FROM v_transactions WHERE id = ?',  // v_transactions 视图
+    [id],
+  );
+  return rows[0];  // 找不到时返回 undefined
+}
+```
+
+#### 兜底处理方案
+
+`removeTransfer` 函数已经内置了兜底逻辑：
+
+位置：`packages/loot-core/src/server/transactions/transfer.ts:95-118`
+
+```typescript
+export async function removeTransfer(transaction) {
+  const transferTrans = await db.getTransaction(transaction.transfer_id);
+
+  if (transferTrans) {
+    // 配对交易存在 → 正常处理（删除或解除配对）
+    if (transferTrans.is_child) {
+      await db.updateTransaction({
+        id: transaction.transfer_id,
+        transfer_id: null,
+        payee: null,
+      });
+    } else {
+      await db.deleteTransaction({ id: transaction.transfer_id });
+    }
+  }
+  // ⭐ 兜底逻辑：无论配对交易是否找到，都要清理当前交易的 transfer_id
+  await db.updateTransaction({ id: transaction.id, transfer_id: null });
+  return { id: transaction.id, transfer_id: null };
+}
+```
+
+#### 为什么这是安全的？
+
+1. **数据库删除先于转账处理**：两笔交易已经被设置 `tombstone = 1`，从业务视角已经"删除"
+2. **`getTransaction` 返回 undefined 不是错误**：代码用 `if (transferTrans)` 显式检查，这是预期的正常场景
+3. **兜底更新保证幂等性**：即使配对交易找不到，当前交易的 `transfer_id` 也会被设为 null，避免留下"悬挂引用"
+
+### 2. 先后快速删除的边界场景
+
+#### 问题场景
+
+用户在短时间内连续删除两笔配对交易（例如在 UI 上快速点击两次）。
+
+#### 时序分析
+
+```
+时刻 t1: 删除交易 A
+  ├── 数据库: A.tombstone = 1
+  └── 转账处理:
+      ├── onDelete(A) → removeTransfer(A)
+      │   ├── getTransaction(B) → B 还存在
+      │   ├── deleteTransaction(B) → B.tombstone = 1
+      │   └── updateTransaction(A) → A.transfer_id = null
+      └── 完成
+
+时刻 t2: 删除交易 B（用户第二次点击）
+  ├── 数据库: B.tombstone 已是 1（重复设置无影响）
+  └── 转账处理:
+      ├── onDelete(B) → removeTransfer(B)
+      │   ├── getTransaction(A) → A.tombstone=1 → undefined
+      │   └── 兜底逻辑: updateTransaction(B) → B.transfer_id = null
+      └── 完成（无副作用）
+```
+
+#### 为什么不会出问题？
+
+1. **tombstone 是幂等操作**：重复设置 `tombstone = 1` 不会产生副作用
+2. **`removeTransfer` 是幂等函数**：
+   - 如果配对交易已被删除 → 跳过处理块
+   - 无论如何都会清理当前交易的 `transfer_id`
+3. **并发安全**：即使两次删除几乎同时发生，最多只会：
+   - 第一笔删除时正常删除配对交易
+   - 第二笔删除时发现配对交易已不存在，执行兜底逻辑
+
+### 3. 兜底时哪些字段会被清理？
+
+#### 场景 A：配对交易存在（正常撤销）
+
+| 字段 | 处理方式 |
+|-----|---------|
+| `transfer_id` | 设为 null（双向） |
+| `payee` | 仅当是子交易时设为 null |
+| 其他字段 | 保持不变 |
+
+代码路径：
+```typescript
+if (transferTrans) {
+  if (transferTrans.is_child) {
+    // 子交易：只清除配对标识
+    await db.updateTransaction({
+      id: transaction.transfer_id,
+      transfer_id: null,  // 清除配对引用
+      payee: null,        // 清除转账收款人
+    });
+  } else {
+    // 普通交易：直接删除
+    await db.deleteTransaction({ id: transaction.transfer_id });
+  }
+}
+// 当前交易的 transfer_id 总是被清理
+await db.updateTransaction({ id: transaction.id, transfer_id: null });
+```
+
+#### 场景 B：配对交易不存在（兜底场景）
+
+| 字段 | 处理方式 |
+|-----|---------|
+| `transfer_id` | 设为 null（仅当前交易） |
+| `payee` | **不处理**（配对交易不存在，无需处理） |
+| 其他字段 | 保持不变 |
+
+代码路径：
+```typescript
+const transferTrans = await db.getTransaction(transaction.transfer_id);
+// transferTrans = undefined → 跳过 if 块
+
+// 只执行这一行兜底逻辑
+await db.updateTransaction({ id: transaction.id, transfer_id: null });
+```
+
+### 4. 为什么不会破坏拆分交易一致性？
+
+#### 拆分交易数据结构
+
+```
+父交易 (is_parent = true)
+  ├── 子交易 1 (is_child = true, parent_id = 父ID)
+  ├── 子交易 2 (is_child = true, parent_id = 父ID)
+  └── 子交易 3 (is_child = true, parent_id = 父ID)
+```
+
+#### 保护机制 1：父交易不能自动创建转账
+
+位置：`transfer.ts:48-54`
+
+```typescript
+export async function addTransfer(transaction, transferredAccount) {
+  if (transaction.is_parent) {
+    // 父交易不能创建转账
+    // 应该用子交易来创建转账
+    return null;
+  }
+  // ... 后续逻辑
+}
+```
+
+**原因**：父交易的金额是子交易的总和，如果父交易创建转账，会导致金额重复计算。
+
+#### 保护机制 2：父交易变为拆分时自动解除转账
+
+位置：`transfer.ts:158-160`
+
+```typescript
+if (transaction.is_parent) {
+  // 如果普通交易变成了父交易
+  // 必须移除它的转账配对
+  return removeTransfer(transaction);
+}
+```
+
+**原因**：防止出现"既是父交易又是转账"的不一致状态。
+
+#### 保护机制 3：子交易作为配对时，撤销不删除
+
+位置：`transfer.ts:103-111`
+
+```typescript
+if (transferTrans.is_child) {
+  // ⭐ 关键保护：子交易不能删除
+  // 只能解除配对关系，变成普通交易
+  await db.updateTransaction({
+    id: transaction.transfer_id,
+    transfer_id: null,  // 解除配对
+    payee: null,        // 清除转账收款人
+  });
+} else {
+  // 普通配对交易：可以删除
+  await db.deleteTransaction({ id: transaction.transfer_id });
+}
+```
+
+#### 为什么不能删除子交易？
+
+**数据一致性风险**：
+
+```
+拆分交易结构：
+父交易 P (is_parent=true, amount=100)
+  ├── 子交易 C1 (is_child=true, amount=60, parent_id=P)
+  └── 子交易 C2 (is_child=true, amount=40, parent_id=P)
+
+如果 C2 是转账配对交易，被删除时：
+
+❌ 错误做法（直接删除）：
+  ├── C2 被物理删除
+  └── 父交易 P 的 amount 仍为 100
+      └── 但子交易总和 = 60 ≠ 100 → 数据不一致！
+
+✅ 正确做法（解除配对）：
+  ├── C2 的 transfer_id = null
+  ├── C2 的 payee = null
+  ├── C2 仍然存在
+  └── 父交易 P 的 amount = 100，子交易总和 = 60 + 40 = 100 → 一致！
+```
+
+#### 设计原则
+
+| 交易类型 | 撤销时处理 | 原因 |
+|---------|-----------|------|
+| **普通配对交易** | 删除 | 它是系统自动创建的，用户没手动维护它 |
+| **子交易（配对）** | 解除配对，变为普通交易 | 子交易是拆分交易结构的一部分，删除会破坏一致性 |
+| **父交易** | 不能作为转账（创建时直接跳过） | 父交易是汇总，转账应该在子交易级别 |
+
+### 5. 边界场景测试用例
+
+位置：`packages/loot-core/src/server/transactions/transfer.test.ts:52-220`
+
+测试文件中覆盖了以下边界场景：
+
+```typescript
+// 场景 1：转账被正确插入/更新/删除（第 53 行测试）
+// 验证：创建 → 更新 → 取消转账 → 重新转账 → 删除
+
+// 场景 2：转账被正确取消分类（第 134 行测试）
+// 验证：同类型账户间转账清除分类，不同类型保留分类
+
+// 场景 3：拆分交易的子交易转账被保留（第 174 行测试）
+// 验证：
+//   - 普通交易转账
+//   - 变成父交易 → 转账被移除
+//   - 添加子交易 → 子交易可以有自己的转账
+//   - 子交易的 transfer_id ≠ 父交易原有的 transfer_id
+```
+
+---
+
 ## 完整流程图
 
 ```
