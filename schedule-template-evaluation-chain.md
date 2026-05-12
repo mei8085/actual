@@ -90,15 +90,15 @@ export type RecurConfig = {
 CREATE TABLE schedules_next_date
   (id TEXT PRIMARY KEY,
    schedule_id TEXT,
-   local_next_date INTEGER,   -- 本地调整后的日期
-   local_next_date_ts INTEGER, -- 本地调整的时间戳
-   base_next_date INTEGER,    -- 规则计算的原始日期
-   base_next_date_ts INTEGER); -- 原始日期的时间戳
+   local_next_date INTEGER,   -- 本地调整后的日期（存储 reset=false 时的更新）
+   local_next_date_ts INTEGER, -- 本地时间戳（用于判断使用哪套字段）
+   base_next_date INTEGER,    -- 基期日期（存储 reset=true 时的更新）
+   base_next_date_ts INTEGER); -- 基期时间戳（用于判断使用哪套字段）
 ```
 
-#### 1.5.2 两套字段的设计意图
+#### 1.5.2 v_schedules 视图选择逻辑
 
-`v_schedules` 视图通过时间戳比较决定使用哪套字段：
+`v_schedules` 视图通过**比较两套时间戳**决定展示哪套日期：
 
 **位置：** `packages/loot-core/src/server/aql/schema/index.ts:331-336`
 
@@ -109,56 +109,15 @@ CASE
 END
 ```
 
-| 场景 | 比较结果 | 使用字段 | 说明 |
-|------|---------|---------|------|
-| 初始创建 | `local_ts = base_ts` | `local_next_date` | 两套字段一致 |
-| 正常推进（reset=true） | `local_ts = base_ts` | `local_next_date` | 两套字段同时更新 |
-| 跳过操作（reset=false） | `local_ts != base_ts` | `base_next_date` | 使用原始日期 |
+**核心判定规则：**
+| 条件 | 展示字段 | 含义 |
+|------|---------|------|
+| `local_ts == base_ts` | `local_next_date` | 两套时间戳一致，使用本地日期 |
+| `local_ts != base_ts` | `base_next_date` | 两套时间戳不一致，使用基期日期 |
 
-#### 1.5.3 创建时的写入路径
+#### 1.5.3 setNextDate 更新语句
 
-**位置：** `packages/loot-core/src/server/schedules/app.ts:254-304`
-
-```typescript
-export async function createSchedule({
-  schedule = null,
-  conditions = [],
-} = {}): Promise<ScheduleEntity['id']> {
-  // ...
-  const nextDate = getNextDate(dateCond);  // 计算首次 next_date
-  const nextDateRepr = nextDate ? toDateRepr(nextDate) : null;
-
-  // 创建规则
-  const ruleId = await insertRule({
-    stage: null,
-    conditionsOp: 'and',
-    conditions,
-    actions: [{ op: 'link-schedule', value: scheduleId }],
-  });
-
-  const now = Date.now();
-
-  // 写入 schedules_next_date：两套字段初始化为相同值
-  await db.insertWithUUID('schedules_next_date', {
-    schedule_id: scheduleId,
-    local_next_date: nextDateRepr,    // 本地日期
-    local_next_date_ts: now,         // 相同时间戳
-    base_next_date: nextDateRepr,     // 基期日期
-    base_next_date_ts: now,          // 相同时间戳
-  });
-
-  // 写入 schedules 主表
-  await db.insertWithSchema('schedules', {
-    ...schedule,
-    id: scheduleId,
-    rule: ruleId,
-  });
-
-  return scheduleId;
-}
-```
-
-#### 1.5.4 reset=true 路径（更新计划时重置）
+更新逻辑分两支，由 `reset` 参数控制：
 
 **位置：** `packages/loot-core/src/server/schedules/app.ts:219-232`
 
@@ -167,147 +126,227 @@ await db.update(
   'schedules_next_date',
   reset
     ? {
+        // reset=true：更新 base 字段
         id: nd.id,
         base_next_date: toDateRepr(newNextDate),
-        base_next_date_ts: Date.now(),  // 更新基期时间戳
+        base_next_date_ts: Date.now(),  // 使用当前时间戳（新值）
       }
     : {
+        // reset=false：更新 local 字段
         id: nd.id,
         local_next_date: toDateRepr(newNextDate),
-        local_next_date_ts: nd.base_next_date_ts,  // 保持基期时间戳不变
+        local_next_date_ts: nd.base_next_date_ts,  // 复用当前 base 时间戳
       },
 );
 ```
 
-**更新时机：** `packages/loot-core/src/server/schedules/app.ts:357-373`
+**关键观察：**
+- `reset=true` 时，`base_next_date_ts` 被设置为**新的** `Date.now()`
+- `reset=false` 时，`local_next_date_ts` 被设置为**当前的** `nd.base_next_date_ts`（复用）
+
+#### 1.5.4 各操作场景的真实时间戳变化与字段生效
+
+根据代码逻辑，逐个分析场景：
+
+**场景 1：创建计划（createSchedule）**
+
+**位置：** `packages/loot-core/src/server/schedules/app.ts:288-295`
 
 ```typescript
-if (
-  resetNextDate ||
-  !areScheduleConditionsEqual(
-    oldConditions.find(c => c.field === 'account'),
-    newConditions.find(c => c.field === 'account'),
-  ) ||
-  !areConditionValuesEqual(
-    stripType(oldConditions.find(c => c.field === 'date') || {}),
-    stripType(newConditions.find(c => c.field === 'date') || {}),
-  )
-) {
-  await setNextDate({
-    id: schedule.id,
-    conditions: newConditions,
-    reset: true,  // 日期条件变化 → 重置两套字段
-  });
-}
+const now = Date.now();
+await db.insertWithUUID('schedules_next_date', {
+  schedule_id: scheduleId,
+  local_next_date: nextDateRepr,
+  local_next_date_ts: now,       // 相同时间戳
+  base_next_date: nextDateRepr,
+  base_next_date_ts: now,        // 相同时间戳
+});
 ```
 
-#### 1.5.5 reset=false 路径（跳过操作、正常推进）
+| 字段 | 值 |
+|------|----|
+| `local_next_date` | `nextDateRepr` |
+| `local_next_date_ts` | `Date.now()` (T1) |
+| `base_next_date` | `nextDateRepr` |
+| `base_next_date_ts` | `Date.now()` (T1) |
 
-**跳过操作入口：** `packages/loot-core/src/server/schedules/app.ts:395-403`
+**时间戳比较：** `T1 == T1` → **相等**
 
-```typescript
-export async function skipNextDate({ id }) {
-  return setNextDate({
-    id,
-    start: nextDate => {
-      return d.addDays(parseDate(nextDate), 1);  // 从下一天开始计算
-    },
-    skipRequested: true,  // 标记为主动跳过
-  });
-}
-```
+**视图选择：** 使用 `local_next_date`（= `nextDateRepr`）
 
-**正常推进（paid 状态）：** `packages/loot-core/src/server/schedules/app.ts:546-555`
+---
+
+**场景 2：正常推进（已付款，paid 状态）**
+
+**调用位置：** `packages/loot-core/src/server/schedules/app.ts:546-555`
 
 ```typescript
 if (schedule._date.frequency) {
   try {
-    await setNextDate({ id: schedule.id });  // 无 reset 参数，默认为 false
+    await setNextDate({ id: schedule.id });  // 无 reset 参数，默认为 undefined（falsy）
   } catch {
     // 忽略规则损坏的计划
   }
 }
 ```
 
-#### 1.5.6 setNextDate 内部逻辑
+**假设更新前状态：**
+| 字段 | 值 |
+|------|----|
+| `local_next_date` | 2026-05-15 |
+| `local_next_date_ts` | T1 |
+| `base_next_date` | 2026-05-15 |
+| `base_next_date_ts` | T1 |
 
-**位置：** `packages/loot-core/src/server/schedules/app.ts:159-235`
+**执行 `setNextDate({ id })`，reset 为 `undefined`（走 reset=false 分支）：**
+- 查询 `nd.base_next_date_ts` → T1
+- 更新 `local_next_date` = 新日期（如 2026-06-15）
+- 更新 `local_next_date_ts` = `nd.base_next_date_ts` = T1（复用）
+- `base_next_date_ts` 不变（仍为 T1）
+
+**更新后状态：**
+| 字段 | 值 |
+|------|----|
+| `local_next_date` | 2026-06-15（新） |
+| `local_next_date_ts` | T1（复用 base 的时间戳） |
+| `base_next_date` | 2026-05-15（不变） |
+| `base_next_date_ts` | T1（不变） |
+
+**时间戳比较：** `T1 == T1` → **相等**
+
+**视图选择：** 使用 `local_next_date`（= 2026-06-15）✅ 正确
+
+---
+
+**场景 3：跳过操作（skipNextDate）**
+
+**调用位置：** `packages/loot-core/src/server/schedules/app.ts:395-403`
 
 ```typescript
-export async function setNextDate({
-  id,
-  start,
-  conditions,
-  reset,
-  skipRequested,
-}: {
-  id: string;
-  start?;
-  conditions?;
-  reset?: boolean;
-  skipRequested?: boolean;
-}) {
-  // ...
-
-  // 跳过操作的周末特殊处理
-  if (skipRequested === true) {
-    const skipWeekend: boolean = dateCond.value?.skipWeekend;
-    const weekendSolveMode: string = dateCond.value?.weekendSolveMode;
-
-    // 周末策略=before 时的特殊处理
-    if (weekendSolveMode === 'before' && skipWeekend === true) {
-      const parsedNextDate = parseDate(nextDate);
-      if (d.isFriday(parsedNextDate) || d.isWeekend(parsedNextDate)) {
-        // 强制推到下周一，避免 getNextDate 又拉回周五
-        nextDate = dayFromDate(d.nextMonday(parsedNextDate));
-      }
-    }
-  }
-
-  // 计算新日期
-  const newNextDate = getNextDate(
-    dateCond,
-    start ? start(nextDate) : new Date(),
-  );
-
-  if (newNextDate != null && newNextDate !== nextDate) {
-    // 查询现有记录
-    const nd = await db.first<...>(
-      'SELECT id, base_next_date_ts FROM schedules_next_date WHERE schedule_id = ?',
-      [id],
-    );
-
-    // 根据 reset 标志更新不同字段
-    await db.update(
-      'schedules_next_date',
-      reset
-        ? {
-            id: nd.id,
-            base_next_date: toDateRepr(newNextDate),
-            base_next_date_ts: Date.now(),
-          }
-        : {
-            id: nd.id,
-            local_next_date: toDateRepr(newNextDate),
-            local_next_date_ts: nd.base_next_date_ts,  // 复用基期时间戳
-          },
-    );
-  }
+export async function skipNextDate({ id }) {
+  return setNextDate({
+    id,
+    start: nextDate => {
+      return d.addDays(parseDate(nextDate), 1);
+    },
+    skipRequested: true,  // 无 reset 参数
+  });
 }
 ```
 
-#### 1.5.7 reset 与 skip 对应关系汇总
+**逻辑与"正常推进"完全相同：** `reset` 为 `undefined`（falsy），走 reset=false 分支。
 
-| 操作 | reset 参数 | 更新字段 | 时间戳变化 |
-|------|-----------|---------|-----------|
-| 初始创建 | N/A | `local + base` 都写 | `local_ts = base_ts = now()` |
-| 日期条件变化 | `true` | `base_next_date` + `base_next_date_ts` | `base_ts` 更新 |
-| 跳过操作 | `false`（默认） | `local_next_date` | `local_ts` 复用 `base_ts` |
-| 正常推进（已付款） | `false`（默认） | `local_next_date` | `local_ts` 复用 `base_ts` |
+**更新后时间戳：** `local_ts == base_ts` → 视图使用 `local_next_date`（即跳过操作后的新日期）
 
-**视图选择逻辑：**
-- `local_ts == base_ts` → 使用 `local_next_date`（两套一致或刚 reset）
-- `local_ts != base_ts` → 使用 `base_next_date`（local 被跳过操作更新过）
+---
+
+**场景 4：条件变化（updateSchedule 中 reset=true）**
+
+**触发条件：** `packages/loot-core/src/server/schedules/app.ts:357-373`
+
+```typescript
+if (
+  resetNextDate ||
+  !areScheduleConditionsEqual(...) ||  // account 变化
+  !areConditionValuesEqual(...)        // date 条件变化
+) {
+  await setNextDate({
+    id: schedule.id,
+    conditions: newConditions,
+    reset: true,  // 显式设置 reset=true
+  });
+}
+```
+
+**假设更新前状态：**
+| 字段 | 值 |
+|------|----|
+| `local_next_date` | 2026-05-15 |
+| `local_next_date_ts` | T1 |
+| `base_next_date` | 2026-05-15 |
+| `base_next_date_ts` | T1 |
+
+**执行 `setNextDate({ reset: true })`：**
+- 更新 `base_next_date` = 新日期（根据新条件计算）
+- 更新 `base_next_date_ts` = `Date.now()` = T2（新的时间戳）
+- `local_next_date_ts` 不变（仍为 T1）
+
+**更新后状态：**
+| 字段 | 值 |
+|------|----|
+| `local_next_date` | 2026-05-15（不变） |
+| `local_next_date_ts` | T1（不变） |
+| `base_next_date` | 2026-08-15（新条件计算的新日期） |
+| `base_next_date_ts` | T2（新时间戳） |
+
+**时间戳比较：** `T1 != T2` → **不相等**
+
+**视图选择：** 使用 `base_next_date`（= 2026-08-15）✅ 正确
+
+---
+
+**场景 5：连续正常推进（演示时间戳变化）**
+
+假设：创建 → 正常推进 → 再正常推进
+
+| 步骤 | `local_ts` | `base_ts` | 比较结果 | 视图使用字段 |
+|------|-----------|-----------|---------|-------------|
+| 1. 创建 | T1 | T1 | 相等 | `local_next_date` |
+| 2. 第1次正常推进（reset=false） | T1（复用 base_ts） | T1（不变） | 相等 | `local_next_date` |
+| 3. 第2次正常推进（reset=false） | T1（复用 base_ts） | T1（不变） | 相等 | `local_next_date` |
+
+**注意：** 正常推进不会改变 `base_next_date_ts`，永远复用创建时或上次 reset=true 时的时间戳。
+
+---
+
+**场景 6：reset=true 后再正常推进（完整演示）**
+
+| 步骤 | 操作 | `local_date` | `local_ts` | `base_date` | `base_ts` | 比较结果 | 视图使用 |
+|------|------|-------------|-----------|-------------|-----------|---------|---------|
+| 1 | 创建 | 2026-05-15 | T1 | 2026-05-15 | T1 | 相等 | local |
+| 2 | 正常推进（reset=false） | 2026-06-15 | T1 | 2026-05-15 | T1 | 相等 | local (6-15) |
+| 3 | 条件变化（reset=true） | 2026-06-15（不变） | T1（不变） | 2026-09-15（新） | T2（新） | 不相等 | base (9-15) |
+| 4 | 再正常推进（reset=false） | 2026-10-15（新） | T2（复用 base_ts） | 2026-09-15（不变） | T2（不变） | 相等 | local (10-15) |
+
+**关键解释（步骤 3 → 4）：**
+- 步骤 3 reset=true 后：`base_ts` 变为 T2，`local_ts` 仍为 T1 → 不相等 → 视图用 base（2026-09-15）
+- 步骤 4 reset=false 时：`local_next_date_ts = nd.base_next_date_ts = T2` → 现在 `local_ts == base_ts`（都是 T2）→ 视图用 local（2026-10-15）
+
+---
+
+#### 1.5.5 reset/skip 真实对应关系汇总
+
+| 操作 | 代码调用 | reset 参数 | 触发条件 |
+|------|---------|-----------|---------|
+| 初始创建 | `createSchedule()` | N/A（INSERT） | 创建计划时 |
+| 正常推进（已付款） | `setNextDate({ id })` | `undefined`（falsy → false） | advanceSchedulesService 中 paid 状态 |
+| 跳过操作 | `setNextDate({ id, start: ..., skipRequested: true })` | `undefined`（falsy → false） | 用户手动点击跳过 |
+| 条件变化重置 | `setNextDate({ id, conditions, reset: true })` | `true` | account/date 条件变化或 resetNextDate=true |
+
+#### 1.5.6 字段生效判定示例
+
+假设一个月度计划（每月 15 日）：
+
+**时间线：**
+1. **2026-05-10**：创建计划，首次日期为 2026-05-15
+2. **2026-05-15**：已付款 → 正常推进
+3. **2026-05-20**：用户修改计划日期为"每月 20 日" → 条件变化 → reset=true
+4. **2026-06-20**：已付款 → 正常推进
+
+**逐步分析：**
+
+| 时间 | 操作 | local_date | local_ts | base_date | base_ts | 比较 | 视图显示 |
+|------|------|-----------|---------|-----------|---------|------|---------|
+| 5-10 | 创建 | 2026-05-15 | T1 | 2026-05-15 | T1 | 相等 | 2026-05-15 |
+| 5-15 | 正常推进 | 2026-06-15 | T1 | 2026-05-15 | T1 | 相等 | 2026-06-15 |
+| 5-20 | reset=true（条件变化） | 2026-06-15 | T1 | 2026-06-20 | T2 | 不相等 | 2026-06-20 |
+| 6-20 | 正常推进 | 2026-07-20 | T2 | 2026-06-20 | T2 | 相等 | 2026-07-20 |
+
+**评审要点：**
+1. 正常推进和跳过操作都走 `reset=false`，更新 `local_*` 字段但复用 `base_ts`
+2. 只有条件变化时走 `reset=true`，更新 `base_*` 字段并改变 `base_ts`
+3. 视图选择逻辑：时间戳相等用 `local`，不等用 `base`
+4. reset=true 相当于"重新锚定"，后续的 reset=false 操作会以新的 `base_ts` 为基准保持相等
 
 ---
 
@@ -406,7 +445,7 @@ async function advanceSchedulesService(syncSuccess) {
       schedule.next_date,
       schedule.completed,
       hasTrans.has(schedule.id),
-      schedule.custom_upcoming_length ?? upcomingLength,
+      schedule.custom_upcoming_length ?? upcomingLength[0]?.value ?? '7',
     );
 
     // 状态判断逻辑见 schedules.ts:13-37
@@ -423,7 +462,7 @@ async function advanceSchedulesService(syncSuccess) {
         // 递归计划：计算并更新 next_date
         if (schedule._date.frequency) {
           try {
-            await setNextDate({ id: schedule.id });
+            await setNextDate({ id: schedule.id });  // reset=false（默认）
           } catch {
             // 忽略规则损坏的计划
           }
@@ -908,7 +947,7 @@ export async function skipNextDate({ id }) {
       return d.addDays(parseDate(nextDate), 1);
     },
     skipRequested: true,  // 标记为主动跳过
-  });
+  });  // 无 reset 参数，默认 falsy → reset=false
 }
 ```
 
@@ -932,7 +971,7 @@ if (skipRequested === true) {
 }
 ```
 
-**数据库更新路径：** 详见第一节 1.5.5 reset=false 路径。
+**数据库更新路径：** 详见第一节 1.5.4，skipNextDate 走 reset=false 分支。
 
 ### 3.3 提前支付
 
@@ -977,7 +1016,7 @@ export function getHasTransactionsQuery(schedules) {
 if (status === 'paid') {
   if (schedule._date.frequency) {
     // 递归计划：立即推进到下一期
-    await setNextDate({ id: schedule.id });
+    await setNextDate({ id: schedule.id });  // reset=false（默认）
   } else {
     if (schedule._date < currentDay()) {
       // 单次计划：日期已过则标记完成
@@ -1095,7 +1134,8 @@ if (num_months < 0) {
 │    │    schedule_id,                                                  │
 │    │    local_next_date: nextDateRepr, local_next_date_ts: now,      │
 │    │    base_next_date: nextDateRepr,  base_next_date_ts: now,       │
-│    │  }) → 两套字段初始化为相同值                                      │
+│    │  }) → 两套字段初始化（local_ts = base_ts = now）                  │
+│    │  视图：local_ts == base_ts → 使用 local_next_date                │
 │    │                                                                  │
 │    └─ db.insertWithSchema('schedules', ...) → 写入计划表              │
 └─────────────────────────────────────────────────────────────────────────┘
@@ -1111,11 +1151,13 @@ if (num_months < 0) {
 │    ├─ getStatus() → 判断状态 (paid/due/missed)                     │
 │    │                                                                  │
 │    ├─ [paid] 已付款                                                   │
-│    │   ├─ 递归计划 → setNextDate({ reset: false })                  │
+│    │   ├─ 递归计划 → setNextDate({ id }) → reset=false（默认）        │
 │    │   │    ├─ getNextDate() → 计算新日期                            │
 │    │   │    └─ db.update schedules_next_date                          │
-│    │   │         { local_next_date, local_next_date_ts: base_ts }    │
-│    │   │         (保持 base 不变，仅更新 local)                      │
+│    │   │         { local_next_date: newDate,                         │
+│    │   │           local_next_date_ts: nd.base_next_date_ts }        │
+│    │   │         （复用 base_ts 保持 local_ts == base_ts）           │
+│    │   │         视图：local_ts == base_ts → 使用 local_next_date    │
 │    │   │                                                             │
 │    │   └─ 单次计划 → 日期已过 → completed=true                       │
 │    │                                                                  │
@@ -1124,7 +1166,15 @@ if (num_months < 0) {
 │            └─ addTransactions() → 写入交易表                        │
 │                                                                       │
 │  跳过操作入口：                                                        │
-│  skipNextDate() → setNextDate({ reset: false, skipRequested: true }) │
+│  skipNextDate() → setNextDate({ id, start: ..., skipRequested: true })│
+│                   → reset=false（默认）                                │
+│                                                                       │
+│  条件变化重置入口：                                                    │
+│  updateSchedule() → 条件变化 → setNextDate({ reset: true })          │
+│                         └─ db.update schedules_next_date             │
+│                              { base_next_date: newDate,              │
+│                                base_next_date_ts: Date.now() }       │
+│                         视图：local_ts != base_ts → 使用 base_next_date│
 └─────────────────────────────────────────────────────────────────────────┘
                                     ↓
 ┌─────────────────────────────────────────────────────────────────────────┐
@@ -1214,3 +1264,37 @@ if (num_months < 0) {
 | `packages/loot-core/src/server/rules/rule.ts` | 规则执行（execActions） |
 | `packages/loot-core/src/server/aql/schema/index.ts` | v_schedules 视图定义（next_date 选择逻辑） |
 | `packages/loot-core/migrations/1618975177358_schedules.sql` | schedules_next_date 表结构 |
+
+---
+
+## 附录：本次事实校对修正点
+
+### 修正点 1：reset/skip 对应关系
+
+**错误表述（旧版）：**
+- 正常推进走 `reset=true`
+- 跳过操作走 `reset=false`
+
+**事实校正（新版）：**
+- 正常推进（paid 状态）：`setNextDate({ id })` → `reset` 为 `undefined`（falsy）→ **reset=false**
+- 跳过操作：`skipNextDate()` → 调用 `setNextDate({ id, start: ..., skipRequested: true })` → 无 `reset` 参数 → **reset=false**
+- 条件变化（account/date 变化或 resetNextDate=true）：**reset=true**
+
+### 修正点 2：时间戳关系与视图选择逻辑
+
+**错误表述（旧版）：**
+- 表格 114-116 行：正常推进是 `reset=true`，跳过是 `reset=false`
+- 文字 308-310 行："local_ts == base_ts → 使用 local_next_date（两套一致或刚 reset）"
+- 两处表述自相矛盾
+
+**事实校正（新版）：**
+| 操作 | reset | 更新字段 | 时间戳变化 | 视图选择 |
+|------|-------|---------|-----------|---------|
+| 创建 | N/A | `local + base` | `local_ts = base_ts = now()` | `local_next_date` |
+| 正常推进 | false | `local_*` | `local_ts = nd.base_next_date_ts`（复用） | `local_next_date`（相等） |
+| 跳过操作 | false | `local_*` | `local_ts = nd.base_next_date_ts`（复用） | `local_next_date`（相等） |
+| 条件变化 | true | `base_*` | `base_next_date_ts = Date.now()`（新值） | `base_next_date`（不等） |
+
+**核心机制：**
+- `reset=false` 时，`local_next_date_ts` 被设置为 **当前的** `nd.base_next_date_ts`（复用）→ 保持相等 → 用 `local`
+- `reset=true` 时，`base_next_date_ts` 被设置为 **新的** `Date.now()` → 打破相等 → 用 `base`
