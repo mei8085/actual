@@ -80,6 +80,235 @@ export type RecurConfig = {
 | `start`/`endMode`/`end*` | RecurConfig | 起止条件 |
 | `skipWeekend`/`weekendSolveMode` | RecurConfig | 周末处理策略 |
 
+### 1.5 创建阶段 next_date 持久化细节
+
+#### 1.5.1 schedules_next_date 表结构
+
+**位置：** `packages/loot-core/migrations/1618975177358_schedules.sql:11-17`
+
+```sql
+CREATE TABLE schedules_next_date
+  (id TEXT PRIMARY KEY,
+   schedule_id TEXT,
+   local_next_date INTEGER,   -- 本地调整后的日期
+   local_next_date_ts INTEGER, -- 本地调整的时间戳
+   base_next_date INTEGER,    -- 规则计算的原始日期
+   base_next_date_ts INTEGER); -- 原始日期的时间戳
+```
+
+#### 1.5.2 两套字段的设计意图
+
+`v_schedules` 视图通过时间戳比较决定使用哪套字段：
+
+**位置：** `packages/loot-core/src/server/aql/schema/index.ts:331-336`
+
+```sql
+CASE
+  WHEN _nd.local_next_date_ts = _nd.base_next_date_ts THEN _nd.local_next_date
+  ELSE _nd.base_next_date
+END
+```
+
+| 场景 | 比较结果 | 使用字段 | 说明 |
+|------|---------|---------|------|
+| 初始创建 | `local_ts = base_ts` | `local_next_date` | 两套字段一致 |
+| 正常推进（reset=true） | `local_ts = base_ts` | `local_next_date` | 两套字段同时更新 |
+| 跳过操作（reset=false） | `local_ts != base_ts` | `base_next_date` | 使用原始日期 |
+
+#### 1.5.3 创建时的写入路径
+
+**位置：** `packages/loot-core/src/server/schedules/app.ts:254-304`
+
+```typescript
+export async function createSchedule({
+  schedule = null,
+  conditions = [],
+} = {}): Promise<ScheduleEntity['id']> {
+  // ...
+  const nextDate = getNextDate(dateCond);  // 计算首次 next_date
+  const nextDateRepr = nextDate ? toDateRepr(nextDate) : null;
+
+  // 创建规则
+  const ruleId = await insertRule({
+    stage: null,
+    conditionsOp: 'and',
+    conditions,
+    actions: [{ op: 'link-schedule', value: scheduleId }],
+  });
+
+  const now = Date.now();
+
+  // 写入 schedules_next_date：两套字段初始化为相同值
+  await db.insertWithUUID('schedules_next_date', {
+    schedule_id: scheduleId,
+    local_next_date: nextDateRepr,    // 本地日期
+    local_next_date_ts: now,         // 相同时间戳
+    base_next_date: nextDateRepr,     // 基期日期
+    base_next_date_ts: now,          // 相同时间戳
+  });
+
+  // 写入 schedules 主表
+  await db.insertWithSchema('schedules', {
+    ...schedule,
+    id: scheduleId,
+    rule: ruleId,
+  });
+
+  return scheduleId;
+}
+```
+
+#### 1.5.4 reset=true 路径（更新计划时重置）
+
+**位置：** `packages/loot-core/src/server/schedules/app.ts:219-232`
+
+```typescript
+await db.update(
+  'schedules_next_date',
+  reset
+    ? {
+        id: nd.id,
+        base_next_date: toDateRepr(newNextDate),
+        base_next_date_ts: Date.now(),  // 更新基期时间戳
+      }
+    : {
+        id: nd.id,
+        local_next_date: toDateRepr(newNextDate),
+        local_next_date_ts: nd.base_next_date_ts,  // 保持基期时间戳不变
+      },
+);
+```
+
+**更新时机：** `packages/loot-core/src/server/schedules/app.ts:357-373`
+
+```typescript
+if (
+  resetNextDate ||
+  !areScheduleConditionsEqual(
+    oldConditions.find(c => c.field === 'account'),
+    newConditions.find(c => c.field === 'account'),
+  ) ||
+  !areConditionValuesEqual(
+    stripType(oldConditions.find(c => c.field === 'date') || {}),
+    stripType(newConditions.find(c => c.field === 'date') || {}),
+  )
+) {
+  await setNextDate({
+    id: schedule.id,
+    conditions: newConditions,
+    reset: true,  // 日期条件变化 → 重置两套字段
+  });
+}
+```
+
+#### 1.5.5 reset=false 路径（跳过操作、正常推进）
+
+**跳过操作入口：** `packages/loot-core/src/server/schedules/app.ts:395-403`
+
+```typescript
+export async function skipNextDate({ id }) {
+  return setNextDate({
+    id,
+    start: nextDate => {
+      return d.addDays(parseDate(nextDate), 1);  // 从下一天开始计算
+    },
+    skipRequested: true,  // 标记为主动跳过
+  });
+}
+```
+
+**正常推进（paid 状态）：** `packages/loot-core/src/server/schedules/app.ts:546-555`
+
+```typescript
+if (schedule._date.frequency) {
+  try {
+    await setNextDate({ id: schedule.id });  // 无 reset 参数，默认为 false
+  } catch {
+    // 忽略规则损坏的计划
+  }
+}
+```
+
+#### 1.5.6 setNextDate 内部逻辑
+
+**位置：** `packages/loot-core/src/server/schedules/app.ts:159-235`
+
+```typescript
+export async function setNextDate({
+  id,
+  start,
+  conditions,
+  reset,
+  skipRequested,
+}: {
+  id: string;
+  start?;
+  conditions?;
+  reset?: boolean;
+  skipRequested?: boolean;
+}) {
+  // ...
+
+  // 跳过操作的周末特殊处理
+  if (skipRequested === true) {
+    const skipWeekend: boolean = dateCond.value?.skipWeekend;
+    const weekendSolveMode: string = dateCond.value?.weekendSolveMode;
+
+    // 周末策略=before 时的特殊处理
+    if (weekendSolveMode === 'before' && skipWeekend === true) {
+      const parsedNextDate = parseDate(nextDate);
+      if (d.isFriday(parsedNextDate) || d.isWeekend(parsedNextDate)) {
+        // 强制推到下周一，避免 getNextDate 又拉回周五
+        nextDate = dayFromDate(d.nextMonday(parsedNextDate));
+      }
+    }
+  }
+
+  // 计算新日期
+  const newNextDate = getNextDate(
+    dateCond,
+    start ? start(nextDate) : new Date(),
+  );
+
+  if (newNextDate != null && newNextDate !== nextDate) {
+    // 查询现有记录
+    const nd = await db.first<...>(
+      'SELECT id, base_next_date_ts FROM schedules_next_date WHERE schedule_id = ?',
+      [id],
+    );
+
+    // 根据 reset 标志更新不同字段
+    await db.update(
+      'schedules_next_date',
+      reset
+        ? {
+            id: nd.id,
+            base_next_date: toDateRepr(newNextDate),
+            base_next_date_ts: Date.now(),
+          }
+        : {
+            id: nd.id,
+            local_next_date: toDateRepr(newNextDate),
+            local_next_date_ts: nd.base_next_date_ts,  // 复用基期时间戳
+          },
+    );
+  }
+}
+```
+
+#### 1.5.7 reset 与 skip 对应关系汇总
+
+| 操作 | reset 参数 | 更新字段 | 时间戳变化 |
+|------|-----------|---------|-----------|
+| 初始创建 | N/A | `local + base` 都写 | `local_ts = base_ts = now()` |
+| 日期条件变化 | `true` | `base_next_date` + `base_next_date_ts` | `base_ts` 更新 |
+| 跳过操作 | `false`（默认） | `local_next_date` | `local_ts` 复用 `base_ts` |
+| 正常推进（已付款） | `false`（默认） | `local_next_date` | `local_ts` 复用 `base_ts` |
+
+**视图选择逻辑：**
+- `local_ts == base_ts` → 使用 `local_next_date`（两套一致或刚 reset）
+- `local_ts != base_ts` → 使用 `base_next_date`（local 被跳过操作更新过）
+
 ---
 
 ## 二、计划触发后当期值获取与落库
@@ -257,7 +486,11 @@ async function postTransactionForSchedule({
 }
 ```
 
-### 2.5 预算视图求值（写入预算目标）
+### 2.5 预算视图求值（返回值，不直接写入）
+
+**⚠️ 重要修正：** `runSchedule` **仅负责计算并返回** `to_budget` / `perScheduleMonthly`，**不直接写入**预算视图。实际写入由上层调用链汇总后批量处理。
+
+#### 2.5.1 runSchedule 计算逻辑
 
 **入口：** `packages/loot-core/src/server/budget/schedule-template.ts:305-395`
 
@@ -268,7 +501,7 @@ export async function runSchedule(
   balance: number,
   remainder: number,
   last_month_balance: number,
-  to_budget: number,
+  to_budget: number,           // 传入的累计值
   errors: string[],
   category: CategoryEntity,
   currency: Currency,
@@ -317,9 +550,156 @@ export async function runSchedule(
     }
   }
 
+  // 仅返回计算结果，不写入数据库
   return { to_budget, errors, remainder, perScheduleMonthly };
 }
 ```
+
+#### 2.5.2 CategoryTemplateContext 调用链
+
+`runSchedule` 在 `CategoryTemplateContext.runTemplatesForPriority()` 中被调用，计算结果在上下文内汇总。
+
+**位置：** `packages/loot-core/src/server/budget/category-template-context.ts:139-327`
+
+```typescript
+// runTemplatesForPriority 方法签名
+async runTemplatesForPriority(
+  priority: number,
+  budgetAvail: number,
+  availStart: number,
+): Promise<number> {
+  if (!this.priorities.has(priority)) return 0;
+  if (this.limitMet) return 0;
+
+  const t = this.templates.filter(
+    t => t.directive === 'template' && t.priority === priority,
+  );
+  let available = budgetAvail || 0;
+  let toBudget = 0;
+  const perTemplateLocal = new Map<Template, number>();
+  let remainder = 0;
+  let scheduleFlag = false;
+  let schedulePerTemplate: Map<string, number> | null = null;
+
+  // 按模板类型循环处理
+  for (const template of t) {
+    let newBudget = 0;
+    switch (template.type) {
+      // ... 其他类型（simple, refill, copy, periodic, spend, percentage, by, average）
+
+      case 'schedule': {
+        if (!scheduleFlag) {
+          const budgeted = this.fromLastMonth + toBudget;
+          // 调用 runSchedule
+          const ret = await runSchedule(
+            t,                          // 所有同优先级模板
+            this.month,
+            budgeted,                   // 当前累计预算
+            remainder,
+            this.fromLastMonth,         // 上月余额
+            toBudget,                   // 传入累计值
+            [],
+            this.category,
+            this.currency,
+          );
+          // Schedules 假设 to_budget 是整体值，需要减去之前累计避免重复计算
+          newBudget = ret.to_budget - toBudget;
+          remainder = ret.remainder;
+          schedulePerTemplate = ret.perScheduleMonthly;
+          scheduleFlag = true;
+        }
+        break;
+      }
+      default: {
+        break;
+      }
+    }
+
+    available = available - newBudget;
+    toBudget += newBudget;
+    perTemplateLocal.set(
+      template,
+      (perTemplateLocal.get(template) ?? 0) + newBudget,
+    );
+  }
+
+  // ... 后续处理：redistributeBatch 重新分配、limit 检查、四舍五入、available clamp 等
+
+  // 将 per-template 贡献写入上下文的 perTemplateContribution
+  const items = Array.from(perTemplateLocal);
+  let remaining = Math.max(0, toBudget);
+  items.forEach(([template, value], i) => {
+    const isLast = i === items.length - 1;
+    const share = isLast
+      ? remaining
+      : Math.max(0, Math.min(remaining, Math.round(value * perRowScale)));
+    const existing = this.perTemplateContribution.get(template) ?? 0;
+    this.perTemplateContribution.set(template, existing + share);
+    remaining -= share;
+  });
+
+  return this.category.is_income ? -toBudget : toBudget;
+}
+```
+
+#### 2.5.3 完整预算求值调用链
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    CategoryTemplateContext 调用链                      │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  1. 初始化                                                              │
+│     CategoryTemplateContext.init()                                     │
+│     ├─ 计算上月余额 fromLastMonth                                       │
+│     ├─ 校验模板合法性（checkByAndScheduleAndSpend）                     │
+│     └─ 分类模板：templates / remainder / goals                          │
+│                                                                         │
+│  2. 按优先级求值（runAll 或外部调用 runTemplatesForPriority）            │
+│     runTemplatesForPriority(priority, budgetAvail, availStart)          │
+│     ├─ 循环处理该优先级下的所有模板                                      │
+│     │                                                                   │
+│     │  ┌─ schedule 类型 ──────────────────────────────────────────────┐│
+│     │  │                                                             ││
+│     │  │  首次遇到 schedule 模板时调用 runSchedule()                   ││
+│     │  │    ├─ createScheduleList() → 计算每个计划的当期目标            ││
+│     │  │    ├─ 分类：pay-month-of vs sinking                          ││
+│     │  │    ├─ 计算 to_budget 增量                                     ││
+│     │  │    └─ 返回 { to_budget, errors, remainder, perScheduleMonthly }││
+│     │  │                                                             ││
+│     │  │  newBudget = ret.to_budget - toBudget (避免重复计算)          ││
+│     │  │  schedulePerTemplate 用于后续 per-template 分配               ││
+│     │  │                                                             ││
+│     │  └───────────────────────────────────────────────────────────────┘│
+│     │                                                                   │
+│     ├─ 累加 toBudget                                                    │
+│     ├─ redistributeBatch() → 按权重重新分配 per-template 贡献           │
+│     │   └─ schedule 使用 perScheduleMonthly 作为权重                     │
+│     ├─ limit 检查（超限时 clamp）                                       │
+│     ├─ hideDecimal 四舍五入                                             │
+│     ├─ available clamp（非收入类别不超额）                              │
+│     └─ 写入 perTemplateContribution Map                                 │
+│                                                                         │
+│  3. remainder 模板处理（如果有）                                        │
+│     runRemainder(budgetAvail, perWeight)                                │
+│                                                                         │
+│  4. 获取结果（不写入，由调用者决定）                                      │
+│     getValues()                                                         │
+│     ├─ runGoal() → 计算 goalAmount                                      │
+│     └─ 返回 { budgeted, goal, longGoal, perTemplateContribution }       │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 2.5.4 关键数据流向说明
+
+| 阶段 | 数据流向 | 说明 |
+|------|---------|------|
+| runSchedule 内部 | 计算 `to_budget` 增量 | 基于传入的 `to_budget` 累计值，返回新的累计值 |
+| runTemplatesForPriority | `newBudget = ret.to_budget - toBudget` | 计算本次 schedule 模板贡献的增量 |
+| redistributeBatch | 按 `perScheduleMonthly` 权重分配 | 将批量预算分配到各个 schedule 模板行 |
+| perTemplateContribution | 上下文内累积 | 按优先级逐步写入 Map，最后通过 getValues() 暴露 |
+| 实际落库 | 由上层调用者处理 | 不在 runSchedule 或 CategoryTemplateContext 内写入数据库 |
 
 ### 2.6 当期目标金额计算（createScheduleList）
 
@@ -552,6 +932,8 @@ if (skipRequested === true) {
 }
 ```
 
+**数据库更新路径：** 详见第一节 1.5.5 reset=false 路径。
+
 ### 3.3 提前支付
 
 **状态判断：** `packages/loot-core/src/shared/schedules.ts:13-37`
@@ -708,6 +1090,13 @@ if (num_months < 0) {
 │    ├─ 提取条件：date, amount, payee, account                       │
 │    ├─ getNextDate() → 计算首次 next_date                            │
 │    ├─ insertRule() → 创建规则（含 link-schedule 动作）                │
+│    │                                                                  │
+│    ├─ db.insertWithUUID('schedules_next_date', {                     │
+│    │    schedule_id,                                                  │
+│    │    local_next_date: nextDateRepr, local_next_date_ts: now,      │
+│    │    base_next_date: nextDateRepr,  base_next_date_ts: now,       │
+│    │  }) → 两套字段初始化为相同值                                      │
+│    │                                                                  │
 │    └─ db.insertWithSchema('schedules', ...) → 写入计划表              │
 └─────────────────────────────────────────────────────────────────────────┘
                                     ↓
@@ -722,49 +1111,65 @@ if (num_months < 0) {
 │    ├─ getStatus() → 判断状态 (paid/due/missed)                     │
 │    │                                                                  │
 │    ├─ [paid] 已付款                                                   │
-│    │   ├─ 递归计划 → setNextDate() → 推进 next_date                │
-│    │   │    └─ getNextDate()                                        │
-│    │   │        ├─ rSchedule.occurrences() → 计算下一日期           │
-│    │   │        └─ 周末跳过处理                                       │
+│    │   ├─ 递归计划 → setNextDate({ reset: false })                  │
+│    │   │    ├─ getNextDate() → 计算新日期                            │
+│    │   │    └─ db.update schedules_next_date                          │
+│    │   │         { local_next_date, local_next_date_ts: base_ts }    │
+│    │   │         (保持 base 不变，仅更新 local)                      │
+│    │   │                                                             │
 │    │   └─ 单次计划 → 日期已过 → completed=true                       │
 │    │                                                                  │
 │    └─ [due/missed] + posts_transaction                              │
 │        └─ postTransactionForSchedule()                              │
 │            └─ addTransactions() → 写入交易表                        │
+│                                                                       │
+│  跳过操作入口：                                                        │
+│  skipNextDate() → setNextDate({ reset: false, skipRequested: true }) │
 └─────────────────────────────────────────────────────────────────────────┘
                                     ↓
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                        预算求值阶段（写入预算视图）                   │
+│                        预算求值阶段（返回计算值）                       │
 ├─────────────────────────────────────────────────────────────────────────┤
 │  触发时机：预算模板求值时                                              │
 │                                                                       │
-│  runSchedule()                                                        │
-│    ├─ 过滤 type='schedule' 的模板                                  │
+│  ⚠️ 重要说明：以下流程仅计算并返回值，不直接写入预算视图              │
+│                                                                       │
+│  CategoryTemplateContext.init(templates, category, month)            │
+│    ├─ 计算上月余额 fromLastMonth                                       │
+│    ├─ 校验：checkByAndScheduleAndSpend()                              │
+│    └─ 分类：templates / remainder / goals                              │
+│                                                                       │
+│  runTemplatesForPriority(priority, budgetAvail, availStart)          │
+│    ├─ 循环处理同优先级模板                                             │
 │    │                                                                  │
-│    ├─ createScheduleList() → 计算每个计划的当期目标                  │
-│    │   ├─ 通过 name 查找 Schedule → getRuleForSchedule()          │
-│    │   ├─ getScheduledAmount() → 基础金额                            │
-│    │   ├─ 应用 adjustment (percent/fixed)                            │
-│    │   ├─ getNextDate() → 获取下次日期                                │
-│    │   ├─ rule.execActions() → 执行规则动作（含 BALANCE_OF）         │
-│    │   ├─ 月度内多次发生 → 累加金额                                   │
-│    │   └─ 过滤 completed=1 的计划                                    │
+│    │  ┌─ schedule 模板首次命中                                       ─┐│
+│    │  │                                                             ││
+│    │  │  runSchedule(...)  ← 传入累计 to_budget                    ││
+│    │  │    ├─ createScheduleList() → 计算每个计划的当期目标            ││
+│    │  │    ├─ 分类：pay-month-of vs sinking                          ││
+│    │  │    └─ 返回 { to_budget, errors, remainder,                   ││
+│    │  │             perScheduleMonthly }                            ││
+│    │  │                                                             ││
+│    │  │  newBudget = ret.to_budget - toBudget                       ││
+│    │  │  (计算增量，避免重复累计)                                     ││
+│    │  │                                                             ││
+│    │  └───────────────────────────────────────────────────────────────┘│
 │    │                                                                  │
-│    ├─ 分类：pay-month-of vs sinking                                 │
-│    │   ├─ pay-month-of: 当月到期 / 月周度高频率                     │
-│    │   └─ sinking: 年度/双月等需要分期储蓄                          │
-│    │                                                                  │
-│    ├─ pay-month-of 处理                                              │
-│    │   └─ 全额计入 to_budget                                          │
-│    │                                                                  │
-│    └─ sinking 处理                                                    │
-│        ├─ 余额充足 → getMonthlyBaseContribution()                  │
-│        │   ├─ yearly:  target/12                                     │
-│        │   ├─ monthly: target/interval                               │
-│        │   └─ weekly/daily: target/intervalMonths                   │
-│        │                                                              │
-│        └─ 余额不足 → getSinkingContributionBreakdown()             │
-│            └─ 按到期顺序分配余额（先覆盖早到期的）                    │
+│    ├─ 累加 toBudget += newBudget                                      │
+│    ├─ redistributeBatch() → 按权重分配到各模板行                       │
+│    │   (schedule 使用 perScheduleMonthly 作为权重)                     │
+│    ├─ limit 检查 + clamp                                              │
+│    ├─ hideDecimal 四舍五入                                             │
+│    ├─ available clamp（非收入类别）                                  │
+│    └─ 写入 perTemplateContribution Map                                │
+│                                                                       │
+│  runRemainder(budgetAvail, perWeight) → 处理剩余权重模板               │
+│                                                                       │
+│  getValues()                                                          │
+│    ├─ runGoal() → 计算 goalAmount                                      │
+│    └─ 返回 { budgeted, goal, longGoal, perTemplateContribution }      │
+│                                                                       │
+│  ⚠️ 实际落库：由上层调用者处理                                        │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -802,7 +1207,10 @@ if (num_months < 0) {
 | `packages/loot-core/src/types/models/schedule.ts` | Schedule 类型定义 |
 | `packages/loot-core/src/types/models/templates.ts` | ScheduleTemplate 类型定义 |
 | `packages/loot-core/src/shared/schedules.ts` | 共享工具：getStatus, getNextDate, getScheduledAmount 等 |
-| `packages/loot-core/src/server/schedules/app.ts` | 计划 CRUD + 自动推进服务 |
-| `packages/loot-core/src/server/budget/schedule-template.ts` | 预算模板求值逻辑 |
+| `packages/loot-core/src/server/schedules/app.ts` | 计划 CRUD + 自动推进服务 + schedules_next_date 更新逻辑 |
+| `packages/loot-core/src/server/budget/schedule-template.ts` | 预算模板求值逻辑（runSchedule） |
+| `packages/loot-core/src/server/budget/category-template-context.ts` | 分类模板上下文（调用 runSchedule 并汇总结果） |
 | `packages/loot-core/src/server/util/rschedule.ts` | rSchedule 库封装 |
 | `packages/loot-core/src/server/rules/rule.ts` | 规则执行（execActions） |
+| `packages/loot-core/src/server/aql/schema/index.ts` | v_schedules 视图定义（next_date 选择逻辑） |
+| `packages/loot-core/migrations/1618975177358_schedules.sql` | schedules_next_date 表结构 |
