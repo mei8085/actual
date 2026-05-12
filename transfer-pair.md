@@ -706,6 +706,270 @@ if (transferTrans.is_child) {
 
 ---
 
+## 测试证据核查
+
+### 6.1 现有测试覆盖分析
+
+#### 测试文件列表
+
+| 文件路径 | 测试范围 |
+|---------|---------|
+| `packages/loot-core/src/shared/transfer.test.ts` | `validForTransfer` 函数的边界条件验证 |
+| `packages/loot-core/src/server/transactions/transfer.test.ts` | 转账插入/更新/删除/分类清除/拆分交易 |
+
+#### 逐条核对目标场景
+
+##### 场景 A：同时删除两笔互配转账
+
+**核查结论**：❌ **无直接测试**
+
+**现有证据分析**：
+
+1. **代码注释证据**（`transfer.ts:98-101`）
+   ```typescript
+   // Perform operations on the transfer transaction only
+   // if it is found. For example: when users delete both
+   // (in & out) transfer transactions at the same time -
+   // transfer transaction will not be found.
+   ```
+   开发者**明确意识到**这个边界场景，并在注释中提到了"用户同时删除两笔转账交易"的情况。
+
+2. **代码防御逻辑**（`transfer.ts:102`）
+   ```typescript
+   if (transferTrans) {
+     // 只有在配对交易存在时才处理它
+   }
+   // ⭐ 无论配对交易是否存在，都执行兜底逻辑
+   await db.updateTransaction({ id: transaction.id, transfer_id: null });
+   ```
+   代码结构本身就是防御性的：`if (transferTrans)` 条件判断 + `if` 块外的兜底更新。
+
+3. **测试缺失**：
+   - 没有测试用例调用 `batchUpdateTransactions` 并传入 `deleted: [txnA, txnB]`
+   - 没有测试验证两笔交易同时被标记 `tombstone=1` 后，`removeTransfer` 的行为
+
+**结论来源**：**代码推导**（基于代码结构和开发者注释）
+
+---
+
+##### 场景 B：先后快速删除两笔互配转账
+
+**核查结论**：❌ **无直接测试**
+
+**现有证据分析**：
+
+1. **间接证据 1：单删测试**（`transfer.test.ts:129-131`）
+   ```typescript
+   await db.deleteTransaction(transaction);
+   await transfer.onDelete(transaction);
+   differ.expectToMatchDiff(await getAllTransactions());
+   ```
+   这个测试验证了**删除一笔转账会自动删除其配对方**。
+   - 从快照 `transfer.test.ts.snap:592-655` 可以看到：两笔配对交易都消失了
+   - 但这是**正常路径**测试，不是边界场景
+
+2. **间接证据 2：幂等性设计**
+   - `delete_` 函数只是设置 `tombstone = 1`，重复设置无副作用
+   - `removeTransfer` 函数无论配对交易是否存在，都会清理当前交易的 `transfer_id`
+
+3. **测试缺失**：
+   - 没有测试模拟 "第一笔删除时连带删除第二笔，然后第二笔的删除请求再到来" 的时序
+   - 没有并发/竞态条件测试
+
+**结论来源**：**代码推导 + 间接测试证据**
+
+---
+
+### 6.2 已有测试覆盖的场景
+
+| 场景 | 测试状态 | 证据位置 |
+|-----|---------|---------|
+| ✅ 单删转账（自动删除配对方） | 有直接测试 | `transfer.test.ts:129-131` + 快照 7 |
+| ✅ 转账创建/更新 | 有直接测试 | `transfer.test.ts:53-132` + 快照 1-6 |
+| ✅ 分类清除规则 | 有直接测试 | `transfer.test.ts:134-172` |
+| ✅ 拆分交易子交易转账保留 | 有直接测试 | `transfer.test.ts:174-220` |
+| ✅ `validForTransfer` 边界条件 | 有直接测试 | `shared/transfer.test.ts:28-74` |
+| ❌ 同时删除两笔互配转账 | **无直接测试** | 只有代码注释 |
+| ❌ 先后快速删除两笔互配转账 | **无直接测试** | 只有间接证据 |
+
+---
+
+### 6.3 缺失的验证证据
+
+#### 缺失 1：同时删除两笔互配转账的集成测试
+
+**建议新增测试用例**：
+
+```typescript
+test('deleting both paired transfers simultaneously works correctly', async () => {
+  await prepareDatabase();
+  
+  // 1. 创建转账配对
+  const transferTwo = await db.first(
+    "SELECT * FROM payees WHERE transfer_acct = 'two'"
+  );
+  let txnA = {
+    account: 'one',
+    amount: 5000,
+    payee: transferTwo.id,
+    date: '2017-01-01',
+  };
+  txnA.id = await db.insertTransaction(txnA);
+  await transfer.onInsert(txnA);
+  
+  txnA = await db.getTransaction(txnA.id);
+  const txnB = await db.getTransaction(txnA.transfer_id);
+  
+  // 2. 验证配对建立
+  expect(txnA.transfer_id).toBe(txnB.id);
+  expect(txnB.transfer_id).toBe(txnA.id);
+  
+  // 3. 模拟 batchUpdateTransactions 的执行顺序：
+  //    先数据库删除，再转账后处理
+  //    这是关键：onDelete 执行时，两笔交易都已 tombstone=1
+  await db.deleteTransaction(txnA);
+  await db.deleteTransaction(txnB);
+  
+  // 4. 此时 getTransaction 应该返回 undefined
+  const txnAAfterDelete = await db.getTransaction(txnA.id);
+  const txnBAfterDelete = await db.getTransaction(txnB.id);
+  expect(txnAAfterDelete).toBeUndefined();
+  expect(txnBAfterDelete).toBeUndefined();
+  
+  // 5. 调用 onDelete（模拟转账后处理）
+  //    这是核心验证：removeTransfer 在配对交易找不到时不应抛错
+  await expect(transfer.onDelete(txnA)).resolves.not.toThrow();
+  await expect(transfer.onDelete(txnB)).resolves.not.toThrow();
+  
+  // 6. 验证：即使配对交易不存在，函数也正常完成
+  //    （虽然因为 tombstone=1，我们无法直接查询验证 transfer_id）
+});
+```
+
+**为什么需要这个测试？**
+- 验证 `getTransaction` 返回 `undefined` 时，`if (transferTrans)` 分支正确跳过
+- 验证兜底的 `updateTransaction` 调用不会出错（即使交易已 tombstone）
+
+---
+
+#### 缺失 2：先后快速删除的时序测试
+
+**建议新增测试用例**：
+
+```typescript
+test('deleting transfers in quick succession is idempotent', async () => {
+  await prepareDatabase();
+  
+  // 1. 创建转账配对
+  const transferTwo = await db.first(
+    "SELECT * FROM payees WHERE transfer_acct = 'two'"
+  );
+  let txnA = {
+    account: 'one',
+    amount: 5000,
+    payee: transferTwo.id,
+    date: '2017-01-01',
+  };
+  txnA.id = await db.insertTransaction(txnA);
+  await transfer.onInsert(txnA);
+  
+  txnA = await db.getTransaction(txnA.id);
+  const txnB = await db.getTransaction(txnA.transfer_id);
+  
+  // 2. 第一次删除：正常路径，会连带删除 txnB
+  await db.deleteTransaction(txnA);
+  await transfer.onDelete(txnA);
+  
+  // 3. 验证 txnB 也被删除了（tombstone=1）
+  const txnBAfterFirstDelete = await db.getTransaction(txnB.id);
+  expect(txnBAfterFirstDelete).toBeUndefined();
+  
+  // 4. 模拟用户快速点击删除 txnB（竞态场景）
+  //    此时 txnB 已被标记 tombstone=1
+  await db.deleteTransaction(txnB);  // 幂等：重复设置 tombstone=1
+  await expect(transfer.onDelete(txnB)).resolves.not.toThrow();  // 不应抛错
+  
+  // 5. 验证：没有副作用，系统状态一致
+  const allTxns = await getAllTransactions();
+  // 两笔交易都不应出现在 v_transactions 视图中
+  const txnAInView = allTxns.find(t => t.id === txnA.id);
+  const txnBInView = allTxns.find(t => t.id === txnB.id);
+  expect(txnAInView).toBeUndefined();
+  expect(txnBInView).toBeUndefined();
+});
+```
+
+**为什么需要这个测试？**
+- 验证 `removeTransfer` 的幂等性
+- 验证第二次删除时，`getTransaction` 返回 `undefined` 后的行为
+- 验证系统最终状态的一致性
+
+---
+
+#### 缺失 3：通过 batchUpdateTransactions 的端到端测试
+
+**建议新增测试用例**：
+
+```typescript
+import { batchUpdateTransactions } from './index';
+
+test('batch deleting both paired transfers via batchUpdateTransactions', async () => {
+  await prepareDatabase();
+  
+  // 1. 创建转账配对
+  // ...（同上）
+  
+  txnA = await db.getTransaction(txnA.id);
+  const txnB = await db.getTransaction(txnA.transfer_id);
+  
+  // 2. 通过 batchUpdateTransactions 同时删除
+  //    这才是真实的用户操作路径
+  const result = await batchUpdateTransactions({
+    deleted: [{ id: txnA.id }, { id: txnB.id }],
+  });
+  
+  // 3. 验证结果
+  expect(result.deleted).toHaveLength(2);
+  
+  // 4. 验证最终状态
+  const allTxns = await getAllTransactions();
+  expect(allTxns.some(t => t.id === txnA.id)).toBe(false);
+  expect(allTxns.some(t => t.id === txnB.id)).toBe(false);
+});
+```
+
+**为什么需要这个测试？**
+- 现有测试都只是直接调用 `transfer.onDelete`
+- 真实场景是用户通过 `batchUpdateTransactions` 触发
+- 需要验证整个链路：数据库删除 → `getTransactionsByIds` → `onDelete`
+
+---
+
+### 6.4 证据等级总结
+
+| 结论 | 证据类型 | 置信度 |
+|-----|---------|-------|
+| 单删转账自动删除配对方 | 直接测试 | ⭐⭐⭐⭐⭐ |
+| 同时删除两笔时系统安全 | 代码结构 + 开发者注释 | ⭐⭐⭐ |
+| 先后快速删除时系统安全 | 代码结构 + 幂等性设计 | ⭐⭐⭐ |
+| 子交易作为配对时不被删除 | 直接测试 | ⭐⭐⭐⭐⭐ |
+| 父交易不能作为转账 | 直接测试 | ⭐⭐⭐⭐⭐ |
+
+### 6.5 测试差距评估
+
+**高优先级缺失**：
+1. 同时删除两笔互配转账的集成测试
+2. 通过 `batchUpdateTransactions` 的端到端删除测试
+
+**中优先级缺失**：
+3. 先后快速删除的时序测试
+4. 并发删除的竞态条件测试（虽然在单线程 Node.js 环境中可能不是高风险）
+
+**低优先级**：
+5. 性能测试（大量转账同时删除的处理效率）
+
+---
+
 ## 完整流程图
 
 ```
