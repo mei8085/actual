@@ -199,8 +199,14 @@
 | **切回笔记** | `UnmigrateBudgetAutomationsModal` | 用户点击"Save notes & un-migrate" | 切换数据源 |
 
 **关键区别**：
-- 打开面板：笔记→UI 是"加载"（同步可能存在的笔记
-- 切回笔记：UI→笔记 是"切换控制权移交"（先保存→清空 UI 模板→重新同步新笔记
+
+**场景对比**：
+
+| 场景 | 方向 | 含义 |
+|-----|------|------|
+| **打开面板** | 笔记 → UI | 是"加载"动作：从笔记同步可能存在的模板到 UI 编辑器中，供用户查看和编辑。 |
+| **应用模板** | 笔记/UI → Sheet | 是"解析+应用"动作：解析最新的笔记模板（排除 UI 来源），计算预算金额，写入月度电子表格。 |
+| **切回笔记** | UI → 笔记 | 是"控制权移交"动作：先将 UI 模板导出到笔记、清空 UI 模板、切换 source 标记、最后显式同步笔记模板，确保笔记成为唯一数据源。 |
 
 - **同步流程**：
   ```typescript
@@ -904,13 +910,14 @@ private limitMet: boolean = false;            // 是否已达限制
 |---------|------|
 | `packages/loot-core/src/server/budget/goal-template.ts` | 核心逻辑：存储、读取、计算、应用 |
 | `packages/loot-core/src/server/budget/category-template-context.ts` | 计算引擎：模板执行上下文 |
-| `packages/loot-core/src/server/budget/template-notes.ts` | 笔记模板：解析、同步、序列化 |
+| `packages/loot-core/src/server/budget/template-notes.ts` | 笔记模板：解析、同步、序列化、反序列化 |
 | `packages/loot-core/src/server/budget/statements.ts` | SQL 语句：来源隔离、笔记查询 |
 | `packages/loot-core/src/server/budget/app.ts` | API 路由：定义预算相关方法 |
 | `packages/loot-core/src/types/models/templates.ts` | 类型定义：Template 类型系统 |
 | `packages/desktop-client/src/hooks/useBudgetAutomations.ts` | 前端 Hook：加载自动化配置 |
 | `packages/desktop-client/src/components/budget/goals/CategoryAutomationButton.tsx` | UI 入口：自动化按钮 |
 | `packages/desktop-client/src/components/modals/BudgetAutomationsModal/BudgetAutomationsBody.tsx` | 编辑器主界面：保存、预览、校验 |
+| `packages/desktop-client/src/components/modals/UnmigrateBudgetAutomationsModal.tsx` | 切回笔记模式：控制权移交、显式同步 |
 
 ---
 
