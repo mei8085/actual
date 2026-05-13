@@ -224,13 +224,7 @@ async function compareMessages(messages: Message[]): Promise<Message[]> {
 
 对于同一字段（`dataset + row + column`）的消息，根据其时间戳与数据库中已有记录的时间戳关系，分为以下三种情况：
 
-| 状态 | 时间戳关系 | SQL 查询条件 | 处理方式 |
-|------|-----------|-------------|---------|
-| **新消息** | 消息时间戳 < 所有已有记录<br>或数据库中无记录 | `res.length === 0` | 1. 添加到 newMessages<br>2. 应用到数据库（执行 INSERT 或 UPDATE）<br>3. 记录到 messages_crdt 表<br>4. 插入到 Merkle 树 |
-| **旧消息** | 存在已有记录的时间戳 > 消息时间戳 | `res.length > 0`<br>`&& res[0].timestamp !== timestampStr` | 1. 标记 `old: true`<br>2. 添加到 newMessages<br>3. **不**应用到数据库<br>4. 仍记录到 messages_crdt 表<br>5. 仍插入到 Merkle 树 |
-| **重复消息** | 存在已有记录的时间戳 == 消息时间戳 | `res.length > 0`<br>`&& res[0].timestamp === timestampStr` | 1. 忽略，不添加到 newMessages<br>2. **不**应用到数据库<br>3. **不**重复记录到 messages_crdt 表<br>4. Merkle 树中已存在，无需重复插入 |
-
-**SQL 查询逻辑详解：**
+**SQL 查询逻辑：**
 ```sql
 SELECT timestamp 
 FROM messages_crdt 
@@ -238,17 +232,41 @@ WHERE dataset = ? AND row = ? AND column = ?
   AND timestamp >= ?  -- 查找时间戳 >= 当前消息的记录
 ```
 
-- 如果查询结果为空（`res.length === 0`）：说明没有任何记录的时间戳 >= 当前消息，即当前消息是最新的 → **新消息**
-- 如果查询结果非空，但第一条的时间戳 != 当前消息（`res[0].timestamp !== timestampStr`）：说明存在记录的时间戳 > 当前消息 → **旧消息**
-- 如果查询结果非空，且第一条的时间戳 == 当前消息（`res[0].timestamp === timestampStr`）：说明已存在完全相同的消息 → **重复消息**
+**三种状态判定：**
+
+| 状态 | SQL 查询结果 | 对应时间戳关系 | 处理方式 |
+|------|-------------|---------------|---------|
+| **新消息** | `res.length === 0` | 没有记录 >= 当前消息<br>即：数据库为空，或所有记录时间戳 < 当前消息时间戳 | 1. 添加到 newMessages<br>2. 应用到数据库（执行 INSERT 或 UPDATE）<br>3. 记录到 messages_crdt 表<br>4. 插入到 Merkle 树 |
+| **旧消息** | `res.length > 0`<br>`&& res[0].timestamp !== timestampStr` | 存在记录时间戳 > 当前消息时间戳 | 1. 标记 `old: true`<br>2. 添加到 newMessages<br>3. **不**应用到数据库<br>4. 仍记录到 messages_crdt 表<br>5. 仍插入到 Merkle 树 |
+| **重复消息** | `res.length > 0`<br>`&& res[0].timestamp === timestampStr` | 存在记录时间戳 == 当前消息时间戳 | 1. 忽略，不添加到 newMessages<br>2. **不**应用到数据库<br>3. **不**重复记录到 messages_crdt 表<br>4. Merkle 树中已存在，无需重复插入 |
+
+**判定逻辑详解：**
+
+1. **新消息**：`res.length === 0`
+   - SQL 查询 `timestamp >= ?` 返回空
+   - 说明数据库中没有任何记录的时间戳 >= 当前消息
+   - 两种可能：数据库为空，或所有记录的时间戳都 < 当前消息
+   - 结论：当前消息是该字段的**最新**消息，需要应用
+
+2. **旧消息**：`res.length > 0 && res[0].timestamp !== timestampStr`
+   - SQL 查询返回至少一条记录
+   - 第一条记录的时间戳 != 当前消息时间戳
+   - 因为查询的是 `timestamp >= ?`，第一条是最小的 >= 当前消息的时间戳
+   - 如果第一条 != 当前消息，说明它 > 当前消息
+   - 结论：数据库中已有**更新**的消息，当前消息是旧消息，不应用
+
+3. **重复消息**：`res.length > 0 && res[0].timestamp === timestampStr`
+   - SQL 查询返回至少一条记录
+   - 第一条记录的时间戳 == 当前消息时间戳
+   - 结论：当前消息已存在，是**重复**消息，完全忽略
 
 #### 冲突解决总结
 
-| 时间戳关系 | 消息状态 | 是否应用到数据库 | 是否记录到 messages_crdt | 是否插入到 Merkle 树 |
-|-----------|---------|-----------------|------------------------|---------------------|
-| 消息时间戳 < 所有已有记录 | 新消息 | ✅ 是 | ✅ 是 | ✅ 是 |
-| 存在记录时间戳 > 消息时间戳 | 旧消息 | ❌ 否 | ✅ 是 | ✅ 是 |
-| 存在记录时间戳 == 消息时间戳 | 重复消息 | ❌ 否 | ❌ 否 | ❌ 否（已存在） |
+| SQL 查询结果 | 消息状态 | 时间戳关系 | 是否应用到数据库 | 是否记录到 messages_crdt | 是否插入到 Merkle 树 |
+|-------------|---------|-----------|-----------------|------------------------|---------------------|
+| `res.length === 0` | 新消息 | 无记录 >= 当前消息 | ✅ 是 | ✅ 是 | ✅ 是 |
+| `res.length > 0 && res[0].timestamp !== timestampStr` | 旧消息 | 存在记录 > 当前消息 | ❌ 否 | ✅ 是 | ✅ 是 |
+| `res.length > 0 && res[0].timestamp === timestampStr` | 重复消息 | 存在记录 == 当前消息 | ❌ 否 | ❌ 否 | ❌ 否（已存在） |
 
 **这意味着：**
 - 时间戳较大的消息"获胜"
@@ -369,13 +387,18 @@ export function prune(trie: TrieNode, n = 2): TrieNode {
 
 **时间戳比较：**
 - `2023-01-01T10:00:00.000Z-0000-AAAAAAAA` < `2023-01-01T10:00:00.001Z-0000-BBBBBBBB`
+- 即：设备A的时间戳 < 设备B的时间戳
 
 **同步结果（无论消息到达顺序如何）：**
 
-| 到达顺序 | 设备A消息状态 | 设备B消息状态 | 最终值 |
+| 到达顺序 | 设备A消息判定 | 设备B消息判定 | 最终值 |
 |---------|--------------|--------------|--------|
-| A先到，B后到 | 新消息（应用） | 新消息（应用，覆盖A） | $200 |
-| B先到，A后到 | 旧消息（不应用） | 新消息（应用） | $200 |
+| **A先到，B后到** | | | |
+| A消息到达 | `res.length === 0` → 新消息（应用） | - | $100 |
+| B消息到达 | - | `res.length === 0` → 新消息（应用，覆盖A） | $200 |
+| **B先到，A后到** | | | |
+| B消息到达 | - | `res.length === 0` → 新消息（应用） | $200 |
+| A消息到达 | `res.length > 0 && res[0].timestamp !== A时间戳` → 旧消息（不应用） | - | $200（保持不变） |
 
 **结论：** 两台设备最终都显示 $200，因为 B 的时间戳 > A 的时间戳。
 
@@ -385,16 +408,18 @@ export function prune(trie: TrieNode, n = 2): TrieNode {
 ```
 1. 离线状态修改 transactions.id='tx1'.amount 为 $300
    时间戳: 2023-01-01T11:00:00.000Z-0000-AAAAAAAA
-   应用成功（本地数据库无更新记录）
+   判定: 本地数据库为空 → res.length === 0 → 新消息 → 应用成功
+   本地 messages_crdt 现在有记录: timestamp=11:00:00.000
 
 2. 恢复网络，收到设备 B 的旧消息
    B消息时间戳: 2023-01-01T10:30:00.000Z-0000-BBBBBBBB
    相同消息键: (transactions, tx1, amount)
 
 3. compareMessages 检测：
-   - 查询 messages_crdt 中 timestamp >= 10:30:00 的记录
-   - 找到 A 的记录: 11:00:00.000 > 10:30:00.000
-   - 且 11:00:00.000 != 10:30:00.000
+   - SQL: SELECT timestamp FROM messages_crdt WHERE ... AND timestamp >= '10:30:00'
+   - 返回结果: ['11:00:00.000Z-0000-AAAAAAAA']
+   - res.length = 1 > 0
+   - res[0].timestamp ('11:00:00...') !== '10:30:00...'
    
 4. 判定结果：
    - B的消息: 旧消息（old: true）
@@ -431,7 +456,10 @@ Actual Budget 的 CRDT 实现采用了 **HULC 混合逻辑时钟** + **Last Writ
 2. **冲突合并**：
    - 按时间戳字典序**升序**排序消息，较早的先应用
    - 时间戳**较大**的消息覆盖旧消息（Last Write Wins）
-   - 三种消息状态：新消息（应用）、旧消息（不应用但记录）、重复消息（忽略）
+   - 三种消息状态判定基于 SQL `timestamp >= ?` 查询：
+     - 新消息：`res.length === 0`（无记录 >= 当前消息）
+     - 旧消息：`res.length > 0 && res[0].timestamp !== 当前消息`（存在记录 > 当前消息）
+     - 重复消息：`res.length > 0 && res[0].timestamp === 当前消息`（存在记录 == 当前消息）
    - 所有设备按相同规则合并，保证最终一致性
 
 3. **适用场景**：
