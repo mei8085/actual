@@ -815,6 +815,116 @@ BudgetAutomationsBody 中 useEffect (debounce 200ms)
                  └─ 返回 { budgeted, perTemplate } 用于预览显示
 ```
 
+#### 调用链 5：切回笔记模式（Un-migrate）
+
+**说明**：这是跨模块的控制权移交过程，对应触发时机的第 3 条"从 UI 切回笔记模式时"。三步按严格顺序执行：保存笔记 → 切换来源 → 显式同步。
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                       前端层 (desktop-client)                         │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  UnmigrateBudgetAutomationsModal.onSave(close)                      │
+│                                                                     │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │  Step 1: 保存合并后的笔记到 notes 表                         │   │
+│  │                                                              │   │
+│  │  send('notes-save-undoable', {                               │   │
+│  │    id: categoryId,                                           │   │
+│  │    note: editedNotes  // 现有笔记 + 导出的模板语法           │   │
+│  │  })                                                          │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                           │                                         │
+│                           v                                         │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │  Step 2: 清空 UI 模板，切换来源标记为 notes                   │   │
+│  │                                                              │   │
+│  │  send('budget/set-category-automations', {                   │   │
+│  │    categoriesWithTemplates: [{                               │   │
+│  │      id: categoryId,                                         │   │
+│  │      templates: []  // 清空 UI 模板                         │   │
+│  │    }],                                                       │   │
+│  │    source: 'notes'  // 标记为笔记来源                       │   │
+│  │  })                                                          │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                           │                                         │
+│                           v                                         │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │  Step 3: 显式同步笔记模板（重新从笔记解析）                   │   │
+│  │                                                              │   │
+│  │  send('budget/store-note-templates')                         │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                           │                                         │
+│                           v                                         │
+│                      close()  // 关闭模态框                          │
+└─────────────────────────────────────────────────────────────────────┘
+                           │
+                           v
+┌─────────────────────────────────────────────────────────────────────┐
+│                       后端层 (loot-core/server)                      │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │  Step 1: 'notes-save-undoable'                             │   │
+│  │      └─ 更新 notes 表，写入包含模板语法的笔记               │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                                                                     │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │  Step 2: 'budget/set-category-automations'                  │   │
+│  │      └─ goal-template.storeTemplates({ source: 'notes' })   │   │
+│  │           ├─ storeNoteCleanups([categoryId])               │   │
+│  │           └─ db.updateWithSchema('categories', {            │   │
+│  │                id: categoryId,                              │   │
+│  │                goal_def: null,        // 清空              │   │
+│  │                template_settings: {                         │   │
+│  │                  source: 'notes'     // 切换来源           │   │
+│  │                }                                            │   │
+│  │              })                                             │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                                                                     │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │  Step 3: 'budget/store-note-templates'                      │   │
+│  │      └─ template-notes.storeNoteTemplates()                 │   │
+│  │           ├─ getCategoriesWithTemplates()                   │   │
+│  │           │    └─ 现在 source='notes'，该类别会被包含       │   │
+│  │           ├─ storeTemplates({ source: 'notes' })            │   │
+│  │           │    └─ 重新解析笔记 → 填充 goal_def              │   │
+│  │           └─ resetCategoryGoalDefsWithNoTemplates()         │   │
+│  │                └─ 清理无模板的类别                          │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────┘
+                           │
+                           v
+┌─────────────────────────────────────────────────────────────────────┐
+│                            数据层                                    │
+├─────────────────────────────────────────────────────────────────────┤
+│  notes 表: note 字段更新（Step 1）                                  │
+│  categories 表: goal_def=null, template_settings.source='notes'（Step 2）│
+│  categories 表: goal_def 被重新填充（Step 3，从笔记解析）           │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+**前置调用链：渲染预览（弹窗打开时）**
+
+```
+UnmigrateBudgetAutomationsModal.useEffect([templates, categoryData])
+  │
+  ├─ 构建 idToName 映射（百分比模板的 category 是 ID，需转为名称）
+  │
+  ├─ sanitizePercentageCategoriesForNotes(templates, idToName)
+  │    └─ 将 percentage 模板中的 category ID → category name
+  │
+  └─ send('budget/render-note-templates', sanitizedTemplates)
+       │
+       └─ app.ts: 'budget/render-note-templates'
+            │
+            └─ template-notes.renderNoteTemplates(templates)
+                 │
+                 └─ unparse(templates)  // Template[] → 文本语法
+                      │
+                      └─ 返回 "#template 100\n#goal 5000" 格式字符串
+```
+
 ### 关键数据结构
 
 #### Template 类型定义
@@ -859,12 +969,12 @@ private limitMet: boolean = false;            // 是否已达限制
 ### 笔记模板同步触发时机
 
 **真实触发**：
-1. **打开 UI 编辑器时**：`useBudgetAutomations` hook 自动调用
-   - 目的：加载可能存在的笔记模板到编辑器中
-   - 注意：只会处理 `source <> 'ui'` 的类别
 
-2. **应用模板前**：`applyTemplate()` / `overwriteTemplate()` 等函数自动调用
-   - 目的：确保最新的笔记模板被解析
+| 触发场景 | 调用方 | 目的 | 备注 |
+|---------|-------|------|------|
+| **1. 打开 UI 编辑器时** | `useBudgetAutomations` hook | 加载可能存在的笔记模板到编辑器中 | 只会处理 `source <> 'ui'` 的类别 |
+| **2. 应用模板前** | `applyTemplate()` / `overwriteTemplate()` 等函数 | 确保最新的笔记模板被解析 | 排除 UI 来源类别 |
+| **3. 从 UI 切回笔记模式时** | `UnmigrateBudgetAutomationsModal` | 切换控制权，确保笔记重新成为数据源 | 用户点击"Save notes & un-migrate"按钮后显式触发 |
 
 **不会触发**：
 1. 普通预算页面加载时
