@@ -141,12 +141,66 @@
 
 - **同步函数**：`storeNoteTemplates()`
   - 文件：`packages/loot-core/src/server/budget/template-notes.ts:22-28`
-  - **真实触发时机**：
-    1. **打开 UI 编辑器时**：`useBudgetAutomations` hook 自动调用（用于加载可能存在的笔记模板）
-    2. **应用模板前**：`applyTemplate()` / `overwriteTemplate()` 等函数自动调用
+  - **真实触发时机**（按用户操作路径）：
+
+| 触发场景 | 触发路径 | 目的 |
+|---------|---------|------|
+| **打开自动化面板时** | `useBudgetAutomations` hook 自动调用 | 加载可能存在的笔记模板到编辑器 |
+| **执行模板应用动作时** | `applyTemplate()` / `overwriteTemplate()` 等函数自动调用 | 确保最新的笔记模板被解析 |
+| **从 UI 切回笔记模式时** | `UnmigrateBudgetAutomationsModal` 显式调用 | 切换控制权：清空 UI 模板，让笔记成为数据源 |
+
   - **不触发的场景**：
     - 普通预算页面加载时**不会**自动同步
     - 切换月份时**不会**自动同步
+
+#### 2.4 从自动化界面切回笔记模式（Un-migrate）
+
+**功能描述**：用户可以通过 "Un-migrate to text notes" 功能，将 UI 管理的模板重新切换回笔记管理。
+
+**触发组件**：`UnmigrateBudgetAutomationsModal.tsx`
+  - 位置：`packages/desktop-client/src/components/modals/UnmigrateBudgetAutomationsModal.tsx`
+
+**核心流程**：
+
+```
+1. 渲染预览
+   ├─ useEffect 调用 'budget/render-note-templates'
+   │    └─ template-notes.renderNoteTemplates()
+   │         └─ unparse(templates)  → 转为文本语法
+   │
+2. 合并现有笔记
+   │
+3. 保存
+   ├─ 第1步：send('notes-save-undoable')
+   │         └─ 保存合并后的笔记到 notes 表
+   │
+   ├─ 第2步：send('budget/set-category-automations', {
+   │         │         templates: [],
+   │         │         source: 'notes'
+   │         │       })
+   │         └─ 清空 goal_def，标记 source: 'notes'
+   │
+   └─ 第3步：send('budget/store-note-templates')
+             └─ 显式同步笔记模板
+```
+
+**为什么第 3 步显式调用的意义**：
+- 第 2 步只是清空了 `goal_def` 并标记 `source: 'notes'`
+- 但此时 `goal_def` 是 `null`，需要立即从笔记重新解析
+- 确保控制权完整移交给笔记解析器
+- 下次打开面板时会重新从笔记解析（因为 source 已改为 'notes'）
+
+**与其他场景的关系**：
+
+| 场景 | 调用方 | 调用时机 | 目的 |
+|-----|-------|---------|------|
+| **打开面板** | `useBudgetAutomations` hook | 模态框打开时 | 加载已有笔记模板 |
+| **应用模板** | `applyTemplate()` 等 | 用户点击应用按钮 | 解析最新笔记 |
+| **切回笔记** | `UnmigrateBudgetAutomationsModal` | 用户点击"Save notes & un-migrate" | 切换数据源 |
+
+**关键区别**：
+- 打开面板：笔记→UI 是"加载"（同步可能存在的笔记
+- 切回笔记：UI→笔记 是"切换控制权移交"（先保存→清空 UI 模板→重新同步新笔记
 
 - **同步流程**：
   ```typescript
