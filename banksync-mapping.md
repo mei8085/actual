@@ -486,9 +486,31 @@ export const defaultMappings: Mappings = new Map([
 
 ### 6.2 动态字段发现
 
+**实际实现说明**：
 - 映射选项不是硬编码的，而是从实际交易数据中提取
-- 查询该账户最近的一笔同步交易（`raw_synced_data`）
-- 解析原始数据后动态生成可用字段列表
+- 查询满足条件的交易后，取查询结果数组的第一条作为示例交易
+- 解析该交易的 `raw_synced_data` 原始数据后，动态生成可用字段候选列表
+
+**代码证据**：
+```typescript
+// useBankSyncAccountSettings.ts:60-67 - 查询条件无显式排序/限制
+const transactionQuery = q('transactions')
+  .filter({
+    account: accountId,
+    amount: transactionDirection === 'payment' ? { $lte: 0 } : { $gt: 0 },
+    raw_synced_data: { $ne: null },
+  })
+  .options({ splits: 'none' })
+  .select('*');  // ⚠️ 无 orderBy、无 limit 子句
+
+// useBankSyncAccountSettings.ts:73 - 直接取数组首条
+const data = transactions?.[0]?.raw_synced_data;
+```
+
+**关键说明**：
+- 查询条件中未见显式的 `orderBy` 排序或 `limit(1)` 限制
+- 因此 `transactions[0]` 仅代表查询结果集中的第一条，**不等于严格意义上的"最近一笔"**
+- 实际排序取决于数据库查询默认行为（通常是主键/id 顺序）
 
 ### 6.3 嵌套字段支持差异
 
