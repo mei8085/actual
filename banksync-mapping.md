@@ -239,9 +239,13 @@ const saveSettings = () => {
 }
 ```
 
-### 4.3 回放链路（同步时应用映射）
+### 4.3 回放链路（同步时应用映射）- 真实实现
 
 **核心函数**：`normalizeBankSyncTransactions` in `sync.ts`
+
+> **重要实现差异说明**：
+> - **UI 预览阶段**：使用 `getByPath` 函数支持嵌套字段路径解析
+> - **同步入库阶段**：直接按键名读取，**不支持嵌套路径**，但有回退逻辑
 
 #### Step 1: 读取配置
 
@@ -266,43 +270,50 @@ async function normalizeBankSyncTransactions(transactions, acctId) {
   ]);
 ```
 
-#### Step 2: 按交易应用映射
+#### Step 2: 按交易应用映射 - **真实代码实现**
 
 ```typescript
   const normalized = [];
   for (const trans of transactions) {
-    // 1. 根据金额判断交易方向
+    trans.cleared = Boolean(trans.booked);
+
+    if (!importPending && !trans.cleared) continue;
+
+    if (!trans.amount) {
+      trans.amount = trans.transactionAmount.amount;
+    }
+
+    // 根据金额选择映射方向
     const mapping = mappings.get(trans.amount <= 0 ? 'payment' : 'deposit');
 
-    // 2. 应用字段映射
-    const date = trans[mapping.get('date')] ?? trans.date;
-    const payeeName = trans[mapping.get('payee')] ?? trans.payeeName;
-    const notes = trans[mapping.get('notes')];
+    // ⚠️ 关键实现：直接按键名读取，不支持嵌套路径！
+    // 例如：如果配置为 'paymentData.payer.name'，会尝试读取 trans['paymentData.payer.name']
+    // 这会返回 undefined，因为对象结构是 trans.paymentData.payer.name
+    
+    const date = trans[mapping.get('date')] ?? trans.date;           // 有回退
+    const payeeName = trans[mapping.get('payee')] ?? trans.payeeName; // 有回退
+    const notes = trans[mapping.get('notes')];                        // 无回退
 
-    // 3. 支持嵌套字段路径解析 (通过 getByPath 函数)
-    // 例: paymentData.payer.name → trans.paymentData.payer.name
+    // Validate the date because we do some stuff with it. The db
+    // layer does better validation, but this will give nicer errors
+    if (date == null) {
+      throw new Error('`date` is required when adding a transaction');
+    }
 
-    // 4. 构建标准化交易对象
-    normalized.push({
-      payee_name: payeeName,
-      trans: {
-        amount: amountToInteger(trans.amount),
-        payee: trans.payee,
-        account: trans.account,
-        date,
-        notes: importNotes && notes ? notes.trim() : null,
-        // ... 其他字段
-      },
-    });
+    if (payeeName == null) {
+      throw new Error('`payeeName` is required when adding a transaction');
+    }
+
+    // ... 后续处理
   }
-
-  return { normalized, payeesToCreate };
-}
 ```
 
-#### Step 3: 嵌套字段路径解析
+#### Step 3: UI 预览阶段的嵌套字段支持（仅用于预览）
 
 ```typescript
+// 文件: packages/desktop-client/src/components/banksync/EditSyncAccount.tsx
+
+// ✅ UI 预览使用 getByPath 支持嵌套路径
 function getByPath(obj: unknown, path: string): unknown {
   if (obj == null) return undefined;
 
@@ -318,48 +329,117 @@ function getByPath(obj: unknown, path: string): unknown {
 
   return current;
 }
+
+// UI 显示字段列表时使用 getByPath 解析示例值
+export const getFields = (transaction: Record<string, unknown>): MappableFieldWithExample[] =>
+  mappableFields.map(field => ({
+    actualField: field.actualField,
+    syncFields: field.syncFields
+      .map(syncField => {
+        const value = getByPath(transaction, syncField);  // ✅ 使用路径解析
+        return value !== undefined
+          ? { field: syncField, example: String(value) }
+          : null;
+      })
+      .filter((item): item is { field: string; example: string } => item !== null),
+  }));
+```
+
+### 4.4 实现差异对比表
+
+| 阶段 | 字段读取方式 | 嵌套路径支持 | 回退逻辑 |
+|------|-------------|------------|---------|
+| **UI 预览** | `getByPath(obj, path)` 递归解析 | ✅ 支持 | ❌ 无 |
+| **同步入库** | `trans[fieldName]` 直接按键名读取 | ❌ 不支持 | ✅ date/payee 有回退 |
+
+### 4.5 差异对配置生效的影响
+
+#### 问题现象
+
+用户在配置界面选择了嵌套字段（如 `paymentData.payer.name`）：
+- ✅ **UI 显示正常**：示例值正确显示（因为使用 `getByPath` 解析）
+- ❌ **实际同步失效**：该字段值为 `undefined`，最终使用回退值
+
+#### 受影响的字段配置
+
+如果用户配置了以下嵌套路径字段，同步时将无法正确读取：
+
+| 本地字段 | 常见嵌套路径配置 | 实际行为 |
+|---------|----------------|---------|
+| payee | `paymentData.payer.name` | 返回 `undefined` → 回退到 `trans.payeeName` |
+| payee | `paymentData.receiver.name` | 返回 `undefined` → 回退到 `trans.payeeName` |
+| payee | `merchant.name` | 返回 `undefined` → 回退到 `trans.payeeName` |
+| notes | `paymentData.payer.accountNumber` | 返回 `undefined` → notes 为 null |
+
+#### 回退逻辑的具体行为
+
+```typescript
+// date 字段回退
+// 配置为嵌套路径 → trans['paymentData.xxx'] = undefined
+// → 回退到 trans.date
+const date = trans[mapping.get('date')] ?? trans.date;
+
+// payee 字段回退  
+// 配置为嵌套路径 → trans['merchant.name'] = undefined
+// → 回退到 trans.payeeName
+const payeeName = trans[mapping.get('payee')] ?? trans.payeeName;
+
+// notes 字段无回退
+// 配置为嵌套路径 → trans['some.nested.field'] = undefined
+// → notes 最终为 null
+const notes = trans[mapping.get('notes')];
 ```
 
 ## 五、示例交易数据流程
 
-### 5.1 原始银行数据 (GoCardless 示例)
+### 5.1 原始银行数据（含嵌套结构）
 
 ```json
 {
   "transactionId": "TXN001",
+  "date": "2024-01-16",
   "bookingDate": "2024-01-15",
-  "valueDate": "2024-01-16",
-  "remittanceInformationUnstructured": "AMAZON PURCHASE #12345",
-  "additionalInformation": "Online Shopping",
-  "transactionAmount": {
-    "amount": "-49.99",
-    "currency": "EUR"
+  "payeeName": "Default Payee",
+  "paymentData": {
+    "payer": {
+      "name": "Actual Merchant Name",
+      "accountNumber": "****1234"
+    }
   },
-  "creditorName": null,
-  "debtorName": "John Doe"
+  "transactionAmount": {
+    "amount": "-49.99"
+  }
 }
 ```
 
-### 5.2 用户配置的映射
+### 5.2 用户配置
 
 ```json
 {
   "payment": {
     "date": "bookingDate",
-    "payee": "remittanceInformationUnstructured",
-    "notes": "additionalInformation"
+    "payee": "paymentData.payer.name",
+    "notes": "paymentData.payer.accountNumber"
   }
 }
 ```
 
-### 5.3 映射后的标准化交易
+### 5.3 实际映射结果
+
+| 字段 | 预期值 | 实际值 | 原因 |
+|-----|-------|-------|------|
+| date | "2024-01-15" | "2024-01-15" | ✅ bookingDate 是顶层字段，正常读取 |
+| payee | "Actual Merchant Name" | "Default Payee" | ❌ 嵌套路径无法解析，回退到 payeeName |
+| notes | "****1234" | null | ❌ 嵌套路径无法解析，notes 无回退 |
+
+### 5.4 映射后的标准化交易
 
 ```typescript
 {
-  date: "2024-01-15",                    // 来自 bookingDate
-  payee_name: "AMAZON PURCHASE #12345",  // 来自 remittanceInformationUnstructured
-  notes: "Online Shopping",              // 来自 additionalInformation
-  amount: -4999,                         // 金额转换为整数（分）
+  date: "2024-01-15",           // ✅ 来自 bookingDate (顶层字段)
+  payee_name: "Default Payee",  // ❌ 回退值，paymentData.payer.name 配置未生效
+  notes: null,                  // ❌ 无回退，嵌套路径配置未生效
+  amount: -4999,
   imported_id: "TXN001",
   // ...
 }
@@ -379,15 +459,17 @@ function getByPath(obj: unknown, path: string): unknown {
 - 查询该账户最近的一笔同步交易（`raw_synced_data`）
 - 解析原始数据后动态生成可用字段列表
 
-### 6.3 嵌套字段支持
+### 6.3 嵌套字段支持差异
 
-- 使用点分隔符路径访问嵌套对象属性
-- 示例：`paymentData.payer.name` → `trans.paymentData.payer.name`
+- **UI 层**：使用 `getByPath` 函数支持点分隔的嵌套路径访问
+- **业务层**：同步入库时仅支持顶层字段键名访问
+- **不一致风险**：UI 预览可能展示实际上无法工作的配置选项
 
 ### 6.4 回退机制
 
-- 如果映射的字段不存在或为空，使用默认字段作为后备
-- 示例：`trans[mapping.get('date')] ?? trans.date`
+- date 和 payee 字段有默认回退值，保证同步不会中断
+- notes 字段无回退，配置错误会导致备注为空
+- 回退机制掩盖了配置未生效的问题，用户可能不易察觉
 
 ### 6.5 跨平台同步
 
@@ -399,8 +481,8 @@ function getByPath(obj: unknown, path: string): unknown {
 | 文件路径 | 功能描述 |
 |---------|---------|
 | `packages/desktop-client/src/components/banksync/FieldMapping.tsx` | 字段映射UI组件 |
-| `packages/desktop-client/src/components/banksync/EditSyncAccount.tsx` | 银行同步账户设置模态框 |
+| `packages/desktop-client/src/components/banksync/EditSyncAccount.tsx` | 银行同步账户设置模态框，含 `getByPath` 嵌套路径解析 |
 | `packages/desktop-client/src/components/banksync/useBankSyncAccountSettings.ts` | 配置状态管理Hook |
 | `packages/loot-core/src/server/util/custom-sync-mapping.ts` | 映射数据类型与序列化 |
-| `packages/loot-core/src/server/accounts/sync.ts` | 同步核心逻辑，映射应用 |
+| `packages/loot-core/src/server/accounts/sync.ts` | 同步核心逻辑，映射应用（不支持嵌套路径） |
 | `packages/loot-core/src/types/models/bank-sync.ts` | 银行同步类型定义 |
