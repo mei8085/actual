@@ -449,9 +449,40 @@ const notes = trans[mapping.get('notes')];
 
 ### 6.1 交易方向驱动
 
-- 支出（Payment）：金额 ≤ 0，使用付款方相关字段
-- 收入（Deposit）：金额 > 0，使用收款方相关字段
-- 两种方向可以独立配置不同的映射规则
+**实际实现说明**：
+- 代码仅根据交易金额符号选择两套独立的映射配置（payment 或 deposit）
+- 两套映射配置都包含相同的三个本地字段：date、payee、notes
+- 具体映射到哪些银行数据字段，完全由用户配置决定，并非固定绑定付款方/收款方字段
+
+**代码证据**：
+```typescript
+// sync.ts:462 - 仅按金额符号选择映射配置对象
+const mapping = mappings.get(trans.amount <= 0 ? 'payment' : 'deposit');
+
+// sync.ts:464-466 - 从选中的映射配置中读取对应字段
+const date = trans[mapping.get('date')] ?? trans.date;
+const payeeName = trans[mapping.get('payee')] ?? trans.payeeName;
+const notes = trans[mapping.get('notes')];
+```
+
+**默认配置示例**（两套配置默认完全相同）：
+```typescript
+// custom-sync-mapping.ts:31-48
+export const defaultMappings: Mappings = new Map([
+  [
+    'payment',
+    new Map([['date', 'date'], ['payee', 'payeeName'], ['notes', 'notes']]),
+  ],
+  [
+    'deposit',
+    new Map([['date', 'date'], ['payee', 'payeeName'], ['notes', 'notes']]),
+  ],
+]);
+```
+
+**配置灵活性**：
+- 用户可以为支出（payment）和收入（deposit）分别配置不同的银行字段映射
+- 例如：支出时 payee 映射到 `debtorName`，收入时 payee 映射到 `creditorName`
 
 ### 6.2 动态字段发现
 
