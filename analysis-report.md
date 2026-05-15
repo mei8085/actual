@@ -401,6 +401,170 @@ try {
 
 ---
 
+## 八、完整数据流（按调用顺序）
+
+### 8.1 入口：`computeTemplates`
+
+```typescript
+async function computeTemplates(
+  month: string,
+  force: boolean,
+  categoryTemplates: Record<CategoryEntity['id'], Template[]>,
+  categories: CategoryEntity[] = [],
+  skipAvailableClamp: boolean = false
+)
+```
+
+| 阶段 | 输入 | 输出 | 关键中间变量 | 操作说明 |
+|------|------|------|--------------|----------|
+| **初始获取** | `month` | `isTracking`, `availBudget` | `availBudget` | 调用 `getSheetValue(sheetForMonth(month), 'to-budget')` 获取当月可分配预算 |
+| **类别循环** | `categories`, `categoryTemplates` | `templateContexts`, `errors`, `orphanGoals` | `templateContexts`, `errors` | 对每个类别执行初始化，捕获错误 |
+| **条件判断** | `budgeted`, `force` | - | `budgeted` | 仅处理未预算(`budgeted=0`)或强制更新的类别 |
+| **上下文初始化** | `templates`, `category`, `month`, `budgeted` | `templateContext` | `availBudget` | 调用 `CategoryTemplateContext.init()` 初始化，`availBudget += budgeted + getLimitExcess()` |
+| **优先级执行** | `priorities`, `templateContexts` | `templateContexts` | `availBudget` | 按优先级排序后逐个调用 `runTemplatesForPriority()`, `availBudget -= budget` |
+| **余数分配** | `templateContexts`, `availBudget` | `templateContexts` | `availBudget` | 调用 `distributeRemainder()` 分配剩余预算 |
+| **返回结果** | `templateContexts`, `errors`, `orphanGoals` | - | - | - |
+
+---
+
+### 8.2 `CategoryTemplateContext.init()` 初始化流程
+
+```typescript
+static async init(
+  templates: Template[],
+  category: CategoryEntity,
+  month: string,
+  budgeted: number,
+  skipAvailableClamp: boolean = false
+)
+```
+
+| 阶段 | 输入 | 输出 | 关键中间变量 | 操作说明 |
+|------|------|------|--------------|----------|
+| **上月数据获取** | `month`, `category.id` | `fromLastMonth`, `carryover` | `lastMonthSheet` | `lastMonthSheet = sheetForMonth(subMonths(month, 1))` <br> `fromLastMonth = getSheetValue(lastMonthSheet, 'leftover-' + cat.id)` <br> `carryover = getSheetBoolean(lastMonthSheet, 'carryover-' + cat.id)` |
+| **上月数据处理** | `fromLastMonth`, `carryover`, `category` | `fromLastMonth` | - | 条件：`(fromLastMonth<0且无carryover) 或 是收入类别 或 是追踪预算` → `fromLastMonth=0` |
+| **模板验证** | `templates`, `month` | - | - | 调用 `checkByAndScheduleAndSpend()`, `checkPercentage()`，验证失败抛错 |
+| **偏好获取** | - | `hideDecimal`, `currencyCode` | - | 查询 preferences 表获取 `hideFraction`, `defaultCurrencyCode`，无数据时 `hideDecimal=false`，`currencyCode=''` |
+| **私有构造** | 全部参数 | `CategoryTemplateContext` 实例 | - | 调用受保护构造函数，内部调用 `checkLimit()`, `checkSpend()`, `checkGoal()` |
+
+---
+
+### 8.3 私有构造函数执行流程
+
+```typescript
+protected constructor(
+  templates: Template[],
+  category: CategoryEntity,
+  month: string,
+  fromLastMonth: number,
+  budgeted: number,
+  currencyCode: string,
+  hideDecimal: boolean = false,
+  skipAvailableClamp: boolean = false
+)
+```
+
+| 阶段 | 输入 | 输出 | 关键中间变量 | 操作说明 |
+|------|------|------|--------------|----------|
+| **属性赋值** | 全部参数 | 实例属性 | - | `this.category`, `this.month`, `this.fromLastMonth`, `this.previouslyBudgeted`, `this.currency` (通过 `getCurrency(currencyCode)` 获取), `this.hideDecimal`, `this.skipAvailableClamp` |
+| **模板分类** | `templates` | `templates[]`, `remainder[]`, `goals[]` | `priorities: Set<number>`, `remainderWeight` | 按 `directive` 和 `type` 分类：<br>- 普通模板：`type!='remainder' && type!='limit'` → `this.templates[]`，收集 `priority` → `priorities`<br>- 余数模板：`type='remainder'` → `this.remainder[]`，累加 `weight` → `remainderWeight`<br>- 目标模板：`directive='goal' && type='goal'` → `this.goals[]` |
+| **限制检查** | `templates` | `limitAmount`, `limitCheck`, `limitHold`, `limitExcess`, `limitMet` | `limitAmount` | 调用 `checkLimit()`，计算 `limitAmount`，超限情况下设置 `limitMet=true` 和 `limitExcess` |
+| **支出检查** | `templates` | - | - | 调用 `checkSpend()`，检查 `spend` 模板数量不超过 1，否则抛错 |
+| **目标检查** | `templates` | - | - | 调用 `checkGoal()`，检查 `goal` 模板数量不超过 1，否则抛错 |
+
+---
+
+### 8.4 `runTemplatesForPriority()` 执行流程
+
+```typescript
+async runTemplatesForPriority(
+  priority: number,
+  budgetAvail: number,
+  availStart: number
+)
+```
+
+| 阶段 | 输入 | 输出 | 关键中间变量 | 操作说明 |
+|------|------|------|--------------|----------|
+| **前期检查** | `priority` | 返回 `0` | - | 无此优先级或 `limitMet=true` 时直接返回 0 |
+| **模板过滤** | `templates`, `priority` | `t: Template[]` | `available`, `toBudget` | `t = templates.filter(...)`，初始化 `available=budgetAvail`, `toBudget=0` |
+| **模板循环** | `t` | `toBudget` | `perTemplateLocal: Map<Template, number>`, `byFlag`, `scheduleFlag`, `byPerTemplate`, `schedulePerTemplate` | 逐个执行模板：<br> - 普通模板调用对应 `run*` 函数<br> - `by`/`schedule` 模板：首次执行完整逻辑，后续返回 0 |
+| **批量重分配** | `perTemplateLocal`, `t` | `perTemplateLocal` | - | 调用 `redistributeBatch()` 将 `by`/`schedule` 批量总额按权重分配回各模板 |
+| **限制检查** | `toBudget`, `fromLastMonth`, `toBudgetAmount` | `toBudget`, `limitMet`, `available` | `scale` | 若 `toBudget + toBudgetAmount + fromLastMonth >= limitAmount`，计算 `scale`，设置 `limitMet=true`，调整 `toBudget` 和 `available` |
+| **小数隐藏** | `toBudget`, `hideDecimal` | `toBudget` | `scale` | 若 `hideDecimal=true`，将 `toBudget` 取整，更新 `scale` |
+| **可用金额钳制** | `priority`, `available`, `toBudget`, `category.is_income`, `skipAvailableClamp` | `toBudget` | `fullAmount` | 若 `priority>0` 且 `available<0` 且非收入类别且未跳过钳制：<br>- `fullAmount += toBudget`<br>- `toBudget = max(0, toBudget + available)`<br>- 更新 `scale` |
+| **按比例分配到模板** | `perTemplateLocal`, `toBudget`, `scale` | `this.perTemplateContribution` | `remaining` | 遍历模板，按 `scale` 分配，最后一个模板吸收剩余四舍五入差额，累积到 `this.perTemplateContribution` |
+| **返回结果** | - | 最终 `toBudget` | - | 收入类别返回 `-toBudget`，否则返回 `toBudget`，同时 `this.toBudgetAmount += toBudget` |
+
+---
+
+### 8.5 `runRemainder()` 执行流程
+
+```typescript
+runRemainder(budgetAvail: number, perWeight: number)
+```
+
+| 阶段 | 输入 | 输出 | 关键中间变量 | 操作说明 |
+|------|------|------|--------------|----------|
+| **前期检查** | `remainder[]` | `0` | - | 无余数模板直接返回 0 |
+| **初始计算** | `remainderWeight`, `perWeight` | `toBudget` | `smallest` | `toBudget = round(remainderWeight * perWeight)`，`smallest = hideDecimal ? 100 : 1` |
+| **预算调整** | `toBudget`, `budgetAvail` | `toBudget` | - | 若 `toBudget>budgetAvail` 或 `budgetAvail-toBudget<=smallest`，`toBudget=budgetAvail` |
+| **限制检查** | `toBudget`, `toBudgetAmount`, `fromLastMonth`, `limitAmount` | `toBudget`, `limitMet` | - | 若超限，`toBudget=limitAmount - toBudgetAmount - fromLastMonth`, `limitMet=true` |
+| **模板分配** | `toBudget`, `remainder[]` | `this.perTemplateContribution` | `remaining` | 按 `weight` 比例分配，最后一个模板吸收剩余，累积到 `this.perTemplateContribution` |
+| **累积返回** | `toBudget` | `toBudget` | - | `this.toBudgetAmount += toBudget`，返回 `toBudget` |
+
+---
+
+### 8.6 `getValues()` 执行流程
+
+```typescript
+getValues()
+```
+
+| 阶段 | 输入 | 输出 | 关键中间变量 | 操作说明 |
+|------|------|------|--------------|----------|
+| **目标计算** | `goals[]` | `isLongGoal`, `goalAmount` | - | 调用 `runGoal()`：<br>- 有目标：`isLongGoal=true`, `goalAmount=amountToInteger(goals[0].amount)`<br>- 无目标：`isLongGoal=null`, `goalAmount=fullAmount` |
+| **返回结果** | - | `{ budgeted, goal, longGoal, perTemplateContribution }` | - | 最终返回：<br> - `budgeted: this.toBudgetAmount`<br> - `goal: this.goalAmount`<br> - `longGoal: this.isLongGoal`<br> - `perTemplateContribution: this.perTemplateContribution` |
+
+---
+
+## 九、模板类型字段映射表
+
+| 模板类型 | Sheet 键读取 | DB 读取 | 读取位置（函数） | 读取后如何参与计算 |
+|---------|-------------|---------|-----------------|-------------------|
+| **`simple`** | 无 | 无 | `runSimple()` | 优先使用 `template.monthly` 转为整数，否则返回 `limitAmount - fromLastMonth` |
+| **`refill`** | 无 | 无 | `runRefill()` | 直接返回 `limitAmount - fromLastMonth` |
+| **`copy`** | `budget-{category.id}` | 无 | `runCopy()` | 从 `subMonths(month, template.lookBack)` 月份 Sheet 读取预算，原样返回 |
+| **`spend`** | `sum-amount-{category.id}`, `leftover-{category.id}`, `budget-{category.id}` | 无 | `runSpend()` | 1. 从 `template.from` 开始读取历史数据：<br>   - 首月：`alreadyBudgeted = leftover - sum-amount`<br>   - 后续：`alreadyBudgeted += budget`<br>2. 计算：`(target - alreadyBudgeted) / (numMonths + 1)` |
+| **`percentage`** | `total-income` 或 `sum-amount-{incomeCat.id}` | `db.getCategories()` (过滤收入类别) | `runPercentage()` | 1. 根据 `template.category` 决定来源：<br>   - 'all income'：`total-income`<br>   - 'available funds'：入参 `availableFunds`<br>   - 其他：查找收入类别 → `sum-amount-{cat.id}`<br>2. 可选读取上月数据（`previous=true`）<br>3. 计算：`max(0, round(income * percent/100))` |
+| **`by`** | 无 | 无 | `runBy()` | 1. 计算各模板剩余月数，找到最短时间<br>2. 对每个模板计算所需资金：<br>   - 超过最短窗口且可重复：`(amount/period)*(period - numMonths + shortNumMonths)`<br>   - 超过最短窗口不可重复：`(amount/(numMonths+1))*(shortNumMonths+1)`<br>   - 其他：`amount`<br>3. 最终：`(totalNeeded - fromLastMonth) / (shortNumMonths + 1)` |
+| **`schedule`** | `goal-{category.id}` (上月) | `schedules` 表 | `runSchedule()` 调用 `createScheduleList()` 调用 `getRuleForSchedule()`, `prefetchBalanceOfForTransaction()` | 1. 查询调度表获取规则<br>2. 执行规则计算 `target`<br>3. 分为 `payMonthOf` 和 `sinking` 两类<br>4. 根据上月余额、上月目标等条件决定预算策略<br>5. 最终 `to_budget` 加相关金额 |
+| **`average`** | `sum-amount-{category.id}` (历史 `numMonths` 个月) | 无 | `runAverage()` | 1. 读取历史 `numMonths` 个月的支出总和<br>2. 计算平均：`-(sum / numMonths)`<br>3. 可选调整：<br>   - 百分比：`average *= (1 + adjustment/100)`<br>   - 固定值：`average += adjustment`<br>4. 取整返回 |
+| **`remainder`** | 无 | 无 | `runRemainder()` | 按 `weight` 权重分配剩余预算 |
+
+---
+
+## 十、缺失数据处理矩阵
+
+| 数据项 | 缺失场景 | 处理策略 | 默认值/回退值 | 错误类型 | 捕获位置 | 错误聚合方式 |
+|-------|---------|---------|-------------|---------|---------|------------|
+| **上月剩余 (`fromLastMonth`)** | Sheet 无 `leftover-{cat.id}` 单元格 | 降级处理 | `0` | 无 | `actions.getSheetValue()` → `safeNumber(node.value || 0)` | - |
+| **`carryover` 标记** | Sheet 无 `carryover-{cat.id}` 单元格 | 降级处理 | `false` | 无 | `actions.getSheetBoolean()` → `node.value || false` | - |
+| **隐藏小数偏好 (`hideFraction`)** | preferences 表无此记录 | 降级处理 | `false` | 无 | `CategoryTemplateContext.init()` → 空数组检查 | - |
+| **默认货币 (`defaultCurrencyCode`)** | preferences 表无此记录 | 降级处理 | `''` → 系统默认货币 | 无 | `CategoryTemplateContext.init()` → 空数组检查 | - |
+| **活动调度名称** | `schedule` 模板引用的调度名在 `schedules` 表不存在 | 抛错终止 | - | `Error("Schedule X does not exist")` | `CategoryTemplateContext.checkByAndScheduleAndSpend()` | 收集到 `errors[]`，上层 `computeTemplates()` try-catch |
+| **收入类别名称/ID** | `percentage` 模板引用的收入类别不存在 | 抛错终止 | - | `Error("Category X is not found")` | `CategoryTemplateContext.checkPercentage()` | 收集到 `errors[]`，上层 `computeTemplates()` try-catch |
+| **`by`/`spend` 目标月份** | 目标月份已过且不可重复 | 抛错终止 | - | `Error("Target month has passed")` | `CategoryTemplateContext.checkByAndScheduleAndSpend()` | 收集到 `errors[]`，上层 `computeTemplates()` try-catch |
+| **周限起始日期** | `limit.period='weekly'` 但无 `start` | 抛错终止 | - | `Error("Weekly limit requires a start date")` | `CategoryTemplateContext.checkLimit()` | 收集到 `errors[]`，上层 `computeTemplates()` try-catch |
+| **多限制定义** | 同类别有多个 `limit` 模板 | 抛错终止 | - | `Error("Only one 'up to' allowed per category")` | `CategoryTemplateContext.checkLimit()` | 收集到 `errors[]`，上层 `computeTemplates()` try-catch |
+| **多支出模板** | 同类别有多个 `spend` 模板 | 抛错终止 | - | `Error("Only one spend template allowed")` | `CategoryTemplateContext.checkSpend()` | 收集到 `errors[]`，上层 `computeTemplates()` try-catch |
+| **多目标模板** | 同类别有多个 `goal` 模板 | 抛错终止 | - | `Error("Only one #goal allowed per category")` | `CategoryTemplateContext.checkGoal()` | 收集到 `errors[]`，上层 `computeTemplates()` try-catch |
+| **调度数据异常** | `schedule` 模板指向已完成或过期调度 | 软降级 | 该调度被跳过 | 非致命错误 | `createScheduleList()` → `t.filter(c => c.completed === 0)` | 收集到 `errors[]`，但继续处理其他模板 |
+| **历史预算/支出** | `copy`/`spend`/`average` 模板读取历史月份无数据 | 降级处理 | `0` | 无 | `actions.getSheetValue()` → `safeNumber(node.value || 0)` | - |
+| **类别配置** | 计算时找不到类别（仅 dryRun 可能） | 降级处理 | 返回 `{ budgeted: 0, perTemplate: [0...] }` | 无 | `dryRunCategoryTemplate()` → 空检查返回 | - |
+
+---
+
 ## 附录：关键文件位置
 
 | 文件 | 路径 | 说明 |
@@ -409,3 +573,4 @@ try {
 | `goal-template.ts` | `packages/loot-core/src/server/budget/` | 模板应用入口 |
 | `actions.ts` | `packages/loot-core/src/server/budget/` | 数据读写操作 |
 | `templates.ts` | `packages/loot-core/src/types/models/` | 模板类型定义 |
+| `schedule-template.ts` | `packages/loot-core/src/server/budget/` | 调度模板执行 |
