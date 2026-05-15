@@ -554,56 +554,67 @@ const ret = await runSchedule(
 newBudget = ret.to_budget - toBudget;  // 本次增量
 ```
 
-**异常路径区分**：
+**异常路径可核实事实链**：
 
-| 异常类型 | 触发场景 | 处理方式 | 抛出位置 |
-|----------|----------|----------|----------|
-| **硬抛错** | 调度名称不在活动调度列表 | `throw new Error()` | `checkByAndScheduleAndSpend` 阶段 |
-| **硬抛错** | `by` 和 `schedule` 优先级不一致 | `throw new Error()` | `checkByAndScheduleAndSpend` 阶段 |
-| **软错误** | 调度已过期（`num_months < 0`） | 记录到 `errors[]`，返回 `{ t, errors }` | `createScheduleList` 内部 |
-| **软错误** | 调度在目标月份未激活 | 记录到 `errors[]`，返回 `{ t, errors }` | `createScheduleList` 内部 |
+### createScheduleList 分支写入 facts
 
-**软错误是否被消费**：
+**代码位置**：[schedule-template.ts:137-208](file:///d:/fz/0508-1/solo-dogfeeding/code/119-actual/packages/loot-core/src/server/budget/schedule-template.ts#L137-L208)
 
-`runSchedule` 返回的 `errors` **未被消费**，调用点传入空数组 `[]` 并忽略 `ret.errors`。
+**Fact 1**：`if (num_months < 0)` 分支执行 `errors.push()` → [schedule-template.ts:139](file:///d:/fz/0508-1/solo-dogfeeding/code/119-actual/packages/loot-core/src/server/budget/schedule-template.ts#L139)
 
-**代码依据**：
+**Fact 2**：`if (completed)` 分支执行 `errors.push()` → [schedule-template.ts:202-204](file:///d:/fz/0508-1/solo-dogfeeding/code/119-actual/packages/loot-core/src/server/budget/schedule-template.ts#L202-L204)
 
-1. **硬抛错验证**：[category-template-context.ts:482-484](file:///d:/fz/0508-1/solo-dogfeeding/code/119-actual/packages/loot-core/src/server/budget/category-template-context.ts#L482-L484)
-```typescript
-if (!scheduleNames.includes(t.name.trim())) {
-  throw new Error(`Schedule ${t.name.trim()} does not exist`);
-}
-```
+**Fact 3**：`return { t: t.filter(c => c.completed === 0), errors }` → [schedule-template.ts:208](file:///d:/fz/0508-1/solo-dogfeeding/code/119-actual/packages/loot-core/src/server/budget/schedule-template.ts#L208)
+- 返回值包含 `errors` 字段
+- 返回值包含过滤后的 `t` 数组（已完成调度的条目被移除）
 
-2. **软错误产生**：[schedule-template.ts:139](file:///d:/fz/0508-1/solo-dogfeeding/code/119-actual/packages/loot-core/src/server/budget/schedule-template.ts#L139) 和 [schedule-template.ts:202-204](file:///d:/fz/0508-1/solo-dogfeeding/code/119-actual/packages/loot-core/src/server/budget/schedule-template.ts#L202-L204)
-```typescript
-// 调度已过期
-errors.push(`Schedule ${template.name} is in the Past.`);
+---
 
-// 调度未激活
-errors.push(`Schedule ${template.name} is not active during the month in question.`);
-```
+### runSchedule 传递 facts
 
-3. **软错误返回**：[schedule-template.ts:208](file:///d:/fz/0508-1/solo-dogfeeding/code/119-actual/packages/loot-core/src/server/budget/schedule-template.ts#L208)
-```typescript
-return { t: t.filter(c => c.completed === 0), errors };
-```
+**代码位置**：[schedule-template.ts:305-324](file:///d:/fz/0508-1/solo-dogfeeding/code/119-actual/packages/loot-core/src/server/budget/schedule-template.ts#L305-L324)
 
-4. **软错误未消费**：[category-template-context.ts:213](file:///d:/fz/0508-1/solo-dogfeeding/code/119-actual/packages/loot-core/src/server/budget/category-template-context.ts#L213)
-```typescript
-const ret = await runSchedule(
-  t, this.month, budgeted, remainder,
-  this.fromLastMonth, toBudget,
-  [],              // ← 传入空数组，ret.errors 被忽略
-  this.category, this.currency,
-);
-```
+**Fact 4**：`runSchedule` 调用 `createScheduleList()` → [schedule-template.ts:318-323](file:///d:/fz/0508-1/solo-dogfeeding/code/119-actual/packages/loot-core/src/server/budget/schedule-template.ts#L318-L323)
 
-**结论**：
-- `createScheduleList` 中的软错误不会阻止预算计算，也不会返回给用户
-- 只有 `init` 阶段的硬抛错会被 `computeTemplates` 的 `catch` 捕获并返回
-- 软错误被静默丢弃，这是设计选择：过期/未激活的调度不影响预算，只需不分配金额
+**Fact 5**：`errors = errors.concat(t.errors)` → [schedule-template.ts:324](file:///d:/fz/0508-1/solo-dogfeeding/code/119-actual/packages/loot-core/src/server/budget/schedule-template.ts#L324)
+- `runSchedule` 的 `errors` 参数被就地修改，追加了 `createScheduleList` 返回的 `t.errors`
+
+**Fact 6**：`runSchedule` 返回值 **不包含** `errors` 字段，仅返回计算结果 → [schedule-template.ts](file:///d:/fz/0508-1/solo-dogfeeding/code/119-actual/packages/loot-core/src/server/budget/schedule-template.ts)
+
+---
+
+### CategoryTemplateContext 调用点消费 facts
+
+**代码位置**：[category-template-context.ts:210-225](file:///d:/fz/0508-1/solo-dogfeeding/code/119-actual/packages/loot-core/src/server/budget/category-template-context.ts#L210-L225)
+
+**Fact 7**：`const ret = await runSchedule(...)` → [category-template-context.ts:210](file:///d:/fz/0508-1/solo-dogfeeding/code/119-actual/packages/loot-core/src/server/budget/category-template-context.ts#L210)
+- 调用时传入 `[]` 作为 `errors` 参数
+
+**Fact 8**：`ret.to_budget` 被读取并使用 → [category-template-context.ts:219](file:///d:/fz/0508-1/solo-dogfeeding/code/119-actual/packages/loot-core/src/server/budget/category-template-context.ts#L219)
+- `newBudget = ret.to_budget - toBudget`
+
+**Fact 9**：`ret.errors` 未被任何语句读取或赋值给任何变量
+
+**可核实结论**：
+- `createScheduleList` 在两个条件分支写入 `errors` 数组
+- `runSchedule` 将 `createScheduleList` 返回的 `errors` 合并到自己的 `errors` 参数中（修改了传入的数组引用）
+- `runSchedule` 的返回值对象中 **不包含** `errors` 字段
+- `CategoryTemplateContext` 调用点只消费了 `ret.to_budget`，未消费 `ret.errors`
+- `CategoryTemplateContext` 调用 `runSchedule` 时传入 `[]`，意味着 `errors` 参数的修改操作作用在这个空数组上，该数组在函数返回后无引用
+
+---
+
+### 硬抛错 facts（独立于上述事实链）
+
+**代码位置**：[category-template-context.ts:476-487](file:///d:/fz/0508-1/solo-dogfeeding/code/119-actual/packages/loot-core/src/server/budget/category-template-context.ts#L476-L487)
+
+**Fact 10**：`if (!scheduleNames.includes(t.name.trim()))` 时执行 `throw new Error()` → [category-template-context.ts:482-484](file:///d:/fz/0508-1/solo-dogfeeding/code/119-actual/packages/loot-core/src/server/budget/category-template-context.ts#L482-L484)
+
+**Fact 11**：`if (priority !== currentPriority)` 时执行 `throw new Error()` → [category-template-context.ts:485-487](file:///d:/fz/0508-1/solo-dogfeeding/code/119-actual/packages/loot-core/src/server/budget/category-template-context.ts#L485-L487)
+
+**Fact 12**：上述 `throw` 发生在 `CategoryTemplateContext.init()` 内部，`init` 被 `computeTemplates` 调用时外层有 `try-catch` 包裹 → [goal-template.ts](file:///d:/fz/0508-1/solo-dogfeeding/code/119-actual/packages/loot-core/src/server/budget/goal-template.ts) 中 `computeTemplates` 调用点
+
+**可核实结论**：硬抛错在 `init` 阶段被抛出，被 `computeTemplates` 的 `catch` 捕获并添加到返回的 `errors` 列表。
 
 ---
 
