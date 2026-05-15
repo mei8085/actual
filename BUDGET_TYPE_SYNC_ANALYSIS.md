@@ -10,6 +10,8 @@
 6. [budgetType 特殊处理触发预算重建（Step 5）](#6-budgettype-特殊处理触发预算重建step-5)
 7. [导入流程中的特殊处理](#7-导入流程中的特殊处理)
 8. [关键数据结构](#8-关键数据结构)
+9. [完整链路时序图](#9-完整链路时序图)
+10. [关键设计决策总结](#10-关键设计决策总结)
 
 ---
 
@@ -35,26 +37,33 @@
 
 ### 2.1 前端触发
 
-**位置**: `packages/desktop-client/src/components/settings/BudgetTypeSettings.tsx:14-28`
+**位置**: `packages/desktop-client/src/components/settings/BudgetTypeSettings.tsx:13-28`
 
 ```typescript
 export function BudgetTypeSettings() {
   // 1. 从 Redux store 读取当前预算类型，默认为 'envelope'
   const [budgetType = 'envelope', setBudgetType] = useSyncedPref('budgetType');
+  const [isLoading, setIsLoading] = useState(false);
 
   async function onSwitchType() {
-    const newBudgetType = budgetType === 'envelope' ? 'tracking' : 'envelope';
-    // 2. 切换预算类型，触发同步偏好保存
-    setBudgetType(newBudgetType);
-    // 3. 重置预算缓存
-    await send('reset-budget-cache');
+    setIsLoading(true);
+    try {
+      // 2. 切换预算类型，触发同步偏好保存
+      const newBudgetType = budgetType === 'envelope' ? 'tracking' : 'envelope';
+      setBudgetType(newBudgetType);
+
+      // 3. 重置预算缓存，确保服务器端预算系统重新计算
+      await send('reset-budget-cache');
+    } finally {
+      setIsLoading(false);
+    }
   }
 }
 ```
 
 ### 2.2 useSyncedPref Hook
 
-**位置**: `packages/desktop-client/src/hooks/useSyncedPrefs.ts`
+**位置**: `packages/desktop-client/src/hooks/useSyncedPref.ts:12-28`
 
 ```typescript
 export function useSyncedPref<K extends keyof SyncedPrefs>(
@@ -63,12 +72,15 @@ export function useSyncedPref<K extends keyof SyncedPrefs>(
   const dispatch = useDispatch();
   const setPref = useCallback<SetSyncedPrefAction<K>>(
     value => {
-      // 触发 saveSyncedPrefs action，最终调用后端 API
-      void dispatch(saveSyncedPrefs({ prefs: { [prefName]: value } }));
+      // 触发 saveSyncedPrefs action，最终调用后端 API preferences/save
+      void dispatch(
+        saveSyncedPrefs({
+          prefs: { [prefName]: value },
+        }),
+      );
     },
     [prefName, dispatch],
   );
-  // 从 Redux store 读取值
   const pref = useSelector(state => state.prefs.synced[prefName]);
 
   return [pref, setPref];
@@ -139,7 +151,7 @@ export async function update(table, params) {
   value: 'tracking',
   timestamp: Timestamp { 
     millis: 1715865600000,  // Unix 时间戳
-    counter: 0,             // 逻辑时钟
+    counter: 0,             // 逻辑计数器
     node: 'client-uuid'     // 客户端唯一标识
   }
 }
@@ -242,7 +254,7 @@ export const applyMessages = sequential(async (messages: Message[]) => {
               dataset,               // 'preferences'
               row,                   // 'budgetType'
               column,                // 'value'
-              serializeValue(value), // 序列化值（类型前缀）
+              serializeValue(value), // 序列化值（带类型前缀，存储为 BLOB）
             ],
           );
 
@@ -252,6 +264,7 @@ export const applyMessages = sequential(async (messages: Message[]) => {
 
         // ===== 关键：budgetType 特殊处理 =====
         // 这是触发预算模式切换的关键点！
+        // 注意：setType 函数在导入时被重命名为 setBudgetType
         if (dataset === 'preferences' && row === 'budgetType') {
           void setBudgetType(value);  // 立即触发预算类型切换
         }
@@ -370,7 +383,7 @@ export function scheduleFullSync(): Promise<
         return res;
       });
     } else {
-      // 延迟执行，默认 1000ms（见第 40 行）
+      // 延迟执行，默认 1000ms
       syncTimeout = setTimeout(fullSync, FULL_SYNC_DELAY);
     }
   }
@@ -607,16 +620,22 @@ class Timestamp {
 
 ### 6.1 触发点
 
-**位置**: `packages/loot-core/src/server/sync/index.ts:367-370`
+**位置**: `packages/loot-core/src/server/sync/index.ts:367-371`
 
 ```typescript
+// 导入语句
+import {
+  setType as setBudgetType,  // setType 被重命名为 setBudgetType
+  triggerBudgetChanges,
+} from '#server/budget/base';
+
 // 在 applyMessages 的数据库事务内
 if (dataset === 'preferences' && row === 'budgetType') {
   void setBudgetType(value);  // 立即触发预算类型切换
 }
 ```
 
-### 6.2 setBudgetType 函数
+### 6.2 setType 函数（实际函数名）
 
 **位置**: `packages/loot-core/src/server/budget/base.ts:321-346`
 
@@ -656,7 +675,7 @@ export async function setType(type) {
 }
 ```
 
-### 6.3 createAllBudgets 创建流程
+### 6.3 createBudget 创建流程
 
 **位置**: `packages/loot-core/src/server/budget/base.ts:236-283`
 
@@ -825,15 +844,22 @@ export type Message = {
 
 ### 8.2 messages_crdt 表结构
 
+**位置**: `packages/loot-core/src/server/sql/init.sql:73-79`
+
 ```sql
-CREATE TABLE messages_crdt (
-  timestamp TEXT PRIMARY KEY,  -- 序列化的 Lamport 时间戳
-  dataset TEXT NOT NULL,       -- 表名
-  row TEXT NOT NULL,           -- 行 ID
-  column TEXT NOT NULL,        -- 列名
-  value TEXT NOT NULL          -- 序列化值（带类型前缀）
-);
+CREATE TABLE messages_crdt
+ (id INTEGER PRIMARY KEY,        -- 自增主键
+  timestamp TEXT NOT NULL UNIQUE, -- Lamport 时间戳，唯一约束
+  dataset TEXT NOT NULL,         -- 表名
+  row TEXT NOT NULL,             -- 行 ID
+  column TEXT NOT NULL,          -- 列名
+  value BLOB NOT NULL);          -- 序列化值（二进制 BLOB）
 ```
+
+**关键说明**：
+- `id` 是真正的主键，自增整数
+- `timestamp` 是唯一约束，不是主键
+- `value` 是 BLOB 类型，存储经过 `serializeValue()` 序列化的字符串数据
 
 ### 8.3 值序列化格式
 
@@ -842,25 +868,33 @@ CREATE TABLE messages_crdt (
 ```typescript
 export function serializeValue(value: string | number | null): string {
   if (value === null) {
-    return '0:';                  // null 类型
+    return '0:';                  // null 类型前缀
   } else if (typeof value === 'number') {
-    return 'N:' + value;          // 数字类型
+    return 'N:' + value;          // 数字类型前缀
   } else if (typeof value === 'string') {
-    return 'S:' + value;          // 字符串类型
+    return 'S:' + value;          // 字符串类型前缀
   }
-  throw new Error('Unserializable value type');
+
+  throw new Error('Unserializable value type: ' + JSON.stringify(value));
 }
 
 export function deserializeValue(value: string): string | number | null {
   const type = value[0];
   switch (type) {
-    case '0': return null;
-    case 'N': return parseFloat(value.slice(2));
-    case 'S': return value.slice(2);
-    default: throw new Error('Invalid type key');
+    case '0':
+      return null;
+    case 'N':
+      return parseFloat(value.slice(2));
+    case 'S':
+      return value.slice(2);
+    default:
   }
+
+  throw new Error('Invalid type key for value: ' + value);
 }
 ```
+
+**注意**：虽然 serializeValue 返回字符串，但 SQLite 可以将字符串存入 BLOB 字段。网络传输时通过 Protobuf 进行二进制编码。
 
 ### 8.4 Timestamp Lamport 时钟
 
@@ -892,7 +926,24 @@ class Timestamp {
     // 序列化：millis:counter:node
     return `${this.millis}:${this.counter}:${this.node}`;
   }
+
+  static parse(str: string): Timestamp {
+    // 反序列化字符串为 Timestamp 对象
+    const [millis, counter, node] = str.split(':');
+    return new Timestamp(parseInt(millis), parseInt(counter), node);
+  }
 }
+```
+
+### 8.5 messages_clock 表结构
+
+**位置**: `packages/loot-core/src/server/sql/init.sql:85`
+
+```sql
+CREATE TABLE messages_clock (
+  id INTEGER PRIMARY KEY,    -- 固定为 1，单条记录
+  clock TEXT                 // 序列化的时钟状态（包含 merkle 树）
+);
 ```
 
 ---
@@ -903,7 +954,9 @@ class Timestamp {
 客户端 A (修改预算类型)                    服务器                    客户端 B (接收同步)
      |                                       |                           |
      | 1. 用户点击切换按钮                    |                           |
-     | → useSyncedPref.setBudgetType()       |                           |
+     | → BudgetTypeSettings.onSwitchType()  |                           |
+     | → useSyncedPref('budgetType')[1]     |                           |
+     |   (即 setBudgetType 函数)             |                           |
      | → dispatch saveSyncedPrefs            |                           |
      | → 调用 API preferences/save           |                           |
      |                                       |                           |
@@ -919,8 +972,11 @@ class Timestamp {
      | → applyMessages()                     |                           |
      |   → 写入 preferences 表               |                           |
      |   → 写入 messages_crdt 表             |                           |
+     |     (id INTEGER PK, timestamp UNIQUE) |                           |
+     |   → 更新 Merkle 树                    |                           |
      |   → 检测到 budgetType 变更            |                           |
      |     → setBudgetType('tracking')       |                           |
+     |       (导入自 setType 函数)            |                           |
      |       → 删除所有预算单元格             |                           |
      |       → 重建预算                      |                           |
      | → scheduleFullSync()                  |                           |
@@ -928,7 +984,7 @@ class Timestamp {
      |                                       |                           |
      | 4. fullSync()                         |                           |
      | → getMessagesSince(lastSync)          |                           |
-     | → 编码消息                            |                           |
+     | → encoder.encode() 编码消息           |                           |
      | → POST /sync ───────────────────────→ |                           |
      |                                       | → 存储消息                |
      |                                       | → 更新 Merkle 树          |
@@ -941,7 +997,7 @@ class Timestamp {
      |                                       | → 返回新消息              |
      |                                       |                           |
      |                                       | ───────────────────────→ |
-     |                                       |   编码后的消息            |
+     |                                       |   Protobuf 二进制消息      |
      |                                       |                           |
      |                                       |                           | 5. receiveMessages()
      |                                       |                           |   → Timestamp.recv()
@@ -963,9 +1019,20 @@ class Timestamp {
 | 决策点 | 实现方式 | 目的 |
 |-------|---------|------|
 | **同步触发时机** | `sendMessages` 后延迟 1 秒调度 `fullSync` | 防抖，防止频繁同步 |
-| **budgetType 特殊处理** | `applyMessages` 内直接调用 `setBudgetType` | 立即生效，无需等待下次加载 |
+| **budgetType 特殊处理** | `applyMessages` 内直接调用 `setBudgetType`（即 `setType` 函数） | 立即生效，无需等待下次加载 |
 | **Merkle 树校验** | 客户端与服务端 Merkle 哈希对比 | 保证数据一致性 |
 | **Lamport 时钟** | `Timestamp.send()` / `Timestamp.recv()` | 因果顺序，冲突解决 |
-| **导入模式限制** | 仅禁止 `prefs` 写入，允许 `preferences` | 保留预算类型设置 |
+| **导入模式限制** | 仅禁止 `prefs` 写入，允许 `preferences` 表写入 | 保留预算类型设置 |
 | **原子性保证** | 数据库事务包裹所有写操作 | 要么全部成功，要么全部失败 |
 | **递归同步** | `_fullSync` 发现不一致时递归同步更早消息 | 处理网络中断等异常场景 |
+| **messages_crdt 主键设计** | `id INTEGER PRIMARY KEY`，`timestamp UNIQUE` | 自增 ID 保证顺序，时间戳用于同步逻辑 |
+
+---
+
+## 修正记录
+
+| 修正项 | 原内容 | 修正后内容 |
+|-------|-------|----------|
+| messages_crdt 表结构 | `timestamp TEXT PRIMARY KEY` | `id INTEGER PRIMARY KEY, timestamp TEXT NOT NULL UNIQUE, value BLOB NOT NULL` |
+| setBudgetType 函数名 | 未说明导入重命名 | 明确说明 `setType as setBudgetType` 导入重命名 |
+| value 字段类型 | 未明确 | 明确为 BLOB 类型，存储序列化字符串 |
