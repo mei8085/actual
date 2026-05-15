@@ -554,9 +554,56 @@ const ret = await runSchedule(
 newBudget = ret.to_budget - toBudget;  // 本次增量
 ```
 
-**数据缺失处理**：
-- `fromLastMonth` / `toBudget` 缺失：默认降级为 0
-- 调度名称不存在：**抛错终止**（在 `checkByAndScheduleAndSpend` 中）
+**异常路径区分**：
+
+| 异常类型 | 触发场景 | 处理方式 | 抛出位置 |
+|----------|----------|----------|----------|
+| **硬抛错** | 调度名称不在活动调度列表 | `throw new Error()` | `checkByAndScheduleAndSpend` 阶段 |
+| **硬抛错** | `by` 和 `schedule` 优先级不一致 | `throw new Error()` | `checkByAndScheduleAndSpend` 阶段 |
+| **软错误** | 调度已过期（`num_months < 0`） | 记录到 `errors[]`，返回 `{ t, errors }` | `createScheduleList` 内部 |
+| **软错误** | 调度在目标月份未激活 | 记录到 `errors[]`，返回 `{ t, errors }` | `createScheduleList` 内部 |
+
+**软错误是否被消费**：
+
+`runSchedule` 返回的 `errors` **未被消费**，调用点传入空数组 `[]` 并忽略 `ret.errors`。
+
+**代码依据**：
+
+1. **硬抛错验证**：[category-template-context.ts:482-484](file:///d:/fz/0508-1/solo-dogfeeding/code/119-actual/packages/loot-core/src/server/budget/category-template-context.ts#L482-L484)
+```typescript
+if (!scheduleNames.includes(t.name.trim())) {
+  throw new Error(`Schedule ${t.name.trim()} does not exist`);
+}
+```
+
+2. **软错误产生**：[schedule-template.ts:139](file:///d:/fz/0508-1/solo-dogfeeding/code/119-actual/packages/loot-core/src/server/budget/schedule-template.ts#L139) 和 [schedule-template.ts:202-204](file:///d:/fz/0508-1/solo-dogfeeding/code/119-actual/packages/loot-core/src/server/budget/schedule-template.ts#L202-L204)
+```typescript
+// 调度已过期
+errors.push(`Schedule ${template.name} is in the Past.`);
+
+// 调度未激活
+errors.push(`Schedule ${template.name} is not active during the month in question.`);
+```
+
+3. **软错误返回**：[schedule-template.ts:208](file:///d:/fz/0508-1/solo-dogfeeding/code/119-actual/packages/loot-core/src/server/budget/schedule-template.ts#L208)
+```typescript
+return { t: t.filter(c => c.completed === 0), errors };
+```
+
+4. **软错误未消费**：[category-template-context.ts:213](file:///d:/fz/0508-1/solo-dogfeeding/code/119-actual/packages/loot-core/src/server/budget/category-template-context.ts#L213)
+```typescript
+const ret = await runSchedule(
+  t, this.month, budgeted, remainder,
+  this.fromLastMonth, toBudget,
+  [],              // ← 传入空数组，ret.errors 被忽略
+  this.category, this.currency,
+);
+```
+
+**结论**：
+- `createScheduleList` 中的软错误不会阻止预算计算，也不会返回给用户
+- 只有 `init` 阶段的硬抛错会被 `computeTemplates` 的 `catch` 捕获并返回
+- 软错误被静默丢弃，这是设计选择：过期/未激活的调度不影响预算，只需不分配金额
 
 ---
 
@@ -750,10 +797,23 @@ distributeRemainder(templateContexts, availBudget)
 | 周期性周期无效 | `periodic.period` 非 day/week/month/year | `periodic` | `Unrecognized periodic period` |
 | 优先级不一致 | `by` 和 `schedule` 混合不同优先级 | `by`, `schedule` | `Schedule and By templates must be the same priority level` |
 | 目标日期已过 | `by`/`spend` 目标月已过且无 repeat | `by`, `spend` | `Target month has passed, remove or update the target month` |
-| 多余数模板 | 同一类别多个 `remainder` | `remainder` | （仅警告） |
-| 目标过多 | 同一类别多个 `#goal` | `goal` | `Only one #goal is allowed per category` |
-| 支出模板过多 | 同一类别多个 `spend` | `spend` | `Only one spend template is allowed per category` |
-| 多限制 | 同一类别多个 `up to` | `limit` | `Only one \`up to\` allowed per category` |
+| 多目标模板 | 同一类别多个 `#goal` | `goal` | `Only one #goal is allowed per category` |
+| 多支出模板 | 同一类别多个 `spend` | `spend` | `Only one spend template is allowed per category` |
+| 多限制定义 | 同一类别多个 `up to` | `limit` | `Only one \`up to\` allowed per category` |
+| 周限制缺起始日 | `limit.period === 'weekly'` 但无 `start` | `limit` | `Weekly limit requires a start date (YYYY-MM-DD)` |
+| 无效限制周期 | `limit.period` 非 daily/weekly/monthly | `limit` | `Invalid limit period. Check template syntax` |
+
+**remainder 数量行为**：代码中**不存在**对多个 remainder 模板的任何校验或警告机制，完全允许多个 remainder 模板共存。
+
+**代码依据**：[category-template-context.ts:436-438](file:///d:/fz/0508-1/solo-dogfeeding/code/119-actual/packages/loot-core/src/server/budget/category-template-context.ts#L436-L438) 对 remainder 仅做累加权重处理：
+```typescript
+} else if (t.directive === 'template' && t.type === 'remainder') {
+  this.remainder.push(t);
+  this.remainderWeight += t.weight;
+}
+```
+
+**实际行为**：多个 remainder 模板会被全部收集到 `this.remainder` 数组中，权重累加后在余数分配阶段按各自权重比例分配剩余预算。
 
 ### 6.3 降级 vs 抛错决策树
 
