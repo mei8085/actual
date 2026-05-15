@@ -75,7 +75,7 @@ async function accountsBankSync({ ids = [] }: { ids: Array<AccountEntity['id']> 
     ids,
     true,
   );
-  
+
   for (const acct of accounts) {
     if (acct.bankId && acct.account_id) {
       const syncResponse = await bankSync.syncAccount(
@@ -111,14 +111,14 @@ export async function syncAccount(
 ) {
   // 1. 获取同步起始日期（最早 90 天或账户最早交易日期）
   const syncStartDate = customStartingDate ?? (await getAccountSyncStartDate(id));
-  
+
   // 2. 根据同步源下载交易
   if (acctRow.account_sync_source === 'simpleFin') {
     download = await downloadSimpleFinTransactions(acctId, syncStartDate);
   } else if (acctRow.account_sync_source === 'goCardless') {
     download = await downloadGoCardlessTransactions(...);
   }
-  
+
   // 3. 处理下载的数据
   return processBankSyncDownload(download, id, acctRow, newAccount, ...);
 }
@@ -149,7 +149,7 @@ async function matchTransactions(acctId, transactions, isBankSyncAccount, ...) {
 ```typescript
 export class Timestamp {
   _state: { millis: number; counter: number; node: string };
-  
+
   toString() {
     return [
       new Date(this.millis()).toISOString(),      // ISO 时间
@@ -174,12 +174,12 @@ export class Timestamp {
 export const applyMessages = sequential(async (messages: Message[]) => {
   // 1. 比较消息与现有 CRDT（过滤已应用的消息）
   messages = await compareMessages(messages);
-  
+
   // 2. 按时间戳排序
-  messages = [...messages].sort((m1, m2) => 
+  messages = [...messages].sort((m1, m2) =>
     m1.timestamp.toString().localeCompare(m2.timestamp.toString())
   );
-  
+
   // 3. 数据库事务应用
   db.transaction(() => {
     for (const msg of messages) {
@@ -188,7 +188,7 @@ export const applyMessages = sequential(async (messages: Message[]) => {
       currentMerkle = merkle.insert(currentMerkle, timestamp);  // 更新 Merkle
     }
   });
-  
+
   // 4. 触发预算变化
   triggerBudgetChanges(oldData, newData);
 });
@@ -245,9 +245,9 @@ export async function fetchBudgetData({
     monthUtils.getMonth(startDate),
     monthUtils.getMonth(endDate),
   );
-  
+
   const monthFetchConcurrency = 8;
-  
+
   const monthDataList = await mapWithConcurrency(
     months,
     monthFetchConcurrency,
@@ -256,7 +256,7 @@ export async function fetchBudgetData({
       monthData: await send(endpointName, { month }),
     }),
   );
-  
+
   // 聚合数据...
 }
 ```
@@ -299,14 +299,14 @@ if (updatedAccounts.length > 0) {
 // sync/index.ts - 消息应用后的触发器
 export const applyMessages = sequential(async (messages: Message[]) => {
   // ... 消息应用 ...
-  
+
   // 触发预算变化计算
   if (sheet.get()) {
     sheet.startTransaction();
     triggerBudgetChanges(oldData, newData);
     sheet.get().triggerDatabaseChanges(oldData, newData);
     sheet.endTransaction();
-    
+
     // 显式重新计算全局聚合单元格
     if (idsPerTable.transactions?.length) {
       const globalAggregateCells = [
@@ -322,13 +322,13 @@ export const applyMessages = sequential(async (messages: Message[]) => {
         }
       }
     }
-    
+
     sheet.get().endCacheBarrier();
   }
-  
+
   // 通知监听器
   _syncListeners.forEach(func => func(oldData, newData));
-  
+
   // 触发应用级事件
   app.events.emit('sync', {
     type: 'applied',
@@ -680,7 +680,7 @@ export async function prewarmMonth(
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
-**缓存屏障实现细节**（spreadsheet/spreadsheet.ts）：**
+**缓存屏障实现细节**（spreadsheet/spreadsheet.ts）：
 
 ```typescript
 startCacheBarrier() {
@@ -708,9 +708,63 @@ triggerDatabaseChanges(oldValues, newValues) {
 }
 ```
 
-### 8.4 sync-event 前端失效条件精确对齐
+---
 
-根据 `sync-events.ts` 的实现，`tables` 数组的不同值会触发不同的缓存失效行为：
+## 九、同步事件驱动失效与 Mutation 主动失效的双通道模型
+
+### 9.1 双通道架构概述
+
+银行同步场景涉及两条独立的缓存失效通道，它们可能同时触发，产生叠加效应：
+
+| 通道 | 触发源 | 入口文件 | 触发时机 |
+|------|--------|----------|----------|
+| **通道一：sync-event** | 后端主动推送 | `sync-events.ts` | 后端同步完成后发送 `sync-event` 消息 |
+| **通道二：mutation** | 前端 mutation 回调 | `accounts/mutations.ts` | 前端 mutation 成功完成时 |
+
+### 9.2 通道一：sync-event 事件驱动失效
+
+**入口**：`accounts/app.ts` 中的 `connection.send('sync-event', { type: 'success', tables: [...] })`
+
+**处理逻辑**：位于 `sync-events.ts:39-90` 的 `listenForSyncEvent` 函数
+
+```typescript
+// sync-events.ts:46-90
+if (event.type === 'success' || event.type === 'applied') {
+  const tables = event.tables;
+
+  if (tables.includes('prefs')) {
+    void store.dispatch(loadPrefs());
+  }
+
+  if (
+    tables.includes('categories') ||
+    tables.includes('category_groups') ||
+    tables.includes('category_mapping')
+  ) {
+    void queryClient.invalidateQueries({
+      queryKey: categoryQueries.lists(),
+    });
+  }
+
+  if (
+    tables.includes('accounts') ||
+    tables.includes('payees') ||
+    tables.includes('payee_mapping')
+  ) {
+    void queryClient.invalidateQueries({
+      queryKey: payeeQueries.lists(),
+    });
+  }
+
+  if (tables.includes('accounts')) {
+    void queryClient.invalidateQueries({
+      queryKey: accountQueries.lists(),
+    });
+  }
+}
+```
+
+**失效规则**（基于 `tables` 数组）：
 
 | tables 包含值 | 触发的失效操作 | 不触发的操作 |
 |--------------|---------------|-------------|
@@ -723,16 +777,135 @@ triggerDatabaseChanges(oldValues, newValues) {
 | `payee_mapping` | `queryClient.invalidateQueries({ queryKey: payeeQueries.lists() })` | 不影响 categories/accounts 查询 |
 | **`transactions`** | **Spreadsheet 层单元格重新计算** | **不触发任何 TanStack Query 失效** |
 
-**仅有 transactions 时的实际行为：**
+### 9.3 通道二：Mutation 主动失效
 
-当 `tables = ['transactions']` 时：
-1. **不触发** `categoryQueries.lists()` 失效
-2. **不触发** `accountQueries.lists()` 失效  
-3. **不触发** `payeeQueries.lists()` 失效
-4. **仅在** Spreadsheet 层：`triggerDatabaseChanges` 标记依赖 `transactions` 表的 SQL 单元格为脏，触发重新计算
-5. BudgetTable 通过 Spreadsheet API 读取时自动获取更新后的数据
+**入口**：`accounts/mutations.ts` 中的 `useSyncAccountsMutation` 的 `onSuccess` 回调和 `handleSyncResponse` 函数
 
-### 8.5 月份切换对照表
+**失效触发点**：
+
+#### 触发点一：useSyncAccountsMutation.onSuccess（第 680 行）
+
+```typescript
+// accounts/mutations.ts:34-38
+const invalidateQueries = (queryClient: QueryClient, queryKey?: QueryKey) => {
+  void queryClient.invalidateQueries({
+    queryKey: queryKey ?? accountQueries.lists(),
+  });
+};
+
+// accounts/mutations.ts:680
+onSuccess: () => invalidateQueries(queryClient),
+```
+
+- **效果**：无条件失效 `accountQueries.lists()`
+
+#### 触发点二：handleSyncResponse（第 749 行）
+
+```typescript
+// accounts/mutations.ts:692-752
+function handleSyncResponse(
+  accountId: Entity['id'],
+  res: SyncResponseWithErrors,
+  dispatch: AppDispatch,
+  queryClient: QueryClient,
+  resNewTransactions: Array<Entity['id']>,
+  resMatchedTransactions: Array<Entity['id']>,
+  resUpdatedAccounts: Array<Entity['id']>,
+) {
+  // ... 处理响应 ...
+  resNewTransactions.push(...newTransactions);
+  resMatchedTransactions.push(...matchedTransactions);
+  resUpdatedAccounts.push(...updatedAccounts);
+
+  invalidateQueries(queryClient);  // <-- 每次账户同步完成都调用
+
+  return newTransactions.length > 0 || matchedTransactions.length > 0;
+}
+```
+
+- **效果**：每次账户同步完成（无论成功与否）都失效 `accountQueries.lists()`
+
+### 9.4 通道二在银行同步中的调用时机
+
+`handleSyncResponse` 在 `useSyncAccountsMutation` 中被调用：
+
+```typescript
+// accounts/mutations.ts:549-690
+export function useSyncAccountsMutation() {
+  // ...
+  return useMutation({
+    mutationFn: async ({ id }: SyncAccountsPayload) => {
+      // ... 执行同步 ...
+
+      // SimpleFin 批量同步
+      for (const account of res) {
+        const success = handleSyncResponse(
+          account.accountId,
+          account.res,
+          dispatch,
+          queryClient,
+          newTransactions,
+          matchedTransactions,
+          updatedAccounts,
+        );
+        // ...
+      }
+
+      // 单个账户同步
+      for (let idx = 0; idx < accountIdsToSync.length; idx++) {
+        const res = await send('accounts-bank-sync', { ids: [accountId] });
+        handleSyncResponse(
+          accountId,
+          res,
+          dispatch,
+          queryClient,
+          newTransactions,
+          matchedTransactions,
+          updatedAccounts,
+        );
+        // ...
+      }
+    },
+    onSuccess: () => invalidateQueries(queryClient),
+  });
+}
+```
+
+### 9.5 双通道叠加效应（transactions-only 场景）
+
+当银行同步仅涉及 `transactions` 表变更时（`tables = ['transactions']`）：
+
+| 通道 | 触发条件 | 触发的操作 | 不触发的操作 |
+|------|----------|------------|-------------|
+| **通道一 (sync-event)** | 后端发送 `tables: ['transactions']` | **无 TanStack Query 失效**<br>仅 Spreadsheet 层：`triggerDatabaseChanges` 标记依赖 `transactions` 的 SQL 单元格为脏，触发重新计算 | `categoryQueries.lists()`<br>`accountQueries.lists()`<br>`payeeQueries.lists()` |
+| **通道二 (mutation)** | `useSyncAccountsMutation.onSuccess` + `handleSyncResponse` | `accountQueries.lists()` 失效 | `categoryQueries.lists()`<br>`payeeQueries.lists()` |
+
+**叠加结论**：
+- 两条通道**独立触发**，不存在互斥关系
+- 在 `transactions-only` 场景下：
+  - **通道一** 不触发任何 TanStack Query 失效（仅 Spreadsheet 层重新计算）
+  - **通道二** 触发 `accountQueries.lists()` 失效
+  - **最终效果**：`accountQueries.lists()` 被失效，但 `categoryQueries.lists()` 和 `payeeQueries.lists()` 不被失效
+- 如果同步涉及 `accounts` 表变更（例如账户重命名），则通道一会触发 `accountQueries.lists()` 和 `payeeQueries.lists()` 失效，与通道二的效果叠加
+
+### 9.6 银行同步后端发送的 tables 值
+
+根据 `accounts/app.ts` 的实现，银行同步成功后发送的 `tables` 值为：
+
+| 同步 API | tables 值 | 触发条件 |
+|----------|-----------|----------|
+| `accounts-bank-sync` | `['transactions']` | 有更新的账户时发送 |
+| `simplefin-batch-sync` | `['transactions']` | 有更新的账户时发送 |
+| `gocardless-accounts-link` | `['transactions']` | 链接成功时发送 |
+| `simplefin-accounts-link` | `['transactions']` | 链接成功时发送 |
+| `pluggyai-accounts-link` | `['transactions']` | 链接成功时发送 |
+| `enablebanking-accounts-link` | `['transactions']` | 链接成功时发送 |
+
+---
+
+## 十、对照表
+
+### 10.1 月份切换对照表
 
 | 步骤 | 触发点 | 依赖模块 | 被更新的数据 | 缓存失效范围 |
 |------|--------|----------|--------------|------------|
@@ -744,25 +917,68 @@ triggerDatabaseChanges(oldValues, newValues) {
 | 6 | MonthsProvider 计算 | `MonthsContext.tsx` | `months` 范围数组 | 无 |
 | 7 | 子组件消费 context | `BudgetSummaries` / `BudgetTotals` / `BudgetCategories` | 渲染输出 | 无（从 Spreadsheet 获取实时数据） |
 
-### 8.6 银行同步对照表
+### 10.2 银行同步双通道对照表
 
-| 步骤 | 触发点 | 依赖模块 | 被更新的数据 | 缓存失效范围 |
-|------|--------|----------|--------------|------------|
-| 1 | 用户触发银行同步 | UI 组件（账户页/预算页） | 无 | 无 |
-| 2 | `accounts-bank-sync` API 调用 | `accounts/app.ts` | 无 | 无 |
-| 3 | `syncAccount()` | `accounts/sync.ts` | `transactions` 表新增/更新 | 无（事务中） |
-| 4 | CRDT 消息生成 | CRDT 模块 | 无（消息待应用） | 无 |
-| 5 | `applyMessages()` | `sync/index.ts` | `messages_crdt`, `messages_clock`, `merkle` 树 | Spreadsheet 层：`startCacheBarrier()` |
-| 6 | `triggerBudgetChanges()` | `sync/index.ts` | 预算计算中间状态 | Spreadsheet 层：相关单元格标记为脏 |
-| 7 | `triggerDatabaseChanges()` | `spreadsheet.ts` | SQL 依赖表相关单元格 | Spreadsheet 层：依赖变更表的单元格重新计算 |
-| 8 | `endCacheBarrier()` | `sync/index.ts` | 缓存屏障状态 | Spreadsheet 层：缓存屏障关闭 |
-| 9 | `sync-event` 发送 | `accounts/app.ts` | 无（事件通知） | 无 |
-| 10 | `sync-event` 接收 | `sync-events.ts` | 无（触发失效） | TanStack Query：根据 `tables` 数组选择性失效 |
-| 11 | UI 组件重渲染 | React 调度器 | 显示最新数据 | 无（数据已更新） |
+| 阶段 | 步骤 | 触发点 | 依赖模块 | 通道归属 | 缓存失效范围 |
+|------|------|--------|----------|----------|------------|
+| **银行同步执行** | 1 | 用户触发银行同步 | UI 组件（账户页） | - | 无 |
+| | 2 | `accounts-bank-sync` API 调用 | `accounts/app.ts` | - | 无 |
+| | 3 | `syncAccount()` | `accounts/sync.ts` | - | `transactions` 表新增/更新（事务中） |
+| **CRDT 同步** | 4 | CRDT 消息生成 | CRDT 模块 | - | 无（消息待应用） |
+| | 5 | `applyMessages()` | `sync/index.ts` | - | `messages_crdt`, `messages_clock`, `merkle` 树 |
+| | 6 | `triggerBudgetChanges()` | `sync/index.ts` | **通道一（前端接收前）** | Spreadsheet 层：相关单元格标记为脏 |
+| | 7 | `triggerDatabaseChanges()` | `spreadsheet.ts` | **通道一** | Spreadsheet 层：依赖变更表的单元格重新计算 |
+| | 8 | `endCacheBarrier()` | `sync/index.ts` | - | Spreadsheet 层：缓存屏障关闭 |
+| **通道一：后端事件** | 9 | `sync-event` 发送 | `accounts/app.ts` | **通道一** | 无（事件通知） |
+| | 10 | `sync-event` 接收 | `sync-events.ts:39-90` | **通道一** | TanStack Query：根据 `tables` 选择性失效（`transactions` 时**不触发** Query 失效） |
+| **通道二：前端 Mutation** | 11 | `useSyncAccountsMutation` 成功 | `accounts/mutations.ts:680` | **通道二** | `accountQueries.lists()` 失效 |
+| | 12 | `handleSyncResponse()` 完成 | `accounts/mutations.ts:749` | **通道二** | `accountQueries.lists()` 失效 |
+| **UI 渲染** | 13 | UI 组件重渲染 | React 调度器 | - | 显示最新数据 |
+
+### 10.3 银行同步场景结论
+
+#### 结论一：transactions-only 场景下的双通道行为
+
+当银行同步仅产生 `transactions` 变更时：
+
+| 通道 | 触发源 | 触发的失效 | 不触发的失效 |
+|------|--------|-----------|-------------|
+| **通道一 (sync-event)** | 后端发送 `tables: ['transactions']` | **无 TanStack Query 失效**<br>仅 Spreadsheet 层重新计算 | `categoryQueries.lists()`<br>`accountQueries.lists()`<br>`payeeQueries.lists()` |
+| **通道二 (mutation)** | `useSyncAccountsMutation.onSuccess` + `handleSyncResponse` | `accountQueries.lists()` | `categoryQueries.lists()`<br>`payeeQueries.lists()` |
+
+**最终结果**：`accountQueries.lists()` 被失效，账户列表页面会重新请求数据。
+
+#### 结论二：accounts 变更场景
+
+如果同步涉及 `accounts` 表变更（例如账户重命名），则：
+
+| 通道 | 触发的失效 |
+|------|-----------|
+| **通道一 (sync-event)** | `accountQueries.lists()` + `payeeQueries.lists()` |
+| **通道二 (mutation)** | `accountQueries.lists()` |
+
+**最终结果**：`accountQueries.lists()` 和 `payeeQueries.lists()` 都会被失效，且 `accountQueries.lists()` 可能被失效两次（但第二次是冗余的）。
+
+#### 结论三：Spreadsheet 层与 Query 层的关系
+
+- **Spreadsheet 层重新计算**：确保 BudgetTable 等组件通过 Spreadsheet API 获取最新数据
+- **Query 层失效**：确保依赖 TanStack Query 的组件（如账户列表）重新请求数据
+- 两者相互独立，共同保证数据一致性
+
+#### 结论四：失效入口与影响范围对照
+
+| 失效入口 | 影响范围 | 触发条件 |
+|----------|----------|----------|
+| `sync-event` (tables: categories/category_groups/category_mapping) | `categoryQueries.lists()` | 后端同步了分类数据 |
+| `sync-event` (tables: accounts) | `accountQueries.lists()` + `payeeQueries.lists()` | 后端同步了账户数据 |
+| `sync-event` (tables: payees/payee_mapping) | `payeeQueries.lists()` | 后端同步了商户数据 |
+| `sync-event` (tables: transactions) | **无 Query 层失效**，仅 Spreadsheet 重新计算 | 后端仅同步了交易数据 |
+| `useSyncAccountsMutation.onSuccess` | `accountQueries.lists()` | 前端银行同步成功 |
+| `handleSyncResponse` | `accountQueries.lists()` | 前端处理同步响应（每个账户同步完成时调用） |
 
 ---
 
-## 九、参考文件清单
+## 十一、参考文件清单
 
 | 文件路径 | 说明 |
 |----------|------|
@@ -772,7 +988,8 @@ triggerDatabaseChanges(oldValues, newValues) {
 | `packages/desktop-client/src/components/budget/util.ts` | 预热函数 prewarmMonth / prewarmAllMonths |
 | `packages/desktop-client/src/components/reports/spreadsheets/budgetDataQuery.ts` | 预算数据查询 |
 | `packages/desktop-client/src/hooks/useCategories.ts` | 分类数据 Hook |
-| `packages/desktop-client/src/sync-events.ts` | sync-event 处理 |
+| `packages/desktop-client/src/sync-events.ts` | sync-event 事件处理（通道一） |
+| `packages/desktop-client/src/accounts/mutations.ts` | 账户 mutation（通道二） |
 | `packages/loot-core/src/server/accounts/app.ts` | 账户服务 API |
 | `packages/loot-core/src/server/accounts/sync.ts` | 银行同步实现 |
 | `packages/loot-core/src/server/sync/index.ts` | CRDT 同步核心 |
