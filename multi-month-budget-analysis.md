@@ -469,16 +469,262 @@ export function useCategories() {
 
 ---
 
-## 八、参考文件清单
+## 八、关键时序分析
+
+### 8.1 预算页面月份切换链路
+
+完整的月份切换时序如下：
+
+```
+用户点击月份导航
+       │
+       ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│ 1. onMonthSelect 回调触发 (budget/index.tsx)                         │
+│    • setStartMonthPref(month) - 更新本地偏好设置                        │
+│    • 判断预热方向（左/右）                                           │
+└─────────────────────────────────────────────────────────────────────────┘
+       │
+       ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│ 2. 执行 prewarmMonth 预热相邻月份 (budget/util.ts)                       │
+│    • 根据预算类型选择 API：envelope-budget-month 或 tracking-budget-month│
+│    • send(method, { month }) - 调用服务器 API 获取月份预算数据               │
+│    • spreadsheet.prewarmCache(value.name, value) - 预热 spreadsheet 缓存     │
+└─────────────────────────────────────────────────────────────────────────┘
+       │
+       ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│ 3. 状态更新，重新渲染 BudgetTable 组件                                 │
+│    • startMonth 状态更新触发重渲染                                    │
+│    • BudgetTable 接收新的 startMonth 和 prewarmStartMonth                │
+└─────────────────────────────────────────────────────────────────────────┘
+       │
+       ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│ 4. MonthsProvider 计算新的月份范围 (MonthsContext.tsx)                 │
+│    • endMonth = monthUtils.addMonths(startMonth, numMonths - 1)        │
+│    • bounds = getValidMonthBounds(monthBounds, startMonth, endMonth)   │
+│    • months = monthUtils.rangeInclusive(bounds.start, bounds.end)        │
+└─────────────────────────────────────────────────────────────────────────┘
+       │
+       ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│ 5. 双层 MonthsProvider 生效                                          │
+│    • 第一层：BudgetSummaries 使用 prewarmStartMonth 预热数据                  │
+│    • 第二层：BudgetTotals 和 BudgetCategories 使用实际 startMonth        │
+└─────────────────────────────────────────────────────────────────────────┘
+       │
+       ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│ 6. 调用 fetchBudgetData 获取预算数据                                       │
+│    • 使用 mapWithConcurrency 并行获取多个月份数据                       │
+│    • 并发数限制：monthFetchConcurrency = 8                              │
+│    • 每个月份调用 'envelope-budget-month' 或 'tracking-budget-month'     │
+└─────────────────────────────────────────────────────────────────────────┘
+       │
+       ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│ 7. 数据聚合与渲染                                                     │
+│    • 构建 QueryDataEntity 数组                                        │
+│    • 按类别分组数据                                                  │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+**时序细节代码示例：
+
+```typescript
+// budget/index.tsx - onMonthSelect 实现
+const onMonthSelect = async (month, numDisplayed) => {
+  setStartMonthPref(month);
+  const warmingMonth = month;
+  // 优化：用户左/右按钮切换时预热相邻月份
+  if (month < startMonth) {
+    // 向左：预热前一个月
+    await prewarmMonth(budgetType, spreadsheet, monthUtils.subMonths(month, 1));
+  } else if (month > startMonth) {
+    // 向右：预热后一个月
+    await prewarmMonth(
+      budgetType,
+      spreadsheet,
+      monthUtils.addMonths(month, numDisplayed)
+    );
+  }
+  if (warmingMonth === month) {
+    setStartMonthPref(month);
+  }
+};
+```
+
+```typescript
+// budget/util.ts - prewarmMonth 实现
+export async function prewarmMonth(
+  budgetType,
+  spreadsheet,
+  month
+) {
+  const method = budgetType === 'tracking'
+    ? 'tracking-budget-month'
+    : 'envelope-budget-month';
+  const values = await send(method, { month });
+  for (const value of values) {
+    spreadsheet.prewarmCache(value.name, value);
+  }
+}
+```
+
+### 8.2 银行同步链路
+
+银行同步的完整链路如下：
+
+```
+用户触发银行同步
+       │
+       ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│ 1. 调用 accounts-bank-sync 或 simplefin-batch-sync API             │
+│    (accounts/app.ts)                                                   │
+│    • 查询所有已链接且未关闭的账户                                     │
+└─────────────────────────────────────────────────────────────────────────┘
+       │
+       ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│ 2. 遍历账户调用 bankSync.syncAccount() (accounts/sync.ts)               │
+│    • 获取同步起始日期（最早 90 天或账户最早交易日期）                  │
+│    • 根据同步源下载交易（GoCardless/SimpleFin/PluggyAI/EnableBanking） │
+│    • reconcileTransactions 协调新旧交易                                │
+│    • 应用用户规则                                                  │
+└─────────────────────────────────────────────────────────────────────────┘
+       │
+       ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│ 3. 数据变更写入数据库，触发 CRDT 消息生成                              │
+└─────────────────────────────────────────────────────────────────────────┘
+       │
+       ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│ 4. applyMessages 执行 (sync/index.ts)                                │
+│    • sheet.startCacheBarrier() - 启动缓存屏障                          │
+│    • 比较消息与现有 CRDT（过滤已应用的消息）                          │
+│    • 按时间戳排序                                                    │
+│    • db.transaction() - 数据库事务                                    │
+│      - 应用消息到数据库                                                │
+│      - 插入 messages_crdt 表                                            │
+│      - 更新 Merkle 树                                                 │
+└─────────────────────────────────────────────────────────────────────────┘
+       │
+       ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│ 5. 触发预算变化计算与单元格重新计算                                      │
+│    • sheet.startTransaction()                                         │
+│    • triggerBudgetChanges(oldData, newData)                              │
+│    • sheet.triggerDatabaseChanges(oldData, newData) - 标记相关 SQL 单元格为脏│
+│    • 重新计算全局聚合单元格（如账户余额）                              │
+│    • sheet.endTransaction()                                           │
+└─────────────────────────────────────────────────────────────────────────┘
+       │
+       ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│ 6. 结束缓存屏障                                                      │
+│    • sheet.endCacheBarrier()                                      │
+│    • 标记缓存安全（如果没有待处理变更）                                │
+└─────────────────────────────────────────────────────────────────────────┘
+       │
+       ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│ 7. 发送 sync-event 通知客户端 (accounts/app.ts)                   │
+│    • connection.send('sync-event', { type: 'success', tables: ['transactions'] })│
+└─────────────────────────────────────────────────────────────────────────┘
+       │
+       ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│ 8. 前端接收 sync-event (sync-events.ts)                            │
+│    • listenForSyncEvent 监听                                          │
+│    • 根据 tables 数组判断需要失效的缓存                                  │
+│      - categories/category_groups: 失效 categoryQueries.lists()              │
+│      - accounts: 失效 accountQueries.lists()                       │
+│      - payees: 失效 payeeQueries.lists()                             │
+│    • queryClient.invalidateQueries() - 触发 TanStack Query 缓存失效    │
+└─────────────────────────────────────────────────────────────────────────┘
+       │
+       ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│ 9. UI 组件重新渲染，显示最新数据                                    │
+│    • useCategories 重新获取数据                                    │
+│    • BudgetTable 刷新预算表格数据                                        │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+**缓存屏障实现细节**（spreadsheet/spreadsheet.ts）：**
+
+```typescript
+startCacheBarrier() {
+  this.cacheBarrier = true;
+  this.markCacheDirty();
+}
+
+endCacheBarrier() {
+  this.cacheBarrier = false;
+  const pendingChange = this.running || this.computeQueue.length > 0;
+  if (!pendingChange) {
+    this.markCacheSafe();
+  }
+}
+
+triggerDatabaseChanges(oldValues, newValues) {
+  const tables = new Set([...oldValues.keys(), ...newValues.keys()]);
+  this.startTransaction();
+  this.nodes.forEach(node => {
+    if (node.sql && node.sql.state.dependencies.some(dep => tables.has(dep))) {
+      this._markDirty(node.name);
+    }
+  });
+  this.endTransaction();
+}
+```
+
+### 8.3 月份切换对照表
+
+| 步骤 | 触发点 | 依赖模块 | 被更新的数据 | 缓存失效范围 |
+|------|--------|----------|--------------|------------|
+| 1 | 用户点击月份导航 | MonthPicker | 组件 / 左右箭头 | 无（状态变更） |
+| 2 | onMonthSelect 回调 | budget/index.tsx | startMonthPref (localStorage) | 无 |
+| 3 | prewarmMonth() | budget/util.ts | spreadsheet 单元格缓存 | Spreadsheet 层：预热相邻月份单元格缓存 |
+| 4 | MonthsProvider 计算 | MonthsContext.tsx | months 范围数组 | 无 |
+| 5 | BudgetTable 重渲染 | BudgetTable.tsx | 可见月份预算数据 | TanStack Query：月份预算数据重新请求 |
+| 6 | fetchBudgetData 并行获取 | budgetDataQuery.ts | QueryDataEntity 数组 | 无（复用已缓存的） |
+
+### 8.4 银行同步对照表
+
+| 步骤 | 触发点 | 依赖模块 | 被更新的数据 | 缓存失效范围 |
+|------|--------|----------|--------------|------------|
+| 1 | 用户触发银行同步 | UI 组件/账户页 | 无 | 无 |
+| 2 | accounts-bank-sync API | accounts/app.ts | 无 | 无 |
+| 3 | syncAccount() | accounts/sync.ts | transactions 表新增/更新 | 无（事务中） |
+| 4 | applyMessages() | sync/index.ts | messages_crdt, messages_clock, merkle 树 | Spreadsheet 层：startCacheBarrier() - 缓存屏障开启 |
+| 5 | triggerBudgetChanges() | sync/index.ts | 预算计算依赖项 | Spreadsheet 层：相关单元格标记为脏 |
+| 6 | triggerDatabaseChanges() | spreadsheet.ts | Spreadsheet SQL 依赖表相关单元格 | Spreadsheet 层：所有依赖变更表的单元格重新计算 |
+| 7 | endCacheBarrier() | sync/index.ts | 缓存屏障关闭 | Spreadsheet 层：endCacheBarrier() - 缓存屏障关闭 |
+| 8 | sync-event 发送 | accounts/app.ts | sync 监听器 | 无 |
+| 9 | sync-event 接收 | sync-events.ts | 无 | TanStack Query：categoryQueries.lists()、accountQueries.lists()、payeeQueries.lists()（根据 tables 数组） |
+| 10 | UI 组件重渲染 | 各组件 | 显示最新数据 | 无（数据已更新） |
+
+---
+
+## 九、参考文件清单
 
 | 文件路径 | 说明 |
 |----------|------|
 | `packages/desktop-client/src/components/budget/BudgetTable.tsx` | 预算表格主组件 |
 | `packages/desktop-client/src/components/budget/MonthsContext.tsx` | 月份上下文管理 |
+| `packages/desktop-client/src/components/budget/index.tsx` | 预算页面主组件，onMonthSelect 实现 |
+| `packages/desktop-client/src/components/budget/util.ts` | 预热函数 prewarmMonth / prewarmAllMonths |
 | `packages/desktop-client/src/components/reports/spreadsheets/budgetDataQuery.ts` | 预算数据查询 |
 | `packages/desktop-client/src/hooks/useCategories.ts` | 分类数据 Hook |
+| `packages/desktop-client/src/sync-events.ts` | sync-event 处理 |
 | `packages/loot-core/src/server/accounts/app.ts` | 账户服务 API |
 | `packages/loot-core/src/server/accounts/sync.ts` | 银行同步实现 |
 | `packages/loot-core/src/server/sync/index.ts` | CRDT 同步核心 |
+| `packages/loot-core/src/server/spreadsheet/spreadsheet.ts` | Spreadsheet 缓存屏障实现 |
 | `packages/crdt/src/crdt/timestamp.ts` | HULC 时间戳实现 |
 | `packages/crdt/src/crdt/merkle.ts` | Merkle 树实现 |
