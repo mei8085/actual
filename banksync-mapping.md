@@ -491,9 +491,9 @@ export const defaultMappings: Mappings = new Map([
 - 查询满足条件的交易后，取查询结果数组的第一条作为示例交易
 - 解析该交易的 `raw_synced_data` 原始数据后，动态生成可用字段候选列表
 
-**代码证据**：
+**代码证据 1：查询条件**
 ```typescript
-// useBankSyncAccountSettings.ts:60-67 - 查询条件无显式排序/限制
+// useBankSyncAccountSettings.ts:60-67 - 用户查询未显式指定 orderBy
 const transactionQuery = q('transactions')
   .filter({
     account: accountId,
@@ -501,16 +501,34 @@ const transactionQuery = q('transactions')
     raw_synced_data: { $ne: null },
   })
   .options({ splits: 'none' })
-  .select('*');  // ⚠️ 无 orderBy、无 limit 子句
+  .select('*');
 
 // useBankSyncAccountSettings.ts:73 - 直接取数组首条
 const data = transactions?.[0]?.raw_synced_data;
 ```
 
-**关键说明**：
-- 查询条件中未见显式的 `orderBy` 排序或 `limit(1)` 限制
-- 因此 `transactions[0]` 仅代表查询结果集中的第一条，**不等于严格意义上的"最近一笔"**
-- 实际排序取决于数据库查询默认行为（通常是主键/id 顺序）
+**代码证据 2：AQL 默认排序（schema/index.ts:268-274）**
+```javascript
+// AQL customizeQuery 自动注入的默认排序逻辑
+case 'transactions':
+  return [
+    { date: 'desc' },           // 1. 日期降序
+    'starting_balance_flag',    // 2. 期初余额标志
+    { sort_order: 'desc' },     // 3. 排序值降序
+    'id',                       // 4. id
+  ];
+```
+
+**代码证据 3：SQL 视图排序（schema/index.ts:411）**
+```sql
+-- v_transactions 视图中的 ORDER BY 子句
+ORDER BY _.date desc, _.starting_balance_flag, _.sort_order desc, _.id;
+```
+
+**关键结论**：
+- 示例交易来自**默认排序后的首条记录**
+- 默认排序规则：date 降序 → starting_balance_flag → sort_order 降序 → id
+- 由于有确定的默认排序，首条记录即为满足条件的最新交易
 
 ### 6.3 嵌套字段支持差异
 
