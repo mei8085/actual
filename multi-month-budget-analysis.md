@@ -871,24 +871,7 @@ export function useSyncAccountsMutation() {
 }
 ```
 
-### 9.5 双通道叠加效应（transactions-only 场景）
-
-当银行同步仅涉及 `transactions` 表变更时（`tables = ['transactions']`）：
-
-| 通道 | 触发条件 | 触发的操作 | 不触发的操作 |
-|------|----------|------------|-------------|
-| **通道一 (sync-event)** | 后端发送 `tables: ['transactions']` | **无 TanStack Query 失效**<br>仅 Spreadsheet 层：`triggerDatabaseChanges` 标记依赖 `transactions` 的 SQL 单元格为脏，触发重新计算 | `categoryQueries.lists()`<br>`accountQueries.lists()`<br>`payeeQueries.lists()` |
-| **通道二 (mutation)** | `useSyncAccountsMutation.onSuccess` + `handleSyncResponse` | `accountQueries.lists()` 失效 | `categoryQueries.lists()`<br>`payeeQueries.lists()` |
-
-**叠加结论**：
-- 两条通道**独立触发**，不存在互斥关系
-- 在 `transactions-only` 场景下：
-  - **通道一** 不触发任何 TanStack Query 失效（仅 Spreadsheet 层重新计算）
-  - **通道二** 触发 `accountQueries.lists()` 失效
-  - **最终效果**：`accountQueries.lists()` 被失效，但 `categoryQueries.lists()` 和 `payeeQueries.lists()` 不被失效
-- 如果同步涉及 `accounts` 表变更（例如账户重命名），则通道一会触发 `accountQueries.lists()` 和 `payeeQueries.lists()` 失效，与通道二的效果叠加
-
-### 9.6 银行同步后端发送的 tables 值
+### 9.5 银行同步后端发送的 tables 值
 
 根据 `accounts/app.ts` 的实现，银行同步成功后发送的 `tables` 值为：
 
@@ -903,9 +886,96 @@ export function useSyncAccountsMutation() {
 
 ---
 
-## 十、对照表
+## 十、触发上下文矩阵
 
-### 10.1 月份切换对照表
+### 10.1 上下文分类
+
+银行同步场景根据发起方和触发路径可分为三种上下文：
+
+| 上下文类型 | 触发方 | 通道一触发 | 通道二触发 |
+|-----------|--------|-----------|-----------|
+| **上下文 A：本端主动发起** | 本端 UI 触发 `useSyncAccountsMutation` | ✅ 触发（被动接收后端广播） | ✅ 触发（主动 mutation 回调） |
+| **上下文 B：仅被动接收** | 远端客户端或其他设备发起，本端 sync-event 推送 | ✅ 触发 | ❌ 不触发 |
+| **上下文 C：非账户同步入口** | 其他 mutation（如 `useSaveCategoryMutation`） | ✅ 触发（若涉及同步） | ❌ 不触发 |
+
+### 10.2 上下文 A：本端主动发起银行同步
+
+**触发入口**：
+- 用户在账户页面点击"同步"按钮
+- 调用 `useSyncAccountsMutation.mutate()`
+
+**通道命中情况**：
+| 通道 | 是否触发 | 触发条件 |
+|------|---------|----------|
+| **通道一 (sync-event)** | ✅ 是 | 后端处理完同步后发送 `sync-event` 消息 |
+| **通道二 (mutation)** | ✅ 是 | `useSyncAccountsMutation.onSuccess` 和 `handleSyncResponse` 回调 |
+
+**tables=transactions 时各层行为**：
+
+| 层级 | 发生的行为 | 触发位置 |
+|------|-----------|----------|
+| **Spreadsheet 层** | `triggerDatabaseChanges` 标记依赖 `transactions` 的 SQL 单元格为脏，触发重新计算 | `spreadsheet.ts` |
+| **Query 层（通道一）** | **不触发** TanStack Query 失效 | `sync-events.ts:39-90` 判断 `tables` 为 `transactions` 时跳过 |
+| **Query 层（通道二）** | ✅ 触发 `accountQueries.lists()` 失效 | `accounts/mutations.ts:680,749` |
+
+### 10.3 上下文 B：仅被动接收 sync-event
+
+**触发入口**：
+- 远端客户端修改数据并同步
+- 本端通过 sync-server 收到 `sync-event` 推送
+- 典型场景：多设备使用、后台同步
+
+**通道命中情况**：
+| 通道 | 是否触发 | 触发条件 |
+|------|---------|----------|
+| **通道一 (sync-event)** | ✅ 是 | `sync-event` 消息到达 |
+| **通道二 (mutation)** | ❌ 否 | 本端没有调用任何账户 mutation |
+
+**tables=transactions 时各层行为**：
+
+| 层级 | 发生的行为 | 触发位置 |
+|------|-----------|----------|
+| **Spreadsheet 层** | `triggerDatabaseChanges` 标记依赖 `transactions` 的 SQL 单元格为脏，触发重新计算 | `spreadsheet.ts` |
+| **Query 层（通道一）** | **不触发** TanStack Query 失效 | `sync-events.ts:39-90` 判断 `tables` 为 `transactions` 时跳过 |
+| **Query 层（通道二）** | **不触发** | 本端没有 mutation 在执行 |
+
+**结论**：在上下文 B 且 `tables=transactions` 时，**不会触发任何 TanStack Query 失效**，BudgetTable 通过 Spreadsheet 层重新计算获取最新数据，但账户列表等依赖 TanStack Query 的组件不会自动刷新。
+
+### 10.4 上下文 C：非账户同步入口
+
+**触发入口**：
+- `useSaveCategoryMutation`
+- `useSaveAccountMutation`
+- `useImportTransactionsMutation`
+- 其他非银行同步的 mutation
+
+**通道命中情况**：
+| 通道 | 是否触发 | 触发条件 |
+|------|---------|----------|
+| **通道一 (sync-event)** | ✅ 可能触发 | 若该 mutation 触发后端同步并返回 `sync-event` |
+| **通道二 (mutation)** | ❌ 否 | 这些 mutation 不是 `useSyncAccountsMutation` |
+
+**常见场景**：
+
+| Mutation | tables 值 | Query 层失效 |
+|----------|-----------|-------------|
+| `useSaveCategoryMutation` | `['categories']` | `categoryQueries.lists()` |
+| `useSaveAccountMutation` | `['accounts']` | `accountQueries.lists()` + `payeeQueries.lists()` |
+| `useImportTransactionsMutation` | 无后端推送 | 依赖 mutation 自身的 `onSuccess` |
+
+### 10.5 触发上下文矩阵汇总
+
+| 上下文 | 通道一触发条件 | 通道二触发条件 | tables=transactions 时 Query 层 | tables=transactions 时 Spreadsheet 层 |
+|--------|---------------|---------------|---------------------------------|-------------------------------------|
+| **A：本端主动发起** | 后端发送 `sync-event` | `useSyncAccountsMutation` 成功 | ✅ `accountQueries.lists()` 失效（通道二） | ✅ 重新计算（通道一） |
+| **B：仅被动接收** | `sync-event` 消息到达 | ❌ 不触发 | ❌ 不触发 | ✅ 重新计算 |
+| **C：非账户同步** | 若后端发送 `sync-event` | ❌ 不触发 | 取决于 tables 值 | ✅ 重新计算 |
+
+---
+
+## 十一、对照表
+
+### 11.1 月份切换对照表
 
 | 步骤 | 触发点 | 依赖模块 | 被更新的数据 | 缓存失效范围 |
 |------|--------|----------|--------------|------------|
@@ -917,68 +987,81 @@ export function useSyncAccountsMutation() {
 | 6 | MonthsProvider 计算 | `MonthsContext.tsx` | `months` 范围数组 | 无 |
 | 7 | 子组件消费 context | `BudgetSummaries` / `BudgetTotals` / `BudgetCategories` | 渲染输出 | 无（从 Spreadsheet 获取实时数据） |
 
-### 10.2 银行同步双通道对照表
+### 11.2 银行同步双通道对照表（含触发上下文）
 
-| 阶段 | 步骤 | 触发点 | 依赖模块 | 通道归属 | 缓存失效范围 |
-|------|------|--------|----------|----------|------------|
-| **银行同步执行** | 1 | 用户触发银行同步 | UI 组件（账户页） | - | 无 |
-| | 2 | `accounts-bank-sync` API 调用 | `accounts/app.ts` | - | 无 |
-| | 3 | `syncAccount()` | `accounts/sync.ts` | - | `transactions` 表新增/更新（事务中） |
-| **CRDT 同步** | 4 | CRDT 消息生成 | CRDT 模块 | - | 无（消息待应用） |
-| | 5 | `applyMessages()` | `sync/index.ts` | - | `messages_crdt`, `messages_clock`, `merkle` 树 |
-| | 6 | `triggerBudgetChanges()` | `sync/index.ts` | **通道一（前端接收前）** | Spreadsheet 层：相关单元格标记为脏 |
-| | 7 | `triggerDatabaseChanges()` | `spreadsheet.ts` | **通道一** | Spreadsheet 层：依赖变更表的单元格重新计算 |
-| | 8 | `endCacheBarrier()` | `sync/index.ts` | - | Spreadsheet 层：缓存屏障关闭 |
-| **通道一：后端事件** | 9 | `sync-event` 发送 | `accounts/app.ts` | **通道一** | 无（事件通知） |
-| | 10 | `sync-event` 接收 | `sync-events.ts:39-90` | **通道一** | TanStack Query：根据 `tables` 选择性失效（`transactions` 时**不触发** Query 失效） |
-| **通道二：前端 Mutation** | 11 | `useSyncAccountsMutation` 成功 | `accounts/mutations.ts:680` | **通道二** | `accountQueries.lists()` 失效 |
-| | 12 | `handleSyncResponse()` 完成 | `accounts/mutations.ts:749` | **通道二** | `accountQueries.lists()` 失效 |
-| **UI 渲染** | 13 | UI 组件重渲染 | React 调度器 | - | 显示最新数据 |
+| 阶段 | 步骤 | 触发点 | 依赖模块 | 通道归属 | 前置条件/触发上下文 | 缓存失效范围 |
+|------|------|--------|----------|----------|---------------------|------------|
+| **银行同步执行** | 1 | 用户触发银行同步 | UI 组件（账户页） | - | **上下文 A**：本端主动发起 | 无 |
+| | 2 | `accounts-bank-sync` API 调用 | `accounts/app.ts` | - | 必须通过 `useSyncAccountsMutation` | 无 |
+| | 3 | `syncAccount()` | `accounts/sync.ts` | - | - | `transactions` 表新增/更新（事务中） |
+| **CRDT 同步** | 4 | CRDT 消息生成 | CRDT 模块 | - | - | 无（消息待应用） |
+| | 5 | `applyMessages()` | `sync/index.ts` | - | **上下文 A/B**：CRDT 消息到达 | `messages_crdt`, `messages_clock`, `merkle` 树 |
+| | 6 | `triggerBudgetChanges()` | `sync/index.ts` | **通道一（前端接收前）** | - | Spreadsheet 层：相关单元格标记为脏 |
+| | 7 | `triggerDatabaseChanges()` | `spreadsheet.ts` | **通道一** | - | Spreadsheet 层：依赖变更表的单元格重新计算 |
+| | 8 | `endCacheBarrier()` | `sync/index.ts` | - | - | Spreadsheet 层：缓存屏障关闭 |
+| **通道一：后端事件** | 9 | `sync-event` 发送 | `accounts/app.ts` | **通道一** | **上下文 A/B**：后端处理完成 | 无（事件通知） |
+| | 10 | `sync-event` 接收 | `sync-events.ts:39-90` | **通道一** | **上下文 A（被动）+ B**：收到 `sync-event` | TanStack Query：根据 `tables` 选择性失效（`transactions` 时**不触发** Query 失效） |
+| **通道二：前端 Mutation** | 11 | `useSyncAccountsMutation` 成功 | `accounts/mutations.ts:680` | **通道二** | **仅上下文 A**：本端 mutation 成功 | `accountQueries.lists()` 失效 |
+| | 12 | `handleSyncResponse()` 完成 | `accounts/mutations.ts:749` | **通道二** | **仅上下文 A**：每个账户同步完成 | `accountQueries.lists()` 失效 |
+| **UI 渲染** | 13 | UI 组件重渲染 | React 调度器 | - | - | 显示最新数据 |
 
-### 10.3 银行同步场景结论
+### 11.3 银行同步场景结论
 
-#### 结论一：transactions-only 场景下的双通道行为
+#### 结论一：上下文 A（本地主动发起）且 tables=transactions
 
-当银行同步仅产生 `transactions` 变更时：
+| 通道 | 触发的失效 | 不触发的失效 |
+|------|-----------|-------------|
+| **通道一 (sync-event)** | 无 TanStack Query 失效<br>仅 Spreadsheet 层重新计算 | `categoryQueries.lists()`<br>`accountQueries.lists()`（通道一）<br>`payeeQueries.lists()` |
+| **通道二 (mutation)** | `accountQueries.lists()` | `categoryQueries.lists()`<br>`payeeQueries.lists()` |
 
-| 通道 | 触发源 | 触发的失效 | 不触发的失效 |
-|------|--------|-----------|-------------|
-| **通道一 (sync-event)** | 后端发送 `tables: ['transactions']` | **无 TanStack Query 失效**<br>仅 Spreadsheet 层重新计算 | `categoryQueries.lists()`<br>`accountQueries.lists()`<br>`payeeQueries.lists()` |
-| **通道二 (mutation)** | `useSyncAccountsMutation.onSuccess` + `handleSyncResponse` | `accountQueries.lists()` | `categoryQueries.lists()`<br>`payeeQueries.lists()` |
+**最终结果**：`accountQueries.lists()` 被失效（通道二触发），账户列表页面会重新请求数据。
 
-**最终结果**：`accountQueries.lists()` 被失效，账户列表页面会重新请求数据。
+#### 结论二：上下文 B（仅被动接收）且 tables=transactions
 
-#### 结论二：accounts 变更场景
+| 通道 | 触发的失效 | 不触发的失效 |
+|------|-----------|-------------|
+| **通道一 (sync-event)** | 无 TanStack Query 失效<br>仅 Spreadsheet 层重新计算 | `categoryQueries.lists()`<br>`accountQueries.lists()`<br>`payeeQueries.lists()` |
+| **通道二 (mutation)** | **不触发** | - |
 
-如果同步涉及 `accounts` 表变更（例如账户重命名），则：
+**最终结果**：**不触发任何 TanStack Query 失效**。BudgetTable 通过 Spreadsheet 层重新计算获取最新交易数据，但账户列表等组件不会自动刷新。
+
+#### 结论三：上下文 A（本地主动发起）涉及 accounts 变更
 
 | 通道 | 触发的失效 |
 |------|-----------|
 | **通道一 (sync-event)** | `accountQueries.lists()` + `payeeQueries.lists()` |
 | **通道二 (mutation)** | `accountQueries.lists()` |
 
-**最终结果**：`accountQueries.lists()` 和 `payeeQueries.lists()` 都会被失效，且 `accountQueries.lists()` 可能被失效两次（但第二次是冗余的）。
+**最终结果**：`accountQueries.lists()` 和 `payeeQueries.lists()` 都会被失效，且 `accountQueries.lists()` 被失效两次（通道一 + 通道二），但第二次是冗余的。
 
-#### 结论三：Spreadsheet 层与 Query 层的关系
+#### 结论四：Spreadsheet 层与 Query 层的关系
 
 - **Spreadsheet 层重新计算**：确保 BudgetTable 等组件通过 Spreadsheet API 获取最新数据
 - **Query 层失效**：确保依赖 TanStack Query 的组件（如账户列表）重新请求数据
 - 两者相互独立，共同保证数据一致性
 
-#### 结论四：失效入口与影响范围对照
+#### 结论五：失效入口与影响范围对照（含前置条件）
 
-| 失效入口 | 影响范围 | 触发条件 |
-|----------|----------|----------|
-| `sync-event` (tables: categories/category_groups/category_mapping) | `categoryQueries.lists()` | 后端同步了分类数据 |
-| `sync-event` (tables: accounts) | `accountQueries.lists()` + `payeeQueries.lists()` | 后端同步了账户数据 |
-| `sync-event` (tables: payees/payee_mapping) | `payeeQueries.lists()` | 后端同步了商户数据 |
-| `sync-event` (tables: transactions) | **无 Query 层失效**，仅 Spreadsheet 重新计算 | 后端仅同步了交易数据 |
-| `useSyncAccountsMutation.onSuccess` | `accountQueries.lists()` | 前端银行同步成功 |
-| `handleSyncResponse` | `accountQueries.lists()` | 前端处理同步响应（每个账户同步完成时调用） |
+| 失效入口 | 影响范围 | 前置条件/触发上下文 |
+|----------|----------|---------------------|
+| `sync-event` (tables: categories/category_groups/category_mapping) | `categoryQueries.lists()` | **上下文 A/B**：后端同步了分类数据 |
+| `sync-event` (tables: accounts) | `accountQueries.lists()` + `payeeQueries.lists()` | **上下文 A/B**：后端同步了账户数据 |
+| `sync-event` (tables: payees/payee_mapping) | `payeeQueries.lists()` | **上下文 A/B**：后端同步了商户数据 |
+| `sync-event` (tables: transactions) | **无 Query 层失效**，仅 Spreadsheet 重新计算 | **上下文 A/B**：后端仅同步了交易数据 |
+| `useSyncAccountsMutation.onSuccess` | `accountQueries.lists()` | **仅上下文 A**：前端银行同步成功 |
+| `handleSyncResponse` | `accountQueries.lists()` | **仅上下文 A**：前端处理同步响应（每个账户同步完成时调用） |
+
+#### 结论六：上下文边界总结
+
+| 上下文 | 通道一 | 通道二 | tables=transactions 时 Query 层 |
+|--------|--------|--------|---------------------------------|
+| **A：本端主动发起** | ✅ 触发 | ✅ 触发 | ✅ 触发 `accountQueries.lists()`（通道二） |
+| **B：仅被动接收** | ✅ 触发 | ❌ 不触发 | ❌ 不触发 |
+| **C：非账户同步** | ✅ 可能触发 | ❌ 不触发 | 取决于 tables 值 |
 
 ---
 
-## 十一、参考文件清单
+## 十二、参考文件清单
 
 | 文件路径 | 说明 |
 |----------|------|
