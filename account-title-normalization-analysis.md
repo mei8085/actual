@@ -13,7 +13,7 @@
 │  └─────┬───────┘  └────────┬────────┘  └────────┬────────┘                │
 │        │                   │                    │                          │
 │        ▼                   ▼                    ▼                          │
-│  ┌─────────────────────────────────────────────────────┐                   │
+│  ┌─────────────────────────────────────────────┐                   │
 │  │              normalizeAccount() 归一化              │                   │
 │  │  - name 字段组合: name/iban/currency/institution   │                   │
 │  └──────────────────────────┬──────────────────────────┘                   │
@@ -38,9 +38,10 @@
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                          CRDT 变更追踪                                     │
 │  ┌─────────────────────────────────────────────────────┐           │
-│  │  db.update() → sendMessages() → applyMessages()    │           │
+│  │  db.update() → sendMessages() → _sendMessages()    │           │
+│  │              → applyMessages()                      │           │
 │  │  - HULC 时间戳生成 (Timestamp.send())               │           │
-│  │  - messages_crdt 持久化                              │           │
+│  │  - messages_crdt 持久化 (仅 enabled/offline)        │           │
 │  └──────────────────────────┬──────────────────────────────────┘           │
 └─────────────────────────────┼───────────────────────────────────────────────┘
                               │
@@ -163,28 +164,6 @@ async function updateAccount({
 
 **根本原因**：银行同步链路根本不修改账户名称，因此不存在冲突场景。
 
-**时间线分析**：
-
-```
-T0: 用户首次链接银行账户
-        │
-        ▼
-linkGoCardlessAccount() → db.insertWithUUID('accounts', { name: bankName })
-
-T1: 用户手动修改账户名称
-        │
-        ▼
-updateAccount() → db.update('accounts', { id, name: "我的工资卡" })
-
-T2: 银行同步执行
-        │
-        ▼
-syncAccount() → processBankSyncDownload()
-        │
-        ▼
-accounts.name 保持为 "我的工资卡"（不受影响）
-```
-
 ---
 
 ## 四、CRDT 机制对账户标题变更的记录、传播与回放
@@ -226,10 +205,35 @@ export function checkSyncingMode(mode: SyncingMode): boolean {
 | `disabled` | false | false | **true** | false |
 | `import` | false | false | **true** | true |
 
-### 4.3 `applyMessages` 分支逻辑
+### 4.3 消息发送调用链
 
 ```typescript
-// packages/loot-core/src/server/sync/index.ts:261-325
+// packages/loot-core/src/server/sync/index.ts:526-532
+export async function sendMessages(messages: Message[]) {
+  if (IS_BATCHING) {
+    _BATCHED = _BATCHED.concat(messages);
+  } else {
+    return _sendMessages(messages);
+  }
+}
+
+// packages/loot-core/src/server/sync/index.ts:488-494
+async function _sendMessages(messages: Message[]): Promise<void> {
+  try {
+    await applyMessages(messages);
+  } catch (e) {
+    void errorHandler(e);
+    throw e;
+  }
+}
+```
+
+**调用链**：`sendMessages()` → `_sendMessages()` → `applyMessages()`
+
+### 4.4 `applyMessages` 分支逻辑
+
+```typescript
+// packages/loot-core/src/server/sync/index.ts:261-271
 export const applyMessages = sequential(async (messages: Message[]) => {
   if (checkSyncingMode('import')) {
     // 分支一：import 模式
@@ -239,103 +243,48 @@ export const applyMessages = sequential(async (messages: Message[]) => {
     // 分支二：enabled 或 offline 模式
     messages = await compareMessages(messages);
   }
-
-  messages = [...messages].sort(...);
-
-  let clock;
-  let currentMerkle;
-  if (checkSyncingMode('enabled')) {
-    clock = getClock();
-    currentMerkle = clock.merkle;
-  }
+  // 分支三：disabled 模式（不进入上述任何分支）
   // ...
 });
 ```
 
-### 4.4 各同步模式下 CRDT 行为对照表
+### 4.5 各同步模式下 CRDT 行为对照表（源码可印证）
 
-| CRDT 操作 | `enabled` | `offline` | `disabled` | `import` |
-|-----------|-----------|-----------|-----------|----------|
-| **compareMessages** (冲突检测) | ✅ 发生 | ✅ 发生 | ❌ 不发生 | ❌ 不发生 |
-| **messages_crdt 写入** | ✅ 发生 | ✅ 发生 | ❌ 不发生 | ❌ 不发生 |
-| **merkle 更新** | ✅ 发生 | ✅ 发生 | ❌ 不发生 | ❌ 不发生 |
-| **业务表更新** | ✅ 发生 | ✅ 发生 | ✅ 发生 | ✅ 发生 |
-| **服务器同步** | ✅ 发生 | ❌ 不发生 | ❌ 不发生 | ❌ 不发生 |
+| CRDT 操作 | `enabled` | `offline` | `disabled` | `import` | 源码位置 |
+|-----------|-----------|-----------|-----------|----------|---------|
+| **compareMessages** | ✅ | ✅ | ❌ | ❌ | `packages/loot-core/src/server/sync/index.ts:265` |
+| **messages_crdt 写入** | ✅ | ✅ | ❌ | ❌ | `packages/loot-core/src/server/sync/index.ts:357` |
+| **merkle 更新** | ✅ | ✅ | ❌ | ❌ | `packages/loot-core/src/server/sync/index.ts:364,373` |
+| **业务表更新 (apply)** | ✅ | ✅ | ✅ | ✅ | `packages/loot-core/src/server/sync/index.ts:344` |
+| **服务器同步** | ✅ | ❌ | ❌ | ❌ | `packages/loot-core/src/server/sync/index.ts:555` |
 
-### 4.5 现状实现证据链（按同步模式拆解）
+### 4.6 现状实现证据链（按同步模式拆解）
 
-#### 4.5.1 `enabled` 模式：完整 CRDT 流程
+#### 4.6.1 `enabled` 模式：完整 CRDT 流程
 
-**场景**：用户手动修改账户名称，且开启了同步服务器
-
-**完整流程**：
-
-```
-1. 用户调用 updateAccount()
-        │
-        ▼
-2. db.update('accounts', { id, name }) 
-   → sendMessages() 收集消息
-        │
-        ▼
-3. Timestamp.send() 生成 HULC 时间戳
-        │
-        ▼
-4. batchMessages() 批处理
-        │
-        ▼
-5. applyMessages() 处理
-   ┌─────────────────────────────────────────────────────────────┐
-   │ 5.1 compareMessages() 冲突检测                              │
-   │     - 查询 messages_crdt 表中是否有更新的时间戳               │
-   │     - 如果 timestamp >= existing: 新消息，应用               │
-   │     - 如果 timestamp < existing: 标记 old: true             │
-   └─────────────────────────────────────────────────────────────┘
-   ┌─────────────────────────────────────────────────────────────┐
-   │ 5.2 messages_crdt 写入 (checkSyncingMode('enabled')=true)   │
-   │     INSERT INTO messages_crdt (timestamp, dataset, row,     │
-   │       column, value) VALUES (?, ?, ?, ?, ?)                 │
-   └─────────────────────────────────────────────────────────────┘
-   ┌─────────────────────────────────────────────────────────────┐
-   │ 5.3 merkle 更新 (checkSyncingMode('enabled')=true)         │
-   │     currentMerkle = merkle.insert(currentMerkle, timestamp) │
-   │     currentMerkle = merkle.prune(currentMerkle)             │
-   │     db.runQuery('INSERT OR REPLACE INTO messages_clock...') │
-   └─────────────────────────────────────────────────────────────┘
-        │
-        ▼
-6. scheduleFullSync()
-   ┌─────────────────────────────────────────────────────────────┐
-   │ checkSyncingMode('enabled') && !checkSyncingMode('offline') │
-   │ = true && !false = true                                     │
-   │ → 执行 fullSync() 发送到服务器                               │
-   └─────────────────────────────────────────────────────────────┘
-        │
-        ▼
-7. fullSync()
-   - getMessagesSince(since) 获取本地消息
-   - encoder.encode() 编码消息
-   - POST /sync 发送到服务器
-   - 接收服务器响应并 applyMessages()
-```
-
-**关键代码证据**：
+**代码证据**：
 
 ```typescript
-// packages/loot-core/src/server/sync/index.ts:357-362
+// packages/loot-core/src/server/sync/index.ts:265-270
+} else if (checkSyncingMode('enabled')) {
+  messages = await compareMessages(messages);
+}
+
+// packages/loot-core/src/server/sync/index.ts:357-364
 if (checkSyncingMode('enabled')) {
   db.runQuery(
     db.cache(`INSERT INTO messages_crdt (timestamp, dataset, row, column, value)
      VALUES (?, ?, ?, ?, ?)`),
     [timestamp.toString(), dataset, row, column, serializeValue(value)],
   );
+  currentMerkle = merkle.insert(currentMerkle, timestamp);
 }
 
 // packages/loot-core/src/server/sync/index.ts:373-383
 if (checkSyncingMode('enabled')) {
   currentMerkle = merkle.prune(currentMerkle);
   db.runQuery(
-    'INSERT OR REPLACE INTO messages_clock (id, clock) VALUES (1, ?)',
+    db.cache('INSERT OR REPLACE INTO messages_clock (id, clock) VALUES (1, ?)'),
     [serializeClock({ ...clock, merkle: currentMerkle })],
   );
 }
@@ -346,23 +295,21 @@ if (checkSyncingMode('enabled') && !checkSyncingMode('offline')) {
 }
 ```
 
-#### 4.5.2 `offline` 模式：本地 CRDT 但不同步到服务器
+**流程**：
+1. `checkSyncingMode('enabled') = true` → 执行 `compareMessages`
+2. `checkSyncingMode('enabled') = true` → 写入 `messages_crdt`
+3. `checkSyncingMode('enabled') = true` → 更新 merkle 和 `messages_clock`
+4. `checkSyncingMode('enabled') && !checkSyncingMode('offline') = true && !false = true` → 执行 `fullSync`
 
-**场景**：用户手动修改账户名称，但网络不可用或用户选择离线模式
+#### 4.6.2 `offline` 模式：本地 CRDT 但不同步到服务器
 
-**与 enabled 模式的区别**：
-
-| 操作 | `enabled` | `offline` |
-|-----|----------|-----------|
-| compareMessages | ✅ | ✅ |
-| messages_crdt 写入 | ✅ | ✅ |
-| merkle 更新 | ✅ | ✅ |
-| 业务表更新 | ✅ | ✅ |
-| 服务器同步 | ✅ | ❌ |
-
-**关键代码证据**：
+**代码证据**：
 
 ```typescript
+// packages/loot-core/src/server/sync/index.ts:67-68
+case 'enabled':
+  return SYNCING_MODE === 'enabled' || SYNCING_MODE === 'offline';  // offline 返回 true
+
 // packages/loot-core/src/server/sync/index.ts:555
 if (checkSyncingMode('enabled') && !checkSyncingMode('offline')) {
   // offline 模式下 !checkSyncingMode('offline') = !true = false
@@ -370,44 +317,21 @@ if (checkSyncingMode('enabled') && !checkSyncingMode('offline')) {
 }
 ```
 
-**离线消息积累**：
+**流程**：
+1. `checkSyncingMode('enabled') = true` → 执行 `compareMessages`
+2. `checkSyncingMode('enabled') = true` → 写入 `messages_crdt`
+3. `checkSyncingMode('enabled') = true` → 更新 merkle 和 `messages_clock`
+4. `checkSyncingMode('enabled') && !checkSyncingMode('offline') = true && !true = false` → 不执行 `fullSync`
 
-```typescript
-// packages/loot-core/src/server/sync/index.ts:687-692
-export function getMessagesSince(since: string): Message[] {
-  if (
-    checkSyncingMode('disabled') ||
-    checkSyncingMode('offline') ||    // <-- offline 模式返回空数组
-    !currentId
-  ) {
-    return [];
-  }
-  // ...
-}
-```
+#### 4.6.3 `import` 模式：快速路径，跳过 CRDT
 
-**流程总结**：
-```
-用户修改账户名称 → CRDT 消息写入本地 messages_crdt
-                              ↓
-               恢复网络后调用 scheduleFullSync()
-                              ↓
-               offline → enabled 模式切换
-                              ↓
-               fullSync() 发送积累的消息到服务器
-```
-
-#### 4.5.3 `import` 模式：绕过 CRDT 直接应用
-
-**场景**：导入 QIF/OFX 文件时的处理
-
-**关键代码证据**：
+**代码证据**：
 
 ```typescript
 // packages/loot-core/src/server/sync/index.ts:262-264
 if (checkSyncingMode('import')) {
   applyMessagesForImport(messages);
-  return undefined;  // 直接返回，不执行后续 CRDT 逻辑
+  return undefined;  // 直接返回，不执行后续逻辑
 }
 
 // packages/loot-core/src/server/sync/index.ts:231-250
@@ -415,17 +339,11 @@ function applyMessagesForImport(messages: Message[]): void {
   db.transaction(() => {
     for (let i = 0; i < messages.length; i++) {
       const msg = messages[i];
-      const { dataset } = msg;
-
       if (!msg.old) {
         try {
-          apply(msg);  // 直接应用，不经过 CRDT
+          apply(msg);
         } catch {
-          apply(msg, true);  // UPDATE 模式
-        }
-
-        if (dataset === 'prefs') {
-          throw new Error('Cannot set prefs while importing');
+          apply(msg, true);
         }
       }
     }
@@ -433,62 +351,51 @@ function applyMessagesForImport(messages: Message[]): void {
 }
 ```
 
-**import 模式特点**：
+**流程**：
+1. `checkSyncingMode('import') = true` → 调用 `applyMessagesForImport`
+2. 直接返回，不执行 `compareMessages`、`messages_crdt` 写入、`merkle` 更新
 
-| 特性 | 说明 |
-|-----|------|
-| messages_crdt 写入 | ❌ 不发生 |
-| merkle 更新 | ❌ 不发生 |
-| compareMessages | ❌ 不发生 |
-| 业务表更新 | ✅ 直接 apply |
-| 服务器同步 | ❌ 不发生 |
+#### 4.6.4 `disabled` 模式：进入 applyMessages 但跳过 CRDT 追踪
 
-**注意事项**（代码注释）：
+**代码证据**：
 
 ```typescript
-// packages/loot-core/src/server/sync/index.ts:225-230
-// This is the fast path `apply` function when in "import" mode.
-// There's no need to run through the whole sync system when
-// importing, but **there is a caveat**: because we don't run sync
-// listeners importers should not rely on any functions that use any
-// projected state (like rules). We can't fire those because they
-// depend on having both old and new data which we don't query here
-```
-
-#### 4.5.4 `disabled` 模式：仅本地更新，无任何 CRDT 追踪
-
-**场景**：文件未关联到同步服务器（如使用"不使用服务器"模式）
-
-**关键代码证据**：
-
-```typescript
-// packages/loot-core/src/server/sync/index.ts:261-270
+// packages/loot-core/src/server/sync/index.ts:261-271
 export const applyMessages = sequential(async (messages: Message[]) => {
   if (checkSyncingMode('import')) {
+    // disabled 模式: checkSyncingMode('import') = false → 不进入
     applyMessagesForImport(messages);
     return undefined;
   } else if (checkSyncingMode('enabled')) {
-    // disabled 模式下 checkSyncingMode('enabled') = false
-    // 不进入此分支，不执行 compareMessages
+    // disabled 模式: checkSyncingMode('enabled') = false → 不进入
     messages = await compareMessages(messages);
   }
+  // disabled 模式: 继续执行到这里
+  messages = [...messages].sort(...);
   // ...
 });
+
+// packages/loot-core/src/server/sync/index.ts:344
+if (!msg.old) {
+  apply(msg, getIn(oldData, [dataset, row]) || added.has(dataset + row));
+}
+
+// packages/loot-core/src/server/sync/index.ts:357
+if (checkSyncingMode('enabled')) {
+  // disabled 模式: checkSyncingMode('enabled') = false → 跳过
+  db.runQuery(...);  // 不执行
+}
 ```
 
-**disabled 模式特点**：
+**流程**：
+1. `checkSyncingMode('import') = false` → 不进入 import 分支
+2. `checkSyncingMode('enabled') = false` → 不执行 `compareMessages`
+3. 消息排序继续执行
+4. `!msg.old = true` → 执行 `apply()` 更新业务表
+5. `checkSyncingMode('enabled') = false` → 跳过 `messages_crdt` 写入
+6. `checkSyncingMode('enabled') = false` → 跳过 `merkle` 更新
 
-| 特性 | 说明 |
-|-----|------|
-| messages_crdt 写入 | ❌ 不发生 |
-| merkle 更新 | ❌ 不发生 |
-| compareMessages | ❌ 不发生 |
-| 业务表更新 | ✅ 发生（但不走 applyMessages） |
-| 服务器同步 | ❌ 不发生 |
-
-**实际行为**：`disabled` 模式下，`sendMessages()` 收集的消息会直接通过底层的 `apply()` 函数应用到业务表，**完全不经过** `applyMessages()`，因此没有任何 CRDT 追踪。
-
-### 4.6 冲突检测核心逻辑（`compareMessages`）
+### 4.7 冲突检测核心逻辑（`compareMessages`）
 
 ```typescript
 // packages/loot-core/src/server/sync/index.ts:197-222
@@ -499,7 +406,6 @@ async function compareMessages(messages: Message[]): Promise<Message[]> {
     const { dataset, row, column, timestamp } = message;
     const timestampStr = timestamp.toString();
 
-    // 查询 messages_crdt 表中是否存在 >= 此时间戳的记录
     const res = db.runQuery(
       'SELECT timestamp FROM messages_crdt WHERE dataset = ? AND row = ? AND column = ? AND timestamp >= ?',
       [dataset, row, column, timestampStr],
@@ -507,10 +413,8 @@ async function compareMessages(messages: Message[]): Promise<Message[]> {
     );
 
     if (res.length === 0) {
-      // 无冲突记录 → 新消息，需要应用
       newMessages.push(message);
     } else if (res[0].timestamp !== timestampStr) {
-      // 存在更新的记录 → 标记为 old
       newMessages.push({ ...message, old: true });
     }
     // 时间戳相等 → 重复消息，丢弃
@@ -520,52 +424,44 @@ async function compareMessages(messages: Message[]): Promise<Message[]> {
 }
 ```
 
-### 4.7 桌面端最终展示依赖的状态来源
+### 4.8 桌面端最终展示依赖的状态来源
 
-```
-桌面客户端展示
-        │
-        ▼
-调用 getAccounts() API
-        │
-        ▼
-loot-core: getAccounts()
-        │
-        ▼
-db.getAccounts() → SELECT * FROM accounts
-        │
-        ▼
-返回 AccountEntity[]
-        │
-        ▼
-客户端直接使用 account.name 字段展示
-```
-
-**状态来源**：`accounts.name` 字段（最新应用的变更）
+**代码证据**：客户端调用 `getAccounts()` → `db.getAccounts()` → `SELECT * FROM accounts` → 返回 `AccountEntity[]` → 使用 `account.name` 字段展示。
 
 ---
 
 ## 五、总结
 
-### 同步模式与 CRDT 行为矩阵
+### 同步模式与 CRDT 行为矩阵（源码可直接印证）
 
-| 模式 | compareMessages | messages_crdt 写入 | merkle 更新 | 服务器同步 | 典型场景 |
-|-----|----------------|-------------------|------------|-----------|---------|
-| `enabled` | ✅ | ✅ | ✅ | ✅ | 正常同步 |
-| `offline` | ✅ | ✅ | ✅ | ❌ | 网络断开 |
-| `disabled` | ❌ | ❌ | ❌ | ❌ | 不使用服务器 |
-| `import` | ❌ | ❌ | ❌ | ❌ | 导入文件 |
+| 模式 | compareMessages | messages_crdt 写入 | merkle 更新 | 业务表更新 | 服务器同步 |
+|-----|----------------|-------------------|------------|-----------|-----------|
+| `enabled` | ✅ (L265) | ✅ (L357) | ✅ (L364,373) | ✅ (L344) | ✅ (L555) |
+| `offline` | ✅ (L265) | ✅ (L357) | ✅ (L364,373) | ✅ (L344) | ❌ (L555) |
+| `disabled` | ❌ (L265) | ❌ (L357) | ❌ (L364,373) | ✅ (L344) | ❌ (L555) |
+| `import` | ❌ (L262) | ❌ (L262) | ❌ (L262) | ✅ (L239) | ❌ (L555) |
 
-### 账户名称变更路径
+**说明**：括号内数字为 `packages/loot-core/src/server/sync/index.ts` 中的行号。
 
-1. **首次链接**：`linkGoCardlessAccount()` → `db.insertWithUUID()` → 账户名称写入
-2. **用户手动修改**：`updateAccount()` → `db.update()` → `sendMessages()` → `applyMessages()`
-3. **银行同步**：`processBankSyncDownload()` → **不更新账户名称**
+### 核心调用链
+
+```
+db.update() → sendMessages() → _sendMessages() → applyMessages()
+                                                    │
+                      ┌──────────────────────────────┼──────────────────────────────┐
+                      ▼                              ▼                              ▼
+            import 模式                        enabled/offline 模式              disabled 模式
+            applyMessagesForImport()           compareMessages()                 跳过 compareMessages
+            直接 apply()                        messages_crdt 写入               messages_crdt 不写入
+            返回                                merkle 更新                       merkle 不更新
+                                               业务表更新                        业务表更新
+                                               服务器同步(仅 enabled)            服务器不同步
+```
 
 ### 冲突场景
 
-- **不存在**：银行同步改名 vs 用户手动改名的并发冲突（因为银行同步不更新名称）
-- **存在**：多设备间用户并发修改同一账户名称（通过 CRDT 时间戳仲裁）
+- **不存在**：银行同步改名 vs 用户手动改名（银行同步不更新名称）
+- **存在**：多设备间用户并发修改（通过 CRDT 时间戳仲裁）
 
 ### 核心代码位置
 
@@ -573,8 +469,10 @@ db.getAccounts() → SELECT * FROM accounts
 |-----|---------|
 | 同步模式定义 | `packages/loot-core/src/server/sync/index.ts:41-42` |
 | 模式判定函数 | `packages/loot-core/src/server/sync/index.ts:65-78` |
-| applyMessages 主逻辑 | `packages/loot-core/src/server/sync/index.ts:261-392` |
+| sendMessages | `packages/loot-core/src/server/sync/index.ts:526-532` |
+| _sendMessages | `packages/loot-core/src/server/sync/index.ts:488-494` |
+| applyMessages | `packages/loot-core/src/server/sync/index.ts:261-392` |
 | compareMessages | `packages/loot-core/src/server/sync/index.ts:197-222` |
 | applyMessagesForImport | `packages/loot-core/src/server/sync/index.ts:231-250` |
-| 账户更新 | `packages/loot-core/src/server/accounts/app.ts` (updateAccount 函数) |
+| 账户更新 | `packages/loot-core/src/server/accounts/app.ts` (updateAccount) |
 | 银行同步处理 | `packages/loot-core/src/server/accounts/sync.ts:968-1098` |
