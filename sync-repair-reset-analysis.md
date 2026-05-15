@@ -416,6 +416,192 @@ return {};
 | **Out of Sync** | Sync层 | `_fullSync` 循环检测 → `SyncError('out-of-sync')` | `emit('sync', { type: 'error', subtype: 'out-of-sync' })` | 执行 repair/reset |
 | **Upload Failure** | 云存储层 | `cloudStorage.upload()` → 返回错误对象 | `connection.send('prefs-updated')` + 返回 error | 重试上传 |
 
+### 4.5 reset 失败路径的返回契约与通知闭环
+
+#### 4.5.1 resetSync 调用链路
+
+```
+客户端层 (desktop-client)
+        │
+        ├─ store.dispatch(resetSync())
+        │       │
+        │       ▼
+        │   createAppAsyncThunk: `${sliceName}/resetSync`
+        │       │
+        │       ▼
+        │   await send('sync-reset')
+        │       │
+        │       ▼
+Sync层 (loot-core)
+        │
+        ├─ app.method('sync-reset', resetSync)
+        │       │
+        │       ▼
+        │   export async function resetSync(keyState?)
+        │       │
+        │       ├─ cloudStorage.checkKey() → { valid, error }
+        │       │       │
+        │       │       └─ error → return { error }
+        │       │
+        │       ├─ cloudStorage.resetSyncState() → { error }
+        │       │       │
+        │       │       └─ error → return { error }
+        │       │
+        │       ├─ runMutator(() => { db.execQuery(...) })
+        │       │
+        │       └─ cloudStorage.upload()
+        │               │
+        │               └─ error → return { error: { reason: 'upload-failure' } }
+        │
+        ▼
+返回 { error?: { reason: string; meta?: unknown } }
+        │
+        ▼
+客户端层消费
+        │
+        ├─ const { error } = await send('sync-reset');
+        │       │
+        │       └─ error?.reason === 'encrypt-failure' && error.meta?.isMissingKey
+        │               │
+        │               └─→ pushModal('fix-encryption-key')
+        │       │
+        │       └─ error?.reason === 'file-has-new-key'
+        │               │
+        │               └─→ pushModal('fix-encryption-key')
+        │       │
+        │       └─ error?.reason === 'encrypt-failure'
+        │               │
+        │               └─→ pushModal('create-encryption-key')
+        │       │
+        │       └─ 其他 error → alert(getUploadError(error))
+        │
+        └─ 无 error → dispatch(sync())
+```
+
+#### 4.5.2 resetSync 返回契约
+
+| 返回字段 | 类型 | 含义 | 触发场景 |
+|---------|------|------|---------|
+| `error` | `undefined \| { reason: string; meta?: unknown }` | 错误信息 | 任意阶段失败 |
+| `error.reason` | `string` | 错误原因 | 标识具体失败类型 |
+| `error.meta` | `unknown` | 错误元数据 | 附加错误详情 |
+
+#### 4.5.3 error.reason 消费位置
+
+```typescript
+// 客户端层消费 (appSlice.ts)
+const { error } = await send('sync-reset');
+
+if (error) {
+alert(getUploadError(error));
+
+if (
+    (error.reason === 'encrypt-failure' && error.meta?.isMissingKey) ||
+    error.reason === 'file-has-new-key'
+) {
+    dispatch(pushModal({ modal: { name: 'fix-encryption-key', ... } }));
+} else if (error.reason === 'encrypt-failure') {
+    dispatch(pushModal({ modal: { name: 'create-encryption-key', ... } }));
+}
+} else {
+await dispatch(sync());
+}
+```
+
+#### 4.5.4 sync 事件链路对比（Clock Drift vs Out of Sync）
+
+**Clock Drift 事件链路：**
+
+```
+CRDT层
+    │
+    ├─ Timestamp.recv(msg.timestamp)
+    │       │
+    │       └─→ ClockDriftError
+    │               │
+    │               ▼
+Sync层
+    │
+    ├─ receiveMessages() 捕获
+    │       │
+    │       └─→ throw SyncError('clock-drift')
+    │               │
+    │               ▼
+    ├─ errorHandler()
+    │       │
+    │       └─→ app.events.emit('sync', { type: 'error', subtype: 'clock-drift', meta })
+    │               │
+    │               ▼
+平台层
+    │
+    ├─ connection.send('sync-event', { type: 'error', subtype: 'clock-drift' })
+    │               │
+    │               ▼
+客户端层
+    │
+    ├─ listen('sync-event', event => { ... })
+    │       │
+    │       └─→ event.subtype === 'clock-drift'
+    │               │
+    │               └─→ addNotification({ title: 'Time sync issue', ... })
+```
+
+**Out of Sync 事件链路：**
+
+```
+Sync层
+    │
+    ├─ _fullSync()
+    │       │
+    │       └─→ 循环检测失败 (count >= 10 || count >= 100)
+    │               │
+    │               ▼
+    │       throw SyncError('out-of-sync')
+    │               │
+    │               ▼
+    ├─ errorHandler()
+    │       │
+    │       └─→ app.events.emit('sync', { type: 'error', subtype: 'out-of-sync', meta })
+    │               │
+    │               ▼
+平台层
+    │
+    ├─ connection.send('sync-event', { type: 'error', subtype: 'out-of-sync' })
+    │               │
+    │               ▼
+客户端层
+    │
+    ├─ listen('sync-event', event => { ... })
+    │       │
+    │       └─→ event.subtype === 'out-of-sync'
+    │               │
+    │               └─→ 根据 attemptedSyncRepair 状态显示不同通知
+    │                       │
+    │                       ├─ 首次: 显示 Repair 按钮
+    │                       └─ 重试后仍失败: 显示 Reset sync 按钮
+```
+
+#### 4.5.5 预算层与交易层信号接收对比
+
+| 异常类型 | 预算层 (Budget Service) | 交易层 (Transaction Service) | 说明 |
+|---------|----------------------|---------------------------|------|
+| **Clock Drift** | ❌ 无信号 | ❌ 无信号 | 发生在消息接收前，业务层未参与 |
+| **Out of Sync** | ❌ 无直接信号 | ❌ 无直接信号 | 同步循环检测失败，未触发业务变更 |
+| **Upload Failure** | ❌ 无信号 | ❌ 无信号 | 发生在数据库操作后，业务数据已清理 |
+| **sync-success/applied** | ✅ 收到 `tables.includes('categories')` 信号 | ✅ 收到 `tables.includes('transactions')` 信号 | 正常同步完成时触发 |
+| **sync-error (invalid-schema)** | ⚠️ 间接影响 | ⚠️ 间接影响 | 数据库 schema 不兼容，需更新应用 |
+
+#### 4.5.6 各层信号汇总表
+
+| 层级 | Clock Drift | Out of Sync | Upload Failure | Normal Sync |
+|-----|------------|-------------|----------------|-------------|
+| **CRDT层** | ✅ 触发异常 | ❌ 不涉及 | ❌ 不涉及 | ✅ 时间戳验证通过 |
+| **Sync层** | ✅ 捕获并转发 | ✅ 检测并抛出 | ✅ 捕获并返回 | ✅ 消息应用成功 |
+| **数据库层** | ❌ 未执行 | ❌ 未执行 | ✅ 已清理完成 | ✅ 数据已更新 |
+| **预算服务层** | ❌ 无信号 | ❌ 无信号 | ❌ 无信号 | ✅ `triggerBudgetChanges()` 调用 |
+| **交易服务层** | ❌ 无信号 | ❌ 无信号 | ❌ 无信号 | ✅ `batchMessages()` 调用 |
+| **客户端UI层** | ✅ 显示通知 | ✅ 显示修复/重置按钮 | ✅ 显示错误提示 | ✅ 更新数据缓存 |
+
 ---
 
 ## 五、repair 操作分析
@@ -689,7 +875,7 @@ Sync层: repairSync() / resetSync()
 2. **幂等性**: 操作设计保证可重复执行
 3. **最终一致性**: 重置后通过上传成为权威版本，其他客户端拉取同步
 
-### 8.3 边界清晰性
+### 9.3 边界清晰性
 
 - **CRDT层**: 只关注分布式一致性和哈希计算
 - **Sync层**: 只关注消息同步和状态管理
