@@ -53,7 +53,372 @@
 
 ---
 
-## 三、repair 操作分析
+## 三、跨层协作完整流程
+
+### 3.1 同步入口到消息落库的完整顺序
+
+当同步消息从服务器接收后，经历以下完整流程：
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│                        同步入口                                        │
+│  receiveMessages(messages)                                              │
+│         │                                                               │
+│         ▼                                                               │
+│  ┌──────────────────────────────────────────────────────────────────┐   │
+│  │ 阶段1: 时间戳验证                                               │   │
+│  │  Timestamp.recv(msg.timestamp)                                  │   │
+│  │  → 检测 clock drift 异常                                        │   │
+│  └──────────────────────────────────────────────────────────────────┘   │
+│         │                                                               │
+│         ▼                                                               │
+│  ┌──────────────────────────────────────────────────────────────────┐   │
+│  │ 阶段2: 消息比较过滤                                             │   │
+│  │  compareMessages(messages)                                      │   │
+│  │  → 查询 messages_crdt 判断消息新旧                               │   │
+│  │  → 标记 old 消息（无需应用但需记录到 Merkle）                      │   │
+│  └──────────────────────────────────────────────────────────────────┘   │
+│         │                                                               │
+│         ▼                                                               │
+│  ┌──────────────────────────────────────────────────────────────────┐   │
+│  │ 阶段3: 消息排序                                                 │   │
+│  │  按 timestamp 升序排序                                          │   │
+│  └──────────────────────────────────────────────────────────────────┘   │
+│         │                                                               │
+│         ▼                                                               │
+│  ┌──────────────────────────────────────────────────────────────────┐   │
+│  │ 阶段4: 预取旧数据                                               │   │
+│  │  fetchData() → DataMap (oldData)                                │   │
+│  │  → 为 undo 和变更检测准备                                        │   │
+│  └──────────────────────────────────────────────────────────────────┘   │
+│         │                                                               │
+│         ▼                                                               │
+│  ┌──────────────────────────────────────────────────────────────────┐   │
+│  │ 阶段5: 数据库事务应用（关键）                                    │   │
+│  │  db.transaction(() => {                                         │   │
+│  │    ├─ apply(msg) → INSERT/UPDATE 业务表                        │   │
+│  │    ├─ INSERT INTO messages_crdt                               │   │
+│  │    └─ merkle.insert() → 更新内存 Merkle 树                     │   │
+│  │  })                                                             │   │
+│  └──────────────────────────────────────────────────────────────────┘   │
+│         │                                                               │
+│         ▼                                                               │
+│  ┌──────────────────────────────────────────────────────────────────┐   │
+│  │ 阶段6: 更新内存状态                                             │   │
+│  │  clock.merkle = currentMerkle                                   │   │
+│  │  INSERT OR REPLACE INTO messages_clock                          │   │
+│  └──────────────────────────────────────────────────────────────────┘   │
+│         │                                                               │
+│         ▼                                                               │
+│  ┌──────────────────────────────────────────────────────────────────┐   │
+│  │ 阶段7: 获取新数据                                               │   │
+│  │  fetchData() → DataMap (newData)                               │   │
+│  └──────────────────────────────────────────────────────────────────┘   │
+│         │                                                               │
+│         ▼                                                               │
+│  ┌──────────────────────────────────────────────────────────────────┐   │
+│  │ 阶段8: 预算变更触发                                             │   │
+│  │  sheet.startTransaction()                                       │   │
+│  │  triggerBudgetChanges(oldData, newData)                         │   │
+│  │  → handleTransactionChange() → recompute(sum-amount-{catId})   │   │
+│  │  → handleBudgetChange() → set(budget-{catId}, carryover, goal) │   │
+│  │  → handleAccountChange() → recompute 相关分类汇总               │   │
+│  │  → handleCategoryChange() → 分类变更处理                        │   │
+│  │  sheet.endTransaction()                                         │   │
+│  └──────────────────────────────────────────────────────────────────┘   │
+│         │                                                               │
+│         ▼                                                               │
+│  ┌──────────────────────────────────────────────────────────────────┐   │
+│  │ 阶段9: 交易汇总刷新                                             │   │
+│  │  若涉及 transactions:                                           │   │
+│  │    ├─ recompute(accounts-balance)                              │   │
+│  │    ├─ recompute(onbudget-accounts-balance)                     │   │
+│  │    ├─ recompute(offbudget-accounts-balance)                    │   │
+│  │    └─ recompute(closed-accounts-balance)                       │   │
+│  └──────────────────────────────────────────────────────────────────┘   │
+│         │                                                               │
+│         ▼                                                               │
+│  ┌──────────────────────────────────────────────────────────────────┐   │
+│  │ 阶段10: 通知监听者                                              │   │
+│  │  _syncListeners.forEach(func => func(oldData, newData))         │   │
+│  │  app.events.emit('sync', { type: 'applied', tables, data })    │   │
+│  └──────────────────────────────────────────────────────────────────┘   │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+### 3.2 关键代码路径
+
+**同步入口函数 `receiveMessages`：**
+```typescript
+export function receiveMessages(messages: Message[]): Promise<Message[]> {
+try {
+    messages.forEach(msg => {
+    Timestamp.recv(msg.timestamp);  // CRDT层：时间戳验证
+    });
+} catch (e) {
+    if (e instanceof Timestamp.ClockDriftError) {
+    throw new SyncError('clock-drift');  // 抛出时钟漂移异常
+    }
+    throw e;
+}
+return runMutator(() => applyMessages(messages));  // Sync层：应用消息
+}
+```
+
+**消息应用核心流程 `applyMessages`：**
+```typescript
+export const applyMessages = sequential(async (messages: Message[]) => {
+// 阶段1: 消息比较过滤
+messages = await compareMessages(messages);
+
+// 阶段2: 获取旧数据用于变更检测
+const oldData = await fetchData();
+
+// 阶段3: 数据库事务应用
+db.transaction(() => {
+    for (const msg of messages) {
+    if (!msg.old) {
+        apply(msg);  // 应用到业务表
+    }
+    db.runQuery('INSERT INTO messages_crdt ...');  // 记录CRDT消息
+    currentMerkle = merkle.insert(currentMerkle, timestamp);  // 更新Merkle
+    }
+});
+
+// 阶段4: 触发预算变更
+const newData = await fetchData();
+triggerBudgetChanges(oldData, newData);
+
+// 阶段5: 刷新全局汇总
+if (idsPerTable.transactions?.length) {
+    // recompute global aggregate cells...
+}
+});
+```
+
+### 3.3 预算变更触发的详细逻辑
+
+`triggerBudgetChanges` 根据变更的数据类型触发不同处理：
+
+| 数据表 | 处理函数 | 触发条件 | 刷新内容 |
+|-------|---------|---------|---------|
+| `transactions` | `handleTransactionChange` | date/acct/amount/category/tombstone变化 | `sum-amount-{catId}` |
+| `zero_budgets`/`reflect_budgets` | `handleBudgetChange` | 预算金额变化 | `budget-{catId}`, `carryover`, `goal` |
+| `category_mapping` | `handleCategoryMappingChange` | 分类映射变化 | `sum-amount-{transferId}` |
+| `categories` | `handleCategoryChange` | 分类增删改 | 分类相关计算单元 |
+| `category_groups` | `handleCategoryGroupChange` | 分类组变化 | 分组相关计算单元 |
+| `accounts` | `handleAccountChange` | offbudget状态变化 | 关联分类的 `sum-amount` |
+
+---
+
+## 四、异常处理路径详解
+
+### 4.1 Clock Drift（时钟漂移）异常
+
+**触发条件**：客户端时间戳与服务器时间戳差异过大。
+
+**异常上抛路径**：
+
+```
+CRDT层
+    │
+    ├─ Timestamp.recv(msg.timestamp)
+    │       │
+    │       └─→ 检测到时钟漂移
+    │               │
+    │               ▼
+    │       throw Timestamp.ClockDriftError()
+    │               │
+    │               ▼
+Sync层
+    │
+    ├─ receiveMessages() 捕获异常
+    │       │
+    │       └─→ throw new SyncError('clock-drift')
+    │               │
+    │               ▼
+    │   errorHandler() 处理
+    │       │
+    │       └─→ app.events.emit('sync', { type: 'error', subtype: 'clock-drift' })
+    │               │
+    │               ▼
+应用层
+    │
+    └─ 监听 sync 事件的 UI 组件显示时钟漂移错误提示
+```
+
+**代码实现**：
+```typescript
+// packages/loot-core/src/server/sync/index.ts
+export function receiveMessages(messages: Message[]): Promise<Message[]> {
+try {
+    messages.forEach(msg => {
+    Timestamp.recv(msg.timestamp);
+    });
+} catch (e) {
+    if (e instanceof Timestamp.ClockDriftError) {
+    throw new SyncError('clock-drift');
+    }
+    throw e;
+}
+return runMutator(() => applyMessages(messages));
+}
+```
+
+### 4.2 哈希长期不一致（Out of Sync）异常
+
+**触发条件**：Merkle 树差异循环超过 10 次且 diffTime 相同，或超过 100 次循环。
+
+**异常上抛路径**：
+
+```
+Sync层
+    │
+    ├─ _fullSync() 执行同步循环
+    │       │
+    │       ├─ merkle.diff(res.merkle, getClock().merkle)
+    │       │       │
+    │       │       └─→ diffTime !== null (存在差异)
+    │       │               │
+    │       │               ▼
+    │       │   循环计数检查:
+    │       │   if ((count >= 10 && diffTime === prevDiffTime) || count >= 100)
+    │       │           │
+    │       │           ▼
+    │       │   rebuildMerkleHash() 尝试重建
+    │       │           │
+    │       │           ▼
+    │       │   throw new SyncError('out-of-sync')
+    │       │           │
+    │       │           ▼
+    │       └─ errorHandler() 处理
+    │               │
+    │               └─→ app.events.emit('sync', { type: 'error', subtype: 'out-of-sync' })
+    │                       │
+    │                       ▼
+应用层
+    │
+    └─ 监听 sync 事件，提示用户执行 repair 或 reset
+```
+
+**代码实现**：
+```typescript
+// packages/loot-core/src/server/sync/index.ts
+async function _fullSync(sinceTimestamp, count, prevDiffTime) {
+// ... 同步逻辑 ...
+const diffTime = merkle.diff(res.merkle, getClock().merkle);
+
+if (diffTime !== null) {
+    if ((count >= 10 && diffTime === prevDiffTime) || count >= 100) {
+    const rebuiltMerkle = rebuildMerkleHash();
+    
+    if (rebuiltMerkle.trie.hash === res.merkle.hash) {
+        // 重建后匹配，说明是内存时钟问题
+        logger.log('Merkle hash in db:', hash);
+    }
+    
+    throw new SyncError('out-of-sync');
+    }
+    
+    // 继续循环同步
+    return _fullSync(new Timestamp(diffTime, 0, '0').toString(), ...);
+}
+}
+```
+
+### 4.3 上传失败（Upload Failure）异常
+
+**触发条件**：reset 操作最后阶段上传文件到云端失败。
+
+**异常上抛路径**：
+
+```
+Sync层
+    │
+    ├─ resetSync(keyState?)
+    │       │
+    │       ├─ 阶段1: cloudStorage.checkKey()
+    │       │       │
+    │       │       └─→ 失败 → return { error: { reason: 'file-has-new-key' } }
+    │       │               │
+    │       │               ▼
+    │       ├─ 阶段2: cloudStorage.resetSyncState()
+    │       │       │
+    │       │       └─→ 失败 → return { error }
+    │       │               │
+    │       │               ▼
+    │       ├─ 阶段3: 数据库清理 (runMutator)
+    │       │               │
+    │       │               ▼
+    │       └─ 阶段4: cloudStorage.upload()
+    │               │
+    │               └─→ 失败
+    │                       │
+    │                       ▼
+    │               try { await upload() }
+    │               catch (e) {
+    │                   if (e.reason) return { error: e };
+    │                   captureException(e);
+    │                   return { error: { reason: 'upload-failure' } };
+    │               } finally {
+    │                   connection.send('prefs-updated');  // 确保通知
+    │               }
+    │                       │
+    │                       ▼
+应用层
+    │
+    └─ 接收 resetSync 返回值，显示上传失败错误
+```
+
+**代码实现**：
+```typescript
+// packages/loot-core/src/server/sync/reset.ts
+export async function resetSync(keyState?) {
+// 密钥检查
+if (!keyState) {
+    const { valid, error } = await cloudStorage.checkKey();
+    if (error) return { error };
+    if (!valid) return { error: { reason: 'file-has-new-key' } };
+}
+
+// 重置云状态
+const { error } = await cloudStorage.resetSyncState(keyState);
+if (error) return { error };
+
+// 数据库清理
+await runMutator(async () => {
+    db.execQuery(`DELETE FROM messages_crdt; ...`);
+    await db.loadClock();
+});
+
+// 上传到云端
+try {
+    await cloudStorage.upload();
+} catch (e) {
+    if (e.reason) {
+    return { error: e };
+    }
+    captureException(e);
+    return { error: { reason: 'upload-failure' } };
+} finally {
+    connection.send('prefs-updated');
+}
+
+return {};
+}
+```
+
+### 4.4 异常处理对比表
+
+| 异常类型 | 触发层 | 上抛路径 | 通知方式 | 用户操作 |
+|---------|-------|---------|---------|---------|
+| **Clock Drift** | CRDT层 | `Timestamp.recv` → `SyncError('clock-drift')` | `emit('sync', { type: 'error', subtype: 'clock-drift' })` | 检查系统时间 |
+| **Out of Sync** | Sync层 | `_fullSync` 循环检测 → `SyncError('out-of-sync')` | `emit('sync', { type: 'error', subtype: 'out-of-sync' })` | 执行 repair/reset |
+| **Upload Failure** | 云存储层 | `cloudStorage.upload()` → 返回错误对象 | `connection.send('prefs-updated')` + 返回 error | 重试上传 |
+
+---
+
+## 五、repair 操作分析
 
 ### 3.1 操作定义与触发条件
 
