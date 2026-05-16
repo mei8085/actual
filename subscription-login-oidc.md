@@ -78,65 +78,118 @@ bootstrap() 函数执行：
 
 ## 2. OpenID 配置入口校正
 
-> **关键校正**: OpenID 配置**不在 Bootstrap 页面**，而是在**Login 页面**内！
+> **关键校正（代码原文校对）**:
+> 1. Login 页的 "Review OpenID 配置 → 提交" 链路 **不会写入 OIDC 配置**（永远返回 already-bootstrapped）
+> 2. 只有 `/openid/enable` 端点和代码内部 `forced=true` 调用 **才会触发 bootstrapOpenId**
+> 3. Bootstrap 页面只支持密码初始化，不支持任何 OIDC 配置
 
-### 2.1 OIDC 配置的两个入口
+### 2.1 bootstrapOpenId 调用判定对照表
 
-#### 入口 A: 首次登录配置（Login 页面）
+**判定依据: account-db.js:123**
+```javascript
+if (openIdEnabled && forced) {  // 只有 forced=true 才会执行
+  const { error } = await bootstrapOpenId(loginSettings.openId);
+}
+```
+
+| 调用入口 | forced 值 | openIdEnabled | 分支条件结果 | 是否调用 bootstrapOpenId |
+|---------|----------|--------------|------------|-----------------------|
+| Login 页 subscribe-bootstrap({ openId }) | **false** | true | `true && false = false` | ❌ 不会 |
+| `/openid/enable` → enableOpenID() | - | true | 直接调用，不经过 bootstrap | ✅ 会 |
+| 代码内部 bootstrap(loginSettings, true) | **true** | true | `true && true = true` | ✅ 会 |
+
+---
+
+### 2.2 链路 A: Login 页 Review OIDC 配置（**不会写入配置**）
 
 **触发条件**:
-1. `warnMasterCreation = true` → 尚无 owner 用户（`owner-created` 返回 false）
+1. `warnMasterCreation = true` → 尚无 owner 用户
 2. `askForPassword = true` → 可用登录方法包含 password
 
-**流程**:
+**完整调用链路（按代码原文）**:
 ```
-Login 页面 (OpenIdLogin 组件)
+Login 页 OpenIdLogin 组件
+    ↓ 输入: server password
+1. 用户点击 "Review OpenID configuration" 按钮
+    ↓ 输入: { password }
+2. send('get-openid-config', { password })
+    └─ loot-core: auth/app.ts getOpenIdConfig()
+        ↓ 输入: { password }
+    └─ post(serverConfig.BASE_SERVER + '/openid/config', { password })
+        ↓ 输入: req.body = { password }
+    └─ sync-server: app-openid.ts /openid/config 端点
+        ├─ 验证 ownerCount === 0（不能已有用户）
+        ├─ checkPassword(password) 验证密码
+        ├─ 读取 auth 表 openid 配置并 JSON.parse
+        └─ 返回 { status: 'ok', data: { openId: config } }
     ↓
-显示 "Review OpenID configuration" 按钮
+3. 前端显示 OpenIdForm 表单（仅查看/编辑，不写入）
+    ↓ 用户提交: OpenIdConfig
+4. send('subscribe-bootstrap', { openId: config })
+    └─ loot-core: auth/app.ts bootstrap()
+        ↓ 输入: { openId: OpenIdConfig }
+    └─ post(serverConfig.SIGNUP_SERVER + '/bootstrap', { openId: config })
+        ↓ 输入: req.body = { openId: OpenIdConfig }
+    └─ sync-server: app-account.js /bootstrap 端点
+        ↓ 调用: bootstrap(req.body, forced=false)  ← ⚠️ forced=false 是关键
+    └─ sync-server: account-db.js bootstrap() 函数
+        ├─ 分支条件 L98: !forced && (!openIdEnabled || countOfOwner > 0)
+        │   forced=false, openIdEnabled=true
+        │   无 owner 时 needsBootstrap()=false → 返回 already-bootstrapped
+        │   有 owner 时 needsBootstrap()=true → 不返回错误但继续执行
+        ├─ 分支条件 L123: if (openIdEnabled && forced)
+        │   forced=false → 条件不满足
+        │   → ❌ 不会调用 bootstrapOpenId
+        └─ 分支条件 L132: passEnabled ? loginWithPassword() : {}
+            passEnabled=false → 返回 {}
     ↓
-用户输入 server password 后点击按钮
-    ↓
-前端调用 get-openid-config { password }
-    ↓
-服务端 /openid/config 端点（带 openIdConfigRateLimiter）
-    ├─ 验证 ownerCount === 0（不能已有用户）
-    ├─ 验证 password 正确
-    ├─ 读取 auth 表中 openid 配置
-    └─ 返回 { status: 'ok', data: { openId: config } }
-    ↓
-前端显示 OpenIdForm 表单（可编辑 issuer/client_id/client_secret）
-    ↓
-用户提交配置
-    ↓
-前端调用 subscribe-bootstrap { openId: config }
-    ↓
-服务端 bootstrap() 函数 (forced=false!)
-    ↓
-bootstrapOpenId() 执行:
-    ├─ 验证 issuer/discoveryURL 存在
-    ├─ 验证 client_id/client_secret 存在
-    ├─ 验证 server_hostname 存在
-    ├─ Issuer.discover() 尝试验证 OIDC 提供商
-    └─ 写入 auth 表 (method='openid', active=1)
-    ↓
-成功 → 前端 navigate('/')
+5. 前端 navigate('/')（看起来成功，实际配置未写入）
 ```
 
-#### 入口 B: 已登录后启用 OIDC（管理员）
+> **代码 Bug 确认**: Login 页的 Review OpenID configuration 功能是 **无效的**，提交不会写入任何配置到数据库。
 
-**入口路径**: 管理员设置页面（非 bootstrap/login 流程）
+---
 
+### 2.3 链路 B: 管理员启用 OIDC（**会触发 bootstrapOpenId**）
+
+**入口路径**: 管理员设置页面（已登录后）
+
+**完整调用链路（按代码原文）**:
 ```
-管理员已登录 (password 方式)
+管理员已登录 (password 认证方式)
     ↓
 进入设置 → 启用 OpenID
+    ↓ 输入: { openId: OpenIdConfig }
+1. send('enable-openid', { openId: config })
+    └─ loot-core: auth/app.ts enableOpenId()
+        ↓ 输入: { openId: OpenIdConfig }
+    └─ post(serverConfig.BASE_SERVER + '/openid/enable', openIdConfig, {
+           'X-ACTUAL-TOKEN': userToken
+         })
+        ↓ 输入: req.body = { openId: OpenIdConfig }
+    └─ sync-server: app-openid.ts /openid/enable 端点
+        ├─ validateSessionMiddleware 验证 session
+        └─ isAdmin(res.locals.user_id) 验证管理员权限
+    └─ sync-server: account-db.js enableOpenID(req.body)
+        ├─ 验证 loginSettings.openId 存在
+        ├─ ✅ bootstrapOpenId(loginSettings.openId)  ← 直接调用，无 forced 判断
+        ├─ 成功后: DELETE FROM sessions 清除所有会话（强制所有人重登）
+        └─ 返回: {} 或 { error: 'xxx' }
     ↓
-前端调用 enable-openid { openId: config }
-    ↓
-服务端 /openid/enable 端点 (validateSessionMiddleware)
-    ├─ 验证 isAdmin(res.locals.user_id)
-    ├─ bootstrapOpenId() 配置 OIDC
-    └─ DELETE FROM sessions（强制所有人重新登录）
+成功 → 前端刷新页面，重新用 OIDC 登录
+```
+
+---
+
+### 2.4 链路 C: bootstrap forced=true（**仅内部调用**）
+
+**无公开 HTTP 入口**，仅可在代码层直接调用：
+```javascript
+// 仅代码层可调用，无对外 HTTP 端点
+bootstrap({ openId: config }, true)  // forced=true
+    └─ account-db.js bootstrap() 分支条件 L123:
+       if (openIdEnabled && forced)  // 条件满足
+         → ✅ bootstrapOpenId(config) 被执行
 ```
 
 ### 2.2 OIDC 配置禁用流程
