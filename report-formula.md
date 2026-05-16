@@ -52,7 +52,9 @@ Actual Budget 的自定义报表公式系统提供了一个类似 Excel 的公�
 **3. 公式卡片（FormulaCard）**
 - 文件：`packages/desktop-client/src/components/reports/reports/FormulaCard.tsx:44-48`
 - 用途：在仪表盘展示公式计算结果
-- 实现方式：不使用 FormulaEditor 组件，直接调用 `useFormulaExecution` hook 执行计算，由于该 hook 内部只处理 QUERY、BUDGET_QUERY 等查询函数，因此相当于默认工作在查询模式
+- 实现方式：不使用 FormulaEditor 组件，不存在 `mode` 模式属性，直接复用通用的 `useFormulaExecution` hook 执行链路
+- 能力范围：该 hook 是通用执行引擎，既能预处理 QUERY、BUDGET_QUERY、QUERY_COUNT、QUERY_EXTRACT_* 等特殊查询函数，也能直接将 SUM、AVERAGE、IF 等普通公式透传给 HyperFormula 计算引擎处理
+- 注意：没有"默认查询模式"的概念，mode 属性仅存在于 FormulaEditor 用于语法高亮和自动补全，执行层本身无模式限制
 
 ### 1.2 模式切换实现
 
@@ -564,78 +566,74 @@ async function fetchQuerySum(config: QueryConfig): Promise<number> {
 
 ##### 错误类型 3：预算查询异常（BUDGET_QUERY）的两阶段处理
 
-预算查询异常采用**两阶段处理**，不同分支的表现不同：
+预算查询异常采用**两阶段处理模型**，不同场景下的用户可见性完全不同：
 
 ---
 
-**阶段 1：BUDGET_QUERY 执行异常 → 仅日志分支（静默失败）**
+**场景 A：仅记录日志（静默失败，无用户提示）**
+
+**触发条件**：发生在 BUDGET_QUERY 的预处理和执行阶段
+
+| 具体场景 | 界面层表现 | 执行层处理 |
+|---------|-----------|-----------|
+| ✅ 参数解析失败 | 无任何提示 | 仅 `console.error`，执行 `continue` 跳过当前 BUDGET_QUERY 匹配 |
+| ✅ 参数验证失败 | 无任何提示 | 仅 `console.error`，执行 `continue` 跳过当前 BUDGET_QUERY 匹配 |
+| ✅ 查询执行抛出异常 | 无任何提示 | try-catch 捕获，仅 `console.error`，不替换公式 |
+| **共同结果** | **公式继续执行，用户无感** | **BUDGET_QUERY 函数调用原封不动保留在公式字符串中** |
 
 **代码位置**：`useFormulaExecution.ts:241-285`
 ```typescript
 try {
-  // 1. 解析和验证参数
   const param1 = resolveBudgetParam(parseBudgetParam(param1Str), ...);
-  
-  // 2. 参数验证失败 → 仅日志，跳过当前匹配
-  if (!Array.isArray(param1) || ...) {
+  if (!Array.isArray(param1) || ...) {  // 参数验证失败
     console.error('Failed to resolve BUDGET_QUERY parameters:', ...);
-    continue;  // 不替换公式，BUDGET_QUERY 保留在公式中
+    continue;  // 仅日志，不替换公式
   }
-
-  // 3. 调用预算维度查询
   const val = await fetchBudgetDimensionValueDirect(dimension, param1, ...);
-  
-  // 4. 成功 → 替换公式中的 BUDGET_QUERY 为实际值
   processedFormula = processedFormula.replace(match[0], String(val));
-  
 } catch (err) {
-  // 5. 任何异常 → 仅日志，不替换公式
-  console.error('Error evaluating BUDGET_QUERY', err);
+  console.error('Error evaluating BUDGET_QUERY', err);  // 仅日志
 }
 ```
-
-**阶段 1 表现**：
-| 处理环节 | 界面层表现 | 执行层处理 |
-|---------|-----------|-----------|
-| 参数验证失败 | ✅ 无直接提示 | 仅 `console.error`，`continue` 跳过替换 |
-| 查询执行异常 | ✅ 无直接提示 | 捕获异常，仅日志，不替换公式 |
-| **共同结果** | **✅ 公式继续执行** | **BUDGET_QUERY 函数在公式中原封不动保留** |
 
 ---
 
-**阶段 2：HyperFormula 执行 → 触发公式错误分支**
+**场景 B：触发 Formula error 提示（用户可见错误）**
+
+**触发条件**：阶段 A 中 BUDGET_QUERY 未被替换，公式进入 HyperFormula 执行阶段
+
+| 具体场景 | 界面层表现 | 执行层处理 |
+|---------|-----------|-----------|
+| ❌ HyperFormula 检测到未知函数名 | 显示红色错误文本 `Formula error: #NAME?` | 接收到引擎返回的 `{ type: '#NAME?' }` 错误对象 |
+| ❌ 结果状态 | 计算结果区域清空，无数值显示 | 调用 `setError("Formula error: #NAME?")` + `setResult(null)` |
+| **用户感知** | **明确看到公式异常，可定位问题** | **完整的错误状态上报到组件层** |
 
 **代码位置**：`useFormulaExecution.ts:367-373`
 ```typescript
-// 由于阶段 1 中 BUDGET_QUERY 未被替换，公式中保留了未知函数
-// HyperFormula 执行时检测到未定义的函数名
-
+// BUDGET_QUERY 未被替换 → HyperFormula 将其视为未知函数名
 if (cellValue && typeof cellValue === 'object' && 'type' in cellValue) {
-  setError(`Formula error: ${cellValue.type}`);  // 设置 error 状态
+  setError(`Formula error: ${cellValue.type}`);  // 触发用户可见的错误提示
   setResult(null);
 }
 ```
-
-**阶段 2 表现**：
-| 处理环节 | 界面层表现 | 执行层处理 |
-|---------|-----------|-----------|
-| 检测到错误对象 | ❌ 显示红色错误文本 `Formula error: #NAME?` | 检测 `{ type: '#NAME?' }` 错误对象 |
-| 结果状态 | ❌ 计算结果清空为 `null` | 调用 `setError()` 和 `setResult(null)` |
-| **用户感知** | **明确感知公式问题** | **完整的错误状态上报** |
 
 ---
 
 **完整异常链路总结**：
 ```
-BUDGET_QUERY 执行异常
-    ↓
-├─ 阶段 1（查询层）：仅日志，不替换公式
-├─ 结果：BUDGET_QUERY 原样保留在公式字符串中
-    ↓
-└─ 阶段 2（公式引擎层）：
-   ├─ HyperFormula 遇到未知函数名 BUDGET_QUERY
-   ├─ 返回 { type: '#NAME?' } 错误对象
-   └─ 触发错误状态，界面显示红色错误提示
+BUDGET_QUERY(...) 执行
+    │
+    ├─ 成功 → 替换为数值 → 公式正常执行
+    │
+    └─ 失败（参数错误/查询异常）→ 仅日志，不替换
+           │
+           └─ BUDGET_QUERY 保留在公式字符串中
+                  │
+                  └─ HyperFormula 执行
+                         │
+                         └─ 未知函数名 → #NAME? 错误
+                                │
+                                └─ setError() → 界面显示红色 Formula error
 ```
 
 ---
