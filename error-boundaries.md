@@ -8,37 +8,64 @@ Actual Budget 采用三层错误处理机制，通过 `react-error-boundary` 库
 
 ## ErrorBoundary 异常捕获最终判定表
 
-| 类别 | 场景 | 捕获方式 | 备注 |
-|-----|-----|---------|------|
-| **自动捕获** | 组件 render 函数 | ✅ ErrorBoundary 自动捕获 | JSX 渲染过程中抛出的异常 |
-| **自动捕获** | 函数组件体执行 | ✅ ErrorBoundary 自动捕获 | 函数组件主执行流程 |
-| **自动捕获** | useEffect 回调 | ✅ ErrorBoundary 自动捕获 | 副作用执行过程 |
-| **自动捕获** | useLayoutEffect 回调 | ✅ ErrorBoundary 自动捕获 | 布局副作用执行过程 |
-| **自动捕获** | 类组件生命周期 | ✅ ErrorBoundary 自动捕获 | componentDidMount 等 |
-| **自动捕获** | 类构造函数 constructor | ✅ ErrorBoundary 自动捕获 | 组件实例化阶段 |
-| **必须手动上报** | async/await 异步函数 | ❌ 必须手动 catch + showErrorBoundary | ErrorBoundary 无法捕获异步异常 |
+**⚠️ 官方行为声明：本判定表严格遵循 react-error-boundary 官方约束**
+
+| 类别 | 场景 | 捕获方式 | 官方说明 |
+|-----|-----|---------|---------|
+| **自动捕获** | 组件 render 函数 | ✅ ErrorBoundary 自动捕获 | JSX 渲染同步抛出的异常，官方支持 |
+| **自动捕获** | 函数组件体同步执行 | ✅ ErrorBoundary 自动捕获 | 函数组件主执行流程同步异常，官方支持 |
+| **自动捕获** | **useEffect 同步抛出** | ✅ ErrorBoundary 自动捕获 | useEffect 回调体内**同步代码**抛出的异常，官方支持 |
+| **自动捕获** | **useLayoutEffect 同步抛出** | ✅ ErrorBoundary 自动捕获 | useLayoutEffect 回调体内**同步代码**抛出的异常，官方支持 |
+| **自动捕获** | 类组件生命周期同步代码 | ✅ ErrorBoundary 自动捕获 | componentDidMount 等生命周期内同步异常，官方支持 |
+| **自动捕获** | 类构造函数 constructor | ✅ ErrorBoundary 自动捕获 | 组件实例化阶段同步异常，官方支持 |
+| **必须手动上报** | **useEffect 异步路径** | ❌ 必须手动 catch + showErrorBoundary | **官方不捕获**：Promise、setTimeout 等异步异常 |
+| **必须手动上报** | **useLayoutEffect 异步路径** | ❌ 必须手动 catch + showErrorBoundary | **官方不捕获**：异步回调内的异常 |
+| **必须手动上报** | async/await 异步函数 | ❌ 必须手动 catch + showErrorBoundary | ErrorBoundary 无法穿透异步边界 |
 | **必须手动上报** | Promise 链 .catch() | ❌ 必须手动 catch + showErrorBoundary | Promise rejection 不会冒泡到渲染层 |
 | **必须手动上报** | 事件处理器 onClick/onChange | ❌ 必须手动 catch + showErrorBoundary | 事件回调独立于 React 渲染周期 |
 | **必须手动上报** | setTimeout/setInterval | ❌ 必须手动 catch + showErrorBoundary | 定时器回调在宏任务队列执行 |
 | **必须手动上报** | 第三方库回调函数 | ❌ 必须手动 catch + showErrorBoundary | 非 React 控制的代码执行 |
 | **必须手动上报** | Redux thunk 异步 action | ❌ 使用 addNotification 通知 | 通过通知系统反馈，不触发 ErrorBoundary |
 
-**代码示例：**
+**代码示例（官方行为对照）：**
 ```tsx
-// ✅ 自动捕获：渲染异常直接被 ErrorBoundary 捕获
-function BadComponent() {
+// ✅ 自动捕获：渲染同步异常，ErrorBoundary 捕获
+function RenderError() {
   const data = undefined;
   return <div>{data.name}</div>; // 自动捕获
 }
 
-// ❌ 必须手动上报：异步异常
-function AsyncComponent() {
+// ✅ 自动捕获：useEffect 同步抛出，ErrorBoundary 捕获
+function EffectSyncError() {
+  useEffect(() => {
+    throw new Error('sync error'); // 同步抛出，自动捕获
+  }, []);
+  return null;
+}
+
+// ❌ 必须手动上报：useEffect 异步路径异常
+function EffectAsyncError() {
   const { showBoundary } = useErrorBoundary();
   
   useEffect(() => {
-    // 必须手动 catch
-    fetchData().catch(showBoundary);
+    // 错误写法：不会被 ErrorBoundary 捕获
+    // fetch('/api').then(() => { throw new Error('oops'); });
+    
+    // 正确写法：手动 catch 后上报
+    fetch('/api').catch(showBoundary);
+    
+    // async/await 写法
+    const loadData = async () => {
+      try {
+        await fetch('/api');
+      } catch (e) {
+        showBoundary(e); // 手动上报
+      }
+    };
+    loadData();
   }, [showBoundary]);
+  
+  return null;
 }
 ```
 
@@ -71,7 +98,7 @@ function AsyncComponent() {
 
 3. **UI 渲染过程中未捕获的异常**
    - 组件渲染函数抛出异常
-   - useEffect 等副作用中的异常
+   - **useEffect/useLayoutEffect 同步代码**中的异常
    - 任何穿透到 App 根组件的错误
 
 #### FatalError 组件行为
@@ -249,32 +276,36 @@ type Notification = {
 
 | 序号 | 检查项 | 执行标准 | 验证方式 |
 |-----|--------|---------|---------|
-| 1 | **异常分类判定** | 正确区分同步渲染异常（走 ErrorBoundary）和异步/业务异常（走通知） | 对照「异常捕获最终判定表」 |
-| 2 | **异步异常捕获** | async/await 必须包裹 try/catch，Promise 必须有 .catch() | 静态代码审查 |
-| 3 | **dispatch addNotification** | 调用时传入正确的 type、message、id（如需要去重） | Redux DevTools 检查 action |
-| 4 | **通知状态更新** | Redux state.notifications 数组新增元素 | Redux DevTools 检查 state |
-| 5 | **Notification 组件渲染** | 通知出现在屏幕右下角，z-index = 2999 | 视觉检查 + 元素审查 |
-| 6 | **sticky 判定** | sticky=true 常驻不消失；sticky=false 6.5秒后调用 removeNotification | 计时观察 |
-| 7 | **按钮动作注入** | button.action 函数正确绑定恢复逻辑（如 signOut、sync 等） | 断点调试 |
-| 8 | **用户点击操作按钮** | 按钮进入 loading 状态（setLoading=true），禁用重复点击 | 视觉检查 |
-| 9 | **恢复动作执行** | button.action() 异步函数正确执行，无内部异常 | 断点调试 + 日志检查 |
-| 10 | **通知移除** | 调用 onRemove() → dispatch(removeNotification)，通知从屏幕消失 | Redux DevTools + 视觉检查 |
-| 11 | **按钮状态恢复** | setLoading(false)，按钮恢复可点击状态（如未自动移除） | 视觉检查 |
-| 12 | **onClose 回调** | 如有 onClose，必须在通知移除后触发 | 断点验证 |
+| 1 | **异常分类判定** | 正确区分：<br>• 同步渲染异常/useEffect 同步异常 → 走 ErrorBoundary<br>• useEffect 异步路径/业务异常 → 走通知系统 | 对照「异常捕获最终判定表」 |
+| 2 | **effects 异步路径捕获** | useEffect/useLayoutEffect 中的 Promise、async/await 等异步代码必须手动 catch | 静态代码审查，检查所有 effect 回调 |
+| 3 | **异步异常捕获完整性** | async/await 必须包裹 try/catch，Promise 必须有 .catch() | 静态代码审查 |
+| 4 | **dispatch addNotification** | 调用时传入正确的 type、message、id（如需要去重） | Redux DevTools 检查 action |
+| 5 | **通知状态更新** | Redux state.notifications 数组新增元素 | Redux DevTools 检查 state |
+| 6 | **Notification 组件渲染** | 通知出现在屏幕右下角，z-index = 2999 | 视觉检查 + 元素审查 |
+| 7 | **sticky 判定** | sticky=true 常驻不消失；sticky=false 6.5秒后调用 removeNotification | 计时观察 |
+| 8 | **按钮动作注入** | button.action 函数正确绑定恢复逻辑（如 signOut、sync 等） | 断点调试 |
+| 9 | **用户点击操作按钮** | 按钮进入 loading 状态（setLoading=true），禁用重复点击 | 视觉检查 |
+| 10 | **恢复动作执行** | button.action() 异步函数正确执行，无内部异常 | 断点调试 + 日志检查 |
+| 11 | **通知移除** | 调用 onRemove() → dispatch(removeNotification)，通知从屏幕消失 | Redux DevTools + 视觉检查 |
+| 12 | **按钮状态恢复** | setLoading(false)，按钮恢复可点击状态（如未自动移除） | 视觉检查 |
+| 13 | **onClose 回调** | 如有 onClose，必须在通知移除后触发 | 断点验证 |
 
 ### 检查清单使用说明
 
 **开发阶段自查**:
-- 新增错误处理代码时，逐条对照清单 1-12 项
-- 重点检查清单 1-2 项（异常分类和捕获）和 7 项（动作注入）
+- 新增错误处理代码时，逐条对照清单 1-13 项
+- **重点检查**：清单 1-3 项（异常分类判定、effects 异步路径、异步捕获）
+- 对照「异常捕获最终判定表」确认分类正确
 
 **Code Review 阶段**:
 - Reviewer 对照清单验证 PR 中错误处理逻辑的完整性
-- 清单 3-12 项可通过代码走查完成
+- 清单 4-13 项可通过代码走查完成
+- 特别关注 useEffect/useLayoutEffect 内异步代码是否有 catch
 
 **Bug 复现排查**:
 - 按清单顺序逐项排查，快速定位问题环节
-- 例如：通知不显示 → 检查 3-5 项；按钮没反应 → 检查 7、9 项
+- 例如：通知不显示 → 检查 4-6 项；按钮没反应 → 检查 8、10 项
+- ErrorBoundary 未触发 → 检查是否为异步路径异常（对照判定表）
 
 ---
 
@@ -283,8 +314,10 @@ type Notification = {
 | 错误类型 | 推荐方案 | 原因 |
 |---------|---------|------|
 | 渲染崩溃 | ErrorBoundary | 需要隔离渲染异常 |
+| useEffect 同步代码异常 | ErrorBoundary | 官方会自动捕获 |
+| **useEffect 异步代码异常** | 通知系统 + 手动 catch | **官方不捕获**，异步边界无法穿透 |
 | 应用初始化失败 | FatalError | 必须重启才能恢复 |
-| 网络请求失败 | 通知系统 | 用户可继续操作其他功能 |
+| 网络请求失败 | 通知系统 | 异步异常，用户可继续操作其他功能 |
 | 权限不足 | 通知系统 | 提示 + 跳转动作 |
 | 数据校验失败 | 表单内联提示 + 通知 | 不阻断全局 |
 | 第三方集成失败 | 通知系统 | 可重试或忽略 |
@@ -359,6 +392,7 @@ FatalError 中的最终恢复手段，完全重新加载应用。
 - `FallbackComponent` 属性接收错误信息和复位函数
 - `resetKeys` 数组驱动自动复位
 - `useErrorBoundary()` Hook 手动触发错误边界
+- **官方约束**：仅捕获同步异常，无法穿透异步边界
 
 ### 错误类型定义
 
@@ -384,7 +418,8 @@ type AppError = Error & {
 6. **异步必须手动 catch**: 所有 async/await 和 Promise 链必须捕获异常
 7. **区分错误严重度**: 致命崩溃用 ErrorBoundary，可恢复错误用通知系统
 8. **对照判定表**: 新增错误处理时先对照「异常捕获最终判定表」确定方案
-9. **走查检查清单**: 通知类错误处理完成后，对照「检查清单」走查一遍
+9. **effects 异步重点检查**: useEffect/useLayoutEffect 内的异步代码必须有 catch
+10. **走查检查清单**: 通知类错误处理完成后，对照「检查清单」走查一遍
 
 ---
 
@@ -404,9 +439,9 @@ A:
 
 A: 使用 `resetKeys` 属性，传入依赖数组，任意元素变化即触发重置。
 
-### Q: 异步错误（如 API 请求失败）会被错误边界捕获吗？
+### Q: useEffect 里的 Promise 异常会被 ErrorBoundary 捕获吗？
 
-A: **不会**。ErrorBoundary 仅捕获渲染阶段、生命周期函数和构造函数中的同步异常。异步错误需要单独 try/catch 处理，通过通知系统反馈给用户。请对照「异常捕获最终判定表」确认。
+A: **不会**。根据 react-error-boundary 官方约束，ErrorBoundary 仅捕获同步异常。useEffect 内的异步代码（Promise、async/await、setTimeout 等）异常无法穿透异步边界，**必须手动 catch 后调用 showErrorBoundary 或走通知系统**。请对照「异常捕获最终判定表」确认。
 
 ### Q: FatalError 弹出后还能操作主界面吗？
 
@@ -416,8 +451,13 @@ A: **不能**。ModalOverlay 使用 `position: fixed; inset: 0; zIndex: 3000` �
 
 A: 按「通知触发到恢复动作执行检查清单」逐项排查：先检查 dispatch action，再检查 Redux state 更新，最后检查组件渲染。
 
+### Q: 为什么 useEffect 里的 fetch 异常没有触发 ErrorBoundary？
+
+A: 这是 react-error-boundary 的**官方行为**：ErrorBoundary 只能捕获同步代码异常。fetch 是异步操作，属于 Promise 链，异常不会冒泡到 ErrorBoundary。正确做法是 .catch() 后调用 showErrorBoundary 或 dispatch addNotification。请参考「异常捕获最终判定表」第 7-8 项。
+
 ---
 
-*文档版本: 2.0（一致性校对版）*
+*文档版本: 2.1（官方行为对齐版）*
 *最后更新: 2025-06-16*
 *代码版本: 基于 packages/desktop-client v0.1.x*
+*react-error-boundary 行为对齐: 官方标准约束*
