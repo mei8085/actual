@@ -8,14 +8,51 @@ Actual Budget 的自定义报表公式系统提供了一个类似 Excel 的公�
 
 ## 1. 公式模式切换
 
-### 1.1 两种模式说明
+### 1.1 两种模式说明与使用场景
 
 系统支持两种公式模式，通过 `FormulaEditor` 组件的 `mode` 属性切换：
 
-| 模式 | 用途 | 核心特性 |
-|------|------|----------|
-| `transaction` | 交易级公式计算 | 可访问交易字段变量（amount, date, notes 等） |
-| `query` | 报表级聚合计算 | 可使用 QUERY、BUDGET_QUERY 等查询函数 |
+| 模式 | 使用场景 | 组件 | 核心特性 |
+|------|---------|------|---------|
+| `transaction` | 规则编辑器 | `FormulaActionEditor.tsx:46` | 交易字段级计算，可访问单条交易的属性变量（amount, date, notes, category_name, payee_name 等） |
+| `query` | 报表公式页 | `Formula.tsx:315`, `FormulaCard.tsx:44` | 报表级聚合计算，可使用 QUERY、BUDGET_QUERY 等查询函数调用已定义的查询配置 |
+
+#### 各场景模式配置详情：
+
+**1. 规则编辑器（FormulaActionEditor）**
+- 文件：`packages/desktop-client/src/components/rules/FormulaActionEditor.tsx:43-50`
+```typescript
+<FormulaEditor
+  value={value}
+  onChange={handleChange}
+  mode="transaction"     // 固定使用交易模式
+  disabled={disabled}
+  singleLine             // 强制单行显示
+  showLineNumbers={false}
+/>
+```
+- 用途：对单条交易执行计算或条件判断，如自动分类、设置标志等
+- 可用函数：数学、逻辑、文本、日期函数 + 交易字段变量
+
+**2. 报表公式页（Formula）**
+- 文件：`packages/desktop-client/src/components/reports/reports/Formula.tsx:311-319`
+```typescript
+<FormulaEditor
+  value={formula}
+  onChange={setFormula}
+  mode="query"           // 使用查询模式
+  queries={queriesRef.current}
+  singleLine={false}
+  showLineNumbers
+/>
+```
+- 用途：对交易数据进行多维聚合、统计、趋势分析
+- 可用函数：全量函数集 + QUERY 系列查询函数
+
+**3. 公式卡片（FormulaCard）**
+- 文件：`packages/desktop-client/src/components/reports/reports/FormulaCard.tsx:44`
+- 用途：在仪表盘展示公式计算结果
+- 模式：同样使用 `query` 模式执行计算
 
 ### 1.2 模式切换实现
 
@@ -43,10 +80,6 @@ export function FormulaEditor({
 ```
 
 ### 1.3 不同模式的函数集
-
-**文件位置**：
-- 查询模式函数：`packages/desktop-client/src/components/formula/queryModeFunctions.ts`
-- 交易模式函数：`packages/desktop-client/src/components/formula/transactionModeFunctions.ts`
 
 每种模式都有专门的函数分类：
 - 📊 数学函数（SUM, AVERAGE, COUNT 等）
@@ -243,13 +276,109 @@ const cellValue = hfInstance.getCellValue({ sheet: sheetId, col: 0, row: 0 });
 
 ---
 
-## 3. 非法表达式处理机制
+## 3. 颜色公式的独立执行链路
 
-### 3.1 界面层（编辑器）处理
+颜色公式是一个独立的计算链路，用于根据主公式结果动态设置显示颜色。它与主公式共享查询配置，但有独立的执行上下文和变量集。
+
+### 3.1 完整执行流程
+
+**触发点**：`Formula.tsx` 和 `FormulaCard.tsx` 中独立的 `useFormulaExecution` 调用
+
+#### 阶段 1：变量准备（颜色公式专属）
+
+**文件位置**：`packages/desktop-client/src/components/reports/reports/Formula.tsx:85-97`
+```typescript
+const colorVariables = useMemo(
+  () => ({
+    RESULT: result ?? 0,                    // 主公式计算结果（最核心变量）
+    ...Object.entries(themeColors).reduce(  // 主题颜色变量集
+      (acc, [key, value]) => {
+        acc[`theme_${key}`] = value;
+        return acc;
+      },
+      {} as Record<string, string>,
+    ),
+  }),
+  [result, themeColors],
+);
+```
+
+**可用变量示例**：
+- `RESULT`: 主公式的数值结果
+- `theme_pageText`: 页面文本颜色
+- `theme_errorText`: 错误文本颜色（红色）
+- `theme_positiveText`: 正数文本颜色（绿色）
+- `theme_warningText`: 警告文本颜色（橙色）
+
+#### 阶段 2：独立执行计算
+
+**文件位置**：`packages/desktop-client/src/components/reports/reports/Formula.tsx:98-103`
+```typescript
+const { result: colorResult, error: colorError } = useFormulaExecution(
+  colorFormula,           // 用户输入的颜色公式
+  queriesRef.current,     // 共享同一查询配置
+  queriesVersion,         // 共享版本号触发重算
+  colorVariables,         // 专属变量集
+);
+```
+
+> **关键特性**：颜色公式与主公式**并行执行**，但颜色公式依赖主公式的 `RESULT` 变量，因此实际执行顺序为主公式先完成，颜色公式后执行。
+
+#### 阶段 3：结果传递与渲染决策
+
+**文件位置**：`packages/desktop-client/src/components/reports/reports/Formula.tsx:188-189` 和 `FormulaCard.tsx:71-72`
+```typescript
+// 颜色结果判定逻辑
+const customColor =
+  colorFormula && !colorError && colorResult 
+    ? String(colorResult)   // 公式有效且有结果：使用计算出的颜色值
+    : null;                 // 无公式、有错误或无结果：回退到默认颜色
+```
+
+#### 阶段 4：最终渲染应用
+
+**文件位置**：`packages/desktop-client/src/components/reports/FormulaResult.tsx:153-158`
+```typescript
+// 颜色优先级：自定义颜色 > 错误颜色 > 默认文本颜色
+const color = customColor
+  ? customColor                    // 最高优先级：颜色公式的结果
+  : error
+    ? theme.errorText              // 次高优先级：错误状态的红色
+    : theme.pageText;              // 默认：常规文本颜色
+```
+
+### 3.2 颜色公式典型用例
+
+```excel
+// 示例1：盈亏指示
+=IF(RESULT > 0, "green", IF(RESULT < 0, "red", "gray"))
+
+// 示例2：三级阈值
+=IF(RESULT > 10000, theme_positiveText, IF(RESULT > 0, theme_warningText, theme_errorText))
+
+// 示例3：精确颜色代码
+=IF(ABS(RESULT) > 5000, "#ff5722", "#4caf50")
+```
+
+### 3.3 链路独立性保障
+
+| 特性 | 主公式链路 | 颜色公式链路 |
+|------|-----------|-------------|
+| 独立 Hook实例 | ✓ | ✓ |
+| 独立错误状态 | ✓ | ✓ |
+| 独立变量集 | ✗（基础变量） | ✓（含 RESULT + theme_*） |
+| 共享查询配置 | ✓ | ✓ |
+| 错误互不影响 | - | ✓（颜色公式错误不影响主结果显示 |
+
+---
+
+## 4. 非法表达式处理机制
+
+### 4.1 界面层（编辑器）处理
 
 **文件位置**：`packages/desktop-client/src/components/formula/codeMirror-excelLanguage.tsx`
 
-#### 3.1.1 语法高亮与分类
+#### 4.1.1 语法高亮与分类
 
 通过 StreamLanguage 解析器实现语法高亮，不同类型的函数使用不同颜色：
 
@@ -269,7 +398,7 @@ if (DATE_FUNCTIONS.has(word)) return 'typeName';       // 绿色
 if (QUERY_FUNCTIONS.has(word)) return 'propertyName';  // 红色
 ```
 
-#### 3.1.2 智能自动补全
+#### 4.1.2 智能自动补全
 
 ```typescript
 export function excelFormulaAutocomplete(
@@ -277,7 +406,7 @@ export function excelFormulaAutocomplete(
   queries?: Record<string, unknown>,
   variables?: Record<string, number | string>,
 ): Extension {
-  // 1. 函数补全（按分类分组）
+  // 1. 函数补全（按分类分组分组）
   const functionCompletions = getFunctionCompletions(mode);
   
   // 2. 已定义查询的快捷补全
@@ -314,7 +443,7 @@ export function excelFormulaAutocomplete(
 }
 ```
 
-#### 3.1.3 悬停文档提示
+#### 4.1.3 悬停文档提示
 
 ```typescript
 export function excelFormulaHover(mode: FormulaMode): Extension {
@@ -349,100 +478,161 @@ export function excelFormulaHover(mode: FormulaMode): Extension {
 }
 ```
 
-### 3.2 执行层处理
+### 4.2 执行层处理
 
 **文件位置**：`packages/desktop-client/src/hooks/useFormulaExecution.ts:95-392`
 
-#### 3.2.1 多层错误捕获
+#### 4.2.1 各类错误的处理策略与表现
 
+系统采用**容错优先**的错误处理策略，不同类型的错误有不同的降级处理方式：
+
+| 错误类型 | 界面表现 | 执行层处理 | 对用户的影响 |
+|---------|---------|-----------|-------------|
+| 公式格式错误（无 `=` 开头） | 显示红色错误文本 | 立即返回，设置 `error` 状态 | 明确提示修正公式 |
+| 查询名称不存在 | 继续计算，结果为 0 | 仅 `console.warn`，回退值为 0 | 可能导致计算结果不准确但不中断 |
+| 查询执行失败（数据库错误） | 继续计算，结果为 0 | try-catch 捕获，回退值为 0 | 静默失败，需查看控制台 |
+| QUERY_EXTRACT 函数异常 | 参数解析失败，BUDGET_QUERY 可能失效 | try-catch 捕获，结果设为 `null` | 部分功能失效，整体继续 |
+| BUDGET_QUERY 执行异常 | 该函数结果为空，公式继续计算 | 仅 `console.error`，无状态上报 | 静默失败，需查看控制台 |
+| HyperFormula 语法错误 | 显示红色错误代码 | 检测 `{ type: error }` 对象，设置 `error` 状态 | 明确提示错误类型 |
+| 颜色公式错误 | 使用默认颜色，不影响主结果 | 独立错误状态 `colorError`，不影响主公式 | 颜色回退默认，数值正常显示 |
+
+---
+
+##### 错误类型 1：查询缺失（名称不存在）
+
+**代码位置**：`useFormulaExecution.ts:192-196`
 ```typescript
-async function executeFormula() {
-  let hfInstance: HyperFormula | null = null;
+for (const queryName of queryNames) {
+  const queryConfig = queries[queryName];
 
+  if (!queryConfig) {
+    console.warn(`Query "${queryName}" not found in queries config`);
+    queryData[queryName] = 0;  // 静默回退为 0
+    continue;
+  }
+  // ... 正常执行
+}
+```
+
+**界面表现**：
+- ✅ 不显示任何错误提示
+- ✅ 公式继续执行，该 QUERY 函数返回 0
+- ⚠️ 仅在浏览器控制台输出警告日志
+- ❗ 潜在风险：用户可能误删查询后未察觉，导致后续计算基于错误的 0 值
+
+---
+
+##### 错误类型 2：查询执行失败（数据库异常）
+
+**代码位置**：`useFormulaExecution.ts:538-547`（fetchQuerySum）和 `550-559`（fetchQueryCount）
+```typescript
+async function fetchQuerySum(config: QueryConfig): Promise<number> {
   try {
-    // 1. 基础语法检查
-    if (!formula || !formula.startsWith('=')) {
-      setResult(null);
-      setError('Formula must start with =');
-      return;
-    }
-
-    setIsLoading(true);
-    setError(null);
-
-    try {
-      // 2. 查询执行错误捕获
-      for (const queryName of queryNames) {
-        const queryConfig = queries[queryName];
-        if (!queryConfig) {
-          console.warn(`Query "${queryName}" not found`);
-          queryData[queryName] = 0;
-          continue;
-        }
-        const data = await fetchQuerySum(queryConfig);
-        queryData[queryName] = integerToAmount(data, 2);
-      }
-
-      // 3. 提取函数错误捕获
-      for (const [funcName, regex] of Object.entries(extractionFunctions)) {
-        const matches = Array.from(formula.matchAll(regex));
-        for (const match of matches) {
-          try {
-            // 执行提取函数...
-          } catch (err) {
-            console.error(`Error evaluating ${funcName}(${queryName})`, err);
-            extractionResults[funcName][key] = null;
-          }
-        }
-      }
-
-      // 4. BUDGET_QUERY 错误捕获
-      for (const match of budgetMatches) {
-        try {
-          // 解析参数、执行查询...
-        } catch (err) {
-          console.error('Error evaluating BUDGET_QUERY', err);
-        }
-      }
-
-      // 5. HyperFormula 执行
-      hfInstance = HyperFormula.buildEmpty({ /* 配置 */ });
-      // ... 设置单元格内容 ...
-      
-      const cellValue = hfInstance.getCellValue({ sheet: sheetId, col: 0, row: 0 });
-
-      // 6. 检查 HyperFormula 返回的错误类型
-      if (cellValue && typeof cellValue === 'object' && 'type' in cellValue) {
-        setError(`Formula error: ${cellValue.type}`);
-        setResult(null);
-      } else {
-        setResult(cellValue as number | string);
-        setError(null);
-      }
-
-    } catch (err) {
-      // 7. 执行过程中的未知错误
-      console.error('Formula execution error:', err);
-      setError(err instanceof Error ? err.message : 'Unknown error');
-      setResult(null);
-    } finally {
-      // 8. 确保资源释放
-      if (!cancelled) {
-        setIsLoading(false);
-      }
-      try {
-        hfInstance?.destroy();
-      } catch (err) {
-        console.error('Error destroying HyperFormula instance:', err);
-        setError('Error destroying HyperFormula instance');
-        setResult(null);
-      }
-    }
+    const transQuery = await buildFilteredTransactionsQuery(config);
+    const summedQuery = transQuery.calculate({ $sum: '$amount' });
+    const { data } = await send('query', summedQuery.serialize());
+    return data || 0;
+  } catch (err) {
+    console.error('Error fetching query sum:', err);
+    return 0;  // 数据库查询失败，回退为 0
   }
 }
 ```
 
-#### 3.2.2 取消机制
+**界面表现**：
+- ✅ 不显示任何错误提示
+- ✅ 公式继续执行，返回 0
+- ⚠️ 控制台记录完整错误栈
+- ❗ 潜在风险：数据库连接问题被隐藏，用户无法感知
+
+---
+
+##### 错误类型 3：预算查询异常（BUDGET_QUERY）
+
+**代码位置**：`useFormulaExecution.ts:283-286`
+```typescript
+try {
+  // 解析参数、调用 fetchBudgetDimensionValueDirect...
+} catch (err) {
+  console.error('Error evaluating BUDGET_QUERY', err);
+  // 仅记录日志，不设置 error 状态
+  // 该 BUDGET_QUERY 函数调用在公式中保持未替换状态或失效
+}
+```
+
+**关键特性**：
+- **静默失败**：即使预算查询抛出异常，整个公式仍然继续计算
+- **无用户提示**：不设置 `error` 状态，界面无任何反馈
+- **仅日志记录**：`console.error` 记录错误信息供开发者调试
+
+---
+
+##### 错误类型 4：提取函数执行异常（QUERY_EXTRACT_*）
+
+**代码位置**：`useFormulaExecution.ts:166-172`
+```typescript
+try {
+  if (funcName === 'QUERY_EXTRACT_CATEGORIES') {
+    extractionResults[funcName][key] = await extractQueryCategories(queryName, queries);
+  } // ... 其他提取函数
+} catch (err) {
+  console.error(`Error evaluating ${funcName}(${queryName})`, err);
+  extractionResults[funcName][key] = null;  // 回退为 null
+}
+```
+
+**连锁影响**：
+- 提取函数返回 `null` 后，作为参数传递给 BUDGET_QUERY
+- BUDGET_QUERY 参数验证失败（期望数组/字符串，实际为 null
+- BUDGET_QUERY 执行失效，但仍然只记录日志不报错
+
+---
+
+##### 错误类型 5：HyperFormula 计算引擎错误
+
+**代码位置**：`useFormulaExecution.ts:367-373`
+```typescript
+// 检查 HyperFormula 返回的错误对象
+if (cellValue && typeof cellValue === 'object' && 'type' in cellValue) {
+  setError(`Formula error: ${cellValue.type}`);  // 明确上报错误
+  setResult(null);
+} else {
+  setResult(cellValue as number | string);
+  setError(null);
+}
+```
+
+**常见错误类型**：
+- `#DIV/0!`：除零错误
+- `#VALUE!`：参数类型错误
+- `#NAME?`：函数名未定义
+- `#REF!`：引用错误
+- `#N/A`：值不可用
+
+**界面表现**：
+- ❌ 显示红色错误文本：`Formula error: #DIV/0!`
+- ❌ 计算结果清空为 `null`
+- ✅ 用户明确感知公式问题，可及时修正
+
+---
+
+##### 错误类型 6：颜色公式错误（独立链路容错）
+
+**代码位置**：`Formula.tsx:188-189` 和 `FormulaCard.tsx:71-72`
+```typescript
+// 颜色公式错误时，customColor 为 null，回退到默认颜色
+const customColor =
+  colorFormula && !colorError && colorResult ? String(colorResult) : null;
+```
+
+**容错特性**：
+- 颜色公式的错误完全与主公式隔离
+- 即使颜色公式返回错误，主结果仍正常显示
+- 仅颜色回退为默认值（普通文本色 / 主公式错误时的红色）
+
+---
+
+#### 4.2.2 取消机制
 
 使用 React useEffect 的清理函数实现组件卸载时的执行取消：
 
@@ -461,12 +651,12 @@ useEffect(() => {
   void executeFormula();
 
   return () => {
-    cancelled = true;  // 卸载时设置取消标志
+    cancelled = true;  // 卸载时设置取消标志，防止内存泄漏
   };
 }, [formula, queriesVersion, locale, queries, namedExpressions]);
 ```
 
-### 3.3 结果显示层处理
+### 4.3 结果显示层处理
 
 **文件位置**：`packages/desktop-client/src/components/reports/reports/Formula.tsx:79-83`
 
@@ -478,14 +668,43 @@ const {
 } = useFormulaExecution(formula, queriesRef.current, queriesVersion);
 ```
 
-错误状态传递给 `FormulaResult` 组件进行友好显示：
-- 加载中：显示加载指示器
-- 错误：显示错误信息（红色）
-- 成功：显示计算结果
+**最终渲染逻辑**（FormulaResult.tsx:57-70）：
+```typescript
+const displayValue = useMemo(() => {
+  if (error) {
+    return error;              // 优先显示错误信息
+  } else if (value === null || value === undefined) {
+    return '';                 // 空值显示空白
+  } else if (typeof value === 'number') {
+    return format(amountToInteger(value, format.currency.decimalPlaces), 'financial');
+  } else {
+    return String(value);      // 其他类型转字符串
+  }
+}, [error, value, format]);
+```
 
 ---
 
-## 4. 完整数据流图示
+## 5. 错误处理设计权衡
+
+### 优点
+1. **高可用性**：多数错误采用静默降级，不中断用户操作
+2. **隔离性**：颜色公式与主公式错误互不影响
+3. **渐进式**：语法层面的错误明确提示，数据层面的错误静默降级
+
+### 潜在问题
+1. **可观测性不足**：查询失败、预算查询失败等关键错误仅日志记录，用户无感知
+2. **调试困难**：静默失败可能导致结果不符合预期，但用户难以定位原因
+3. **错误累积**：多个查询同时失败时，结果可能严重失真，但无任何提示
+
+### 改进建议
+- 增加"警告"状态（非阻塞的黄色提示），用于非致命错误
+- 提供查询执行状态的可视化反馈（如每个 QUERY 函数旁边的状态指示器）
+- 增加公式调试面板，展示每个子查询的执行结果和耗时
+
+---
+
+## 6. 完整数据流图示
 
 ```
 用户输入公式
@@ -516,7 +735,7 @@ const {
 
 ---
 
-## 5. 关键文件索引
+## 7. 关键文件索引
 
 | 功能模块 | 文件路径 | 主要职责 |
 |---------|---------|---------|
