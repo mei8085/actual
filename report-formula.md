@@ -310,19 +310,34 @@ const colorVariables = useMemo(
 - `theme_positiveText`: 正数文本颜色（绿色）
 - `theme_warningText`: 警告文本颜色（橙色）
 
-#### 阶段 2：独立执行计算
+#### 阶段 2：依赖驱动的响应式执行
 
-**文件位置**：`packages/desktop-client/src/components/reports/reports/Formula.tsx:98-103`
+**文件位置**：`packages/desktop-client/src/components/reports/reports/FormulaCard.tsx:44-68`
 ```typescript
+// 第一步：主公式独立执行，不受颜色公式影响
+const { result, isLoading, error } = useFormulaExecution(formula, ...);
+
+// 第二步：主公式 result 变化触发颜色变量的重新计算
+const colorVariables = useMemo(
+  () => ({ RESULT: result ?? 0, ...themeColors }),  // RESULT 来自主公式结果
+  [result, themeColors],
+);
+
+// 第三步：颜色变量变化触发颜色公式重新执行（独立 Hook 实例）
 const { result: colorResult, error: colorError } = useFormulaExecution(
-  colorFormula,           // 用户输入的颜色公式
-  queriesRef.current,     // 共享同一查询配置
-  queriesVersion,         // 共享版本号触发重算
-  colorVariables,         // 专属变量集
+  colorFormula,
+  meta?.queries || {},
+  meta?.queriesVersion,
+  colorVariables,
 );
 ```
 
-> **关键特性**：颜色公式与主公式**并行执行**，但颜色公式依赖主公式的 `RESULT` 变量，因此实际执行顺序为主公式先完成，颜色公式后执行。
+> **触发机制说明**：颜色公式与主公式并非固定串行关系，而是通过 React 响应式依赖链形成级联更新：
+> 1. 两个 `useFormulaExecution` 是独立的 Hook 实例，各自维护状态
+> 2. 首次渲染时，主公式 Hook 先调用，颜色公式 Hook 后调用（代码顺序）
+> 3. 主公式异步计算完成 → 更新 `result` 状态 → 触发 `colorVariables` 的 useMemo 重新计算
+> 4. `colorVariables` 引用变化 → 触发颜色公式的 `useFormulaExecution` 重新执行
+> 5. 这是一个**依赖驱动的瀑布式更新**，而非固定的串行等待
 
 #### 阶段 3：结果传递与渲染决策
 
@@ -547,23 +562,81 @@ async function fetchQuerySum(config: QueryConfig): Promise<number> {
 
 ---
 
-##### 错误类型 3：预算查询异常（BUDGET_QUERY）
+##### 错误类型 3：预算查询异常（BUDGET_QUERY）的两阶段处理
 
-**代码位置**：`useFormulaExecution.ts:283-286`
+预算查询异常采用**两阶段处理**，不同分支的表现不同：
+
+---
+
+**阶段 1：BUDGET_QUERY 执行异常 → 仅日志分支（静默失败）**
+
+**代码位置**：`useFormulaExecution.ts:241-285`
 ```typescript
 try {
-  // 解析参数、调用 fetchBudgetDimensionValueDirect...
+  // 1. 解析和验证参数
+  const param1 = resolveBudgetParam(parseBudgetParam(param1Str), ...);
+  
+  // 2. 参数验证失败 → 仅日志，跳过当前匹配
+  if (!Array.isArray(param1) || ...) {
+    console.error('Failed to resolve BUDGET_QUERY parameters:', ...);
+    continue;  // 不替换公式，BUDGET_QUERY 保留在公式中
+  }
+
+  // 3. 调用预算维度查询
+  const val = await fetchBudgetDimensionValueDirect(dimension, param1, ...);
+  
+  // 4. 成功 → 替换公式中的 BUDGET_QUERY 为实际值
+  processedFormula = processedFormula.replace(match[0], String(val));
+  
 } catch (err) {
+  // 5. 任何异常 → 仅日志，不替换公式
   console.error('Error evaluating BUDGET_QUERY', err);
-  // 仅记录日志，不设置 error 状态
-  // 该 BUDGET_QUERY 函数调用在公式中保持未替换状态或失效
 }
 ```
 
-**关键特性**：
-- **静默失败**：即使预算查询抛出异常，整个公式仍然继续计算
-- **无用户提示**：不设置 `error` 状态，界面无任何反馈
-- **仅日志记录**：`console.error` 记录错误信息供开发者调试
+**阶段 1 表现**：
+| 处理环节 | 界面层表现 | 执行层处理 |
+|---------|-----------|-----------|
+| 参数验证失败 | ✅ 无直接提示 | 仅 `console.error`，`continue` 跳过替换 |
+| 查询执行异常 | ✅ 无直接提示 | 捕获异常，仅日志，不替换公式 |
+| **共同结果** | **✅ 公式继续执行** | **BUDGET_QUERY 函数在公式中原封不动保留** |
+
+---
+
+**阶段 2：HyperFormula 执行 → 触发公式错误分支**
+
+**代码位置**：`useFormulaExecution.ts:367-373`
+```typescript
+// 由于阶段 1 中 BUDGET_QUERY 未被替换，公式中保留了未知函数
+// HyperFormula 执行时检测到未定义的函数名
+
+if (cellValue && typeof cellValue === 'object' && 'type' in cellValue) {
+  setError(`Formula error: ${cellValue.type}`);  // 设置 error 状态
+  setResult(null);
+}
+```
+
+**阶段 2 表现**：
+| 处理环节 | 界面层表现 | 执行层处理 |
+|---------|-----------|-----------|
+| 检测到错误对象 | ❌ 显示红色错误文本 `Formula error: #NAME?` | 检测 `{ type: '#NAME?' }` 错误对象 |
+| 结果状态 | ❌ 计算结果清空为 `null` | 调用 `setError()` 和 `setResult(null)` |
+| **用户感知** | **明确感知公式问题** | **完整的错误状态上报** |
+
+---
+
+**完整异常链路总结**：
+```
+BUDGET_QUERY 执行异常
+    ↓
+├─ 阶段 1（查询层）：仅日志，不替换公式
+├─ 结果：BUDGET_QUERY 原样保留在公式字符串中
+    ↓
+└─ 阶段 2（公式引擎层）：
+   ├─ HyperFormula 遇到未知函数名 BUDGET_QUERY
+   ├─ 返回 { type: '#NAME?' } 错误对象
+   └─ 触发错误状态，界面显示红色错误提示
+```
 
 ---
 
