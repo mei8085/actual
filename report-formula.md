@@ -50,9 +50,9 @@ Actual Budget 的自定义报表公式系统提供了一个类似 Excel 的公�
 - 可用函数：全量函数集 + QUERY 系列查询函数
 
 **3. 公式卡片（FormulaCard）**
-- 文件：`packages/desktop-client/src/components/reports/reports/FormulaCard.tsx:44`
+- 文件：`packages/desktop-client/src/components/reports/reports/FormulaCard.tsx:44-48`
 - 用途：在仪表盘展示公式计算结果
-- 模式：同样使用 `query` 模式执行计算
+- 实现方式：不使用 FormulaEditor 组件，直接调用 `useFormulaExecution` hook 执行计算，由于该 hook 内部只处理 QUERY、BUDGET_QUERY 等查询函数，因此相当于默认工作在查询模式
 
 ### 1.2 模式切换实现
 
