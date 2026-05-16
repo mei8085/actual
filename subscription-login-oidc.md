@@ -559,26 +559,36 @@ function isValidRedirectUrl(url) {
     |-- 输入密码并提交                    |                                      |
     |-- 2. POST /bootstrap {password} --->|                                      |
     |                                     |-- bootstrapPassword()               |
-    |                                     |-- 写入 auth 表                     |
+    |                                     |-- 写入 auth 表 (password)           |
     |                                     |-- 生成 session token               |
     |<-- { token } -----------------------|                                      |
     |-- 重定向到 /login                   |                                      |
     |                                     |                                      |
-    |-- (首次 OIDC 配置场景)              |                                      |
+    |-- (⚠️ Login 页 OIDC 配置无效场景)     |                                      |
     |-- 3. POST /openid/config {password} |                                      |
     |<-- 返回 OIDC 配置 ------------------|                                      |
     |-- 显示 OpenIdForm 编辑              |                                      |
     |-- 4. POST /bootstrap {openId} ----->|                                      |
-    |                                     |-- bootstrapOpenId()                 |
+    |                                     |-- bootstrap(req.body, forced=false) |
+    |                                     |-- L123 条件不满足 → 跳过 bootstrapOpenId |
+    |<-- 成功 {} (空对象，实际未写入) ----|                                      |
+    |-- navigate('/')  ← 用户以为成功      |                                      |
+    |                                     |                                      |
+    |-- (✅ 管理员启用 OIDC 有效场景)       |                                      |
+    |-- 管理员已登录 → 进入设置            |                                      |
+    |-- 启用 OpenID → POST /openid/enable |                                      |
+    |                                     |-- validateSessionMiddleware          |
+    |                                     |-- isAdmin() 验证权限                |
+    |                                     |-- enableOpenID() → bootstrapOpenId() |
     |                                     |-- 写入 auth 表 (openid, active=1)  |
-    |<-- 成功 ----------------------------|                                      |
-    |-- navigate('/')                     |                                      |
+    |                                     |-- DELETE FROM sessions 强制重登     |
+    |<-- 成功 { status: 'ok' } -----------|                                      |
+    |-- 前端刷新 → 重新用 OIDC 登录        |                                      |
     |                                     |                                      |
     |-- 5. POST /login {                  |                                      |
     |       loginMethod: 'openid',        |                                      |
     |       returnUrl, password?          |                                      |
     |    } ------------------------------>|                                      |
-    |                                     |                                      |
     |                                     |-- loginWithOpenIdSetup()            |
     |                                     |-- 生成 state/code_verifier          |
     |                                     |-- 写入 pending_openid_requests      |
@@ -609,13 +619,40 @@ function isValidRedirectUrl(url) {
     |-- 携带 X-ACTUAL-TOKEN header       |                                      |
     |-- 11. GET /validate --------------->|                                      |
     |                                     |-- validateSession()                  |
-    |                                     |   查询 sessions 表                  |
-    |                                     |   验证 token 有效                    |
-    |                                     |-- getUserInfo()                      |
+    |                                     |   getSession(token) 查询 sessions   |
+    |                                     |   验证 token 未过期                  |
+    |                                     |-- getUserInfo(user_id)              |
     |<-- 返回用户信息 ---------------------|                                      |
     |                                     |                                      |
     |-- 登录完成，进入应用                  |                                      |
 ```
+
+---
+
+## 8.1 完整闭环表（按请求入口）
+
+| 请求入口 | 前端触发 | 后端函数 | 返回字段（代码原文） | 前端表现 | 是否写入 OIDC 配置 |
+|---------|---------|---------|-------------------|---------|------------------|
+| **Password Bootstrap** | | | | | |
+| `POST /bootstrap` | Bootstrap 页 ConfirmPasswordForm 提交 | `bootstrap({ password }, forced=false)` | 成功: `{ status: 'ok', data: { token } }`<br>失败: `{ status: 'error', reason: 'invalid-password' | 'already-bootstrapped' }` | 成功: 刷新登录方法 → 重定向 /login<br>失败: 红色文字显示 error | ❌ 不涉及 |
+| **OIDC 配置查看** | | | | | |
+| `POST /openid/config` | Login 页输入 password → Review 按钮 | 验证 ownerCount + checkPassword | 成功: `{ openId: config }`<br>失败: `{ status: 'error', reason: 'invalid-password' | 'already-bootstraped' }` | 成功: 显示 OpenIdForm 编辑<br>失败: setError 红色提示 | ❌ 仅读取 |
+| **⚠️ Login 页 OIDC 配置提交（无效）** | | | | | |
+| `POST /bootstrap` | OpenIdForm 提交 | `bootstrap({ openId: config }, forced=false)` | 成功: `{}` (空对象，无错误提示)<br>失败: `{ status: 'error', reason: 'already-bootstrapped' }` | 前端 navigate('/')（用户误以为成功）<br>但数据库 auth 表无变化 | ❌ **不会写入**（forced=false） |
+| **✅ 管理员启用 OIDC（有效）** | | | | | |
+| `POST /openid/enable` | 管理员设置页启用 OpenID | `enableOpenID({ openId: config })` → 直接 `bootstrapOpenId()` | 成功: `{ status: 'ok' }`<br>失败: `{ status: 'error', reason: 'xxx' }` | 成功: 清除 sessions → 所有人重登<br>失败: 显示错误提示 | ✅ **会写入** |
+| **OIDC 登录发起** | | | | | |
+| `POST /login` (loginMethod='openid') | Login 页点击 Sign in with OpenID | `loginWithOpenIdSetup(returnUrl, password?)` | 成功: `{ status: 'ok', data: { returnUrl: oidcAuthUrl } }`<br>失败: `{ status: 'error', reason: 'return-url-missing' | 'invalid-return-url' | 'invalid-password' | 'openid-not-configured' | 'openid-setup-failed' }` | 成功: 浏览器跳转 OIDC Provider<br>失败: setError 红色提示 | ❌ 不涉及 |
+| **OIDC 回调处理** | | | | | |
+| `GET /openid/callback` | OIDC Provider 重定向回来 | `loginWithOpenIdFinalize(req.query)` | 成功: 302 重定向 → `{returnUrl}/openid-cb?token={sessionToken}`<br>失败: 400 JSON `{ status: 'error', reason: 'missing-authorization-code' | 'missing-state' | 'invalid-or-expired-state' | 'openid-grant-failed' | ... }` | 成功: 继续登录流程<br>失败: 浏览器直接显示 JSON 错误 | ❌ 不涉及 |
+| **Session Token 写入（前端）** | | | | | |
+| `subscribe-set-token` | OpenIdCallback 组件 | 仅本地 asyncStorage.setItem | 无返回（前端本地操作） | 存储 token 到本地，无服务端请求 | ❌ 不涉及 |
+| **会话验证** | | | | | |
+| `GET /validate` | dispatch(loggedIn()) 后自动调用 | `validateSession(req, res)` + `getUserInfo(user_id)` | 成功: `{ status: 'ok', data: { userName, permission, userId, displayName, loginMethod } }`<br>失败: 401 `{ status: 'error', reason: 'unauthorized' | 'token-expired' }` | 成功: 进入应用<br>失败: getUser() 返回 null → 未登录状态 | ❌ 不涉及 |
+| **Password 登录** | | | | | |
+| `POST /login` (默认或 loginMethod='password') | Login 页输入密码提交 | `loginWithPassword(password)` | 成功: `{ status: 'ok', data: { token } }`<br>失败: `{ status: 'error', reason: 'invalid-password' }` | 成功: 存储 token → dispatch(loggedIn())<br>失败: 红色文字提示 | ❌ 不涉及 |
+| **Header 登录** | | | | | |
+| `POST /login` (loginMethod='header') | 页面自动检测 header 方式 | 先 `validateAuthHeader(req)` 再 `loginWithPassword(headerVal)` | 成功: `{ status: 'ok', data: { token } }`<br>失败: `{ status: 'error', reason: 'invalid-header' | 'proxy-not-trusted' }` | 成功: 自动登录<br>失败: 显示错误 + 提供密码登录入口 | ❌ 不涉及 |
 
 ---
 
@@ -660,3 +697,27 @@ function isValidRedirectUrl(url) {
 5. **错误分层**: API 失败统一返回 reason，前端根据 reason 本地化显示
 6. **首次用户特殊**: OIDC 首个用户自动成为 owner，继承空用户文件权限
 7. **安全优先**: PKCE、Rate Limit、Redirect 白名单、bcrypt 哈希全链路保护
+
+---
+
+## 11. 最终判定清单（代码原文定位）
+
+1. **结论**: Login 页 subscribe-bootstrap({ openId }) 不会写入 OIDC 配置
+   - 代码位置: `packages/sync-server/src/app-account.js:66` → `bootstrap(req.body, forced=false)`
+   - 判定依据: `forced=false` 不满足执行条件
+
+2. **结论**: bootstrapOpenId 执行条件为 `openIdEnabled && forced` 同时为 true
+   - 代码位置: `packages/sync-server/src/account-db.js:123`
+   - 判定依据: `if (openIdEnabled && forced)` 分支条件
+
+3. **结论**: /openid/enable 端点会直接调用 bootstrapOpenId 写入配置
+   - 代码位置: `packages/sync-server/src/account-db.js:152`
+   - 判定依据: `enableOpenID()` 函数内无条件执行 `bootstrapOpenId()`
+
+4. **结论**: 代码内部 bootstrap(..., true) 可触发 bootstrapOpenId
+   - 代码位置: `packages/sync-server/src/account-db.js:123`
+   - 判定依据: `forced=true` 时条件满足，无对外 HTTP 入口
+
+5. **结论**: Login 页 "Review OpenID configuration" 仅读取配置，不写入
+   - 代码位置: `packages/sync-server/src/app-openid.ts:43-61`
+   - 判定依据: `/openid/config` 端点仅执行 SELECT，不执行 UPDATE/INSERT
