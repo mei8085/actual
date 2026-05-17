@@ -438,10 +438,60 @@ void i18n
 
 #### 4.4.2 翻译资源加载机制
 
-**核心文件**：`packages/desktop-client/src/languages.ts`
+**核心文件**：
+- `packages/desktop-client/src/languages.ts`
+- `bin/package-browser`（构建脚本）
+- `packages/desktop-client/bin/remove-untranslated-languages`（翻译质量过滤脚本）
+
+##### 资源来源：translations 独立仓库
+
+语言资源不存储在主代码仓中，而是来自独立的 translations 仓库：
+
+```
+GitHub: actualbudget/translations
+    ↓
+构建时 clone 到: packages/desktop-client/locale/
+    ↓
+包含文件: en.json, zh.json, fr.json, de.json, ...
+```
+
+**构建脚本逻辑**（`bin/package-browser`）：
+
+```bash
+# 默认会自动拉取翻译资源
+if [ "$SKIP_TRANSLATIONS" = false ]; then
+  echo "Updating translations..."
+  if ! [ -d packages/desktop-client/locale ]; then
+      git clone https://github.com/actualbudget/translations packages/desktop-client/locale
+  fi
+  pushd packages/desktop-client/locale > /dev/null
+  git checkout .
+  git pull
+  popd > /dev/null
+  
+  # 删除翻译完成度低于50%的语言文件
+  packages/desktop-client/bin/remove-untranslated-languages
+fi
+```
+
+**翻译质量过滤**（`remove-untranslated-languages`）：
+
+```javascript
+// 比较各语言与英文的 key 数量，低于50%的语言会被删除
+const percentage = (fileKeysCount / enKeysCount) * 100;
+if (percentage < 50) {
+  fs.unlinkSync(filePath);  // 删除不完整的翻译
+  console.log(`Deleted ${file} due to insufficient keys.`);
+}
+```
+
+##### 运行时加载机制
+
+**代码**（`packages/desktop-client/src/languages.ts`）：
 
 ```typescript
 // 使用 Vite 的 import.meta.glob 动态导入所有语言文件
+// 路径: /locale/*.json → 对应构建时 clone 到的 packages/desktop-client/locale/
 export const languages = import.meta.glob([
   '/locale/*.json',
   '!/locale/*_old.json',
@@ -456,9 +506,26 @@ const loadLanguage = (language: string) => {
 ```
 
 **资源加载流程**：
-1. 构建时，Vite 通过 `import.meta.glob` 收集 `/locale/*.json` 所有翻译文件
-2. 运行时，通过 `i18next-resources-to-backend` 插件按需懒加载语言资源
-3. 语言文件以 JSON 格式存储，key 是英文原文，value 是对应语言的翻译
+
+1. **构建时**：
+   - 从 `actualbudget/translations` 仓库 clone 翻译文件到 `packages/desktop-client/locale/`
+   - 运行 `remove-untranslated-languages` 过滤掉完成度 <50% 的语言
+   - Vite 通过 `import.meta.glob` 收集 `/locale/*.json` 所有翻译文件
+   - 每个语言文件被打包为独立的 chunk，实现按需加载
+
+2. **运行时**：
+   - 通过 `i18next-resources-to-backend` 插件按需懒加载语言资源
+   - 语言文件以 JSON 格式存储，key 是英文原文，value 是对应语言的翻译
+   - 只有用户切换语言时才会加载对应的语言包
+
+3. **可用语言检测**：
+
+   ```typescript
+   // Playwright 测试环境下不加载任何语言（避免测试不稳定）
+   export const availableLanguages = Platform.isPlaywright
+     ? []
+     : Object.keys(languages).map(path => path.split('/')[2].split('.')[0]);
+   ```
 
 #### 4.4.3 翻译资源提取流程
 
@@ -1045,8 +1112,14 @@ Template 对象: {
 | **校验层** | `packages/desktop-client/src/components/budget/goals/validateAutomation.ts` | 前端校验逻辑 |
 | **渲染层** | `packages/desktop-client/src/components/budget/goals/TemplateSentence.tsx` | 自然语言渲染入口 |
 | | `packages/desktop-client/src/components/budget/goals/editor/*ReadOnly.tsx` | 各类型只读组件 |
+| **i18n 层** | `packages/desktop-client/src/i18n.ts` | i18next 初始化与语言解析 |
+| | `packages/desktop-client/src/languages.ts` | 语言资源动态加载 |
+| | `packages/desktop-client/i18next-parser.config.js` | 翻译 Key 提取配置 |
+| | `packages/desktop-client/locale/*.json` | 各语言翻译资源文件 |
 | **UI层** | `packages/desktop-client/src/components/modals/BudgetAutomationsModal/` | 自动化模态框 |
 | | `packages/desktop-client/src/components/budget/goals/automationMessages.tsx` | 错误消息组件 |
 | | `packages/desktop-client/src/components/budget/goals/BudgetAutomationReadOnly.tsx` | 预算表格展示 |
 | **类型定义** | `packages/loot-core/src/types/models/templates.ts` | Template 类型定义 |
 | | `packages/desktop-client/src/components/budget/goals/constants.ts` | 显示类型映射 |
+| **工具链** | `packages/eslint-plugin-actual/lib/rules/no-untranslated-strings.js` | 未翻译字符串检测 |
+| | `packages/eslint-plugin-actual/lib/rules/prefer-trans-over-t.js` | Trans 组件优先规则 |
