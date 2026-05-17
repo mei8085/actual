@@ -346,107 +346,262 @@ app.post('/access', (req, res) => {
 });
 ```
 
-### 5.2 权限变更的生效机制
+### 5.2 权限检查的核心机制
 
-#### 5.2.1 即时生效（服务端）
+#### 5.2.1 服务端无状态权限检查
 
-权限变更直接写入数据库，**后续请求立即生效**：
+权限检查**不依赖会话缓存**，每次请求都会实时查询数据库：
 
-1. 角色变更 → 更新 `users.role` 字段
-2. 访问授权变更 → 插入/删除 `user_access` 表记录
-3. 用户禁用 → 更新 `users.enabled` 字段
+**位置**: `packages/sync-server/src/account-db.js:143-145`
 
-#### 5.2.2 客户端感知机制
-
-**位置**: `packages/loot-core/src/server/auth/app.ts:146-205`
-
-客户端通过 `subscribe-get-user` 轮询获取当前用户信息：
-
-```typescript
-async function getUser() {
-  const userToken = await asyncStorage.getItem('user-token');
-  const res = await get(serverConfig.SIGNUP_SERVER + '/validate', {
-    headers: { 'X-ACTUAL-TOKEN': userToken },
-  });
-  
-  const { data: { permission, userId, userName, displayName, loginMethod, prefs } } = JSON.parse(res);
-  
-  return {
-    offline: false,
-    userName,
-    permission,  // 角色信息
-    userId,
-    displayName,
-    loginMethod,
-    tokenExpired,
-    serverPrefs,
-  };
+```javascript
+export function getUserPermission(userId) {
+  const accountDb = getAccountDb();
+  const { role } = accountDb.first(
+    `SELECT role FROM users WHERE users.id = ?`,
+    [userId],
+  ) || { role: '' };
+  return role;
 }
 ```
 
-#### 5.2.3 会话验证端点
+**文件权限检查**（每次同步/下载操作都会执行）：
 
-**位置**: `packages/sync-server/src/app-account.js:188-209`
+**位置**: `packages/sync-server/src/app-sync.ts:119-129`
 
-```javascript
-app.get('/validate', (req, res) => {
-  const session = validateSession(req, res);
-  if (session) {
-    const user = getUserInfo(session.user_id);
-    res.send({
-      status: 'ok',
-      data: {
-        validated: true,
-        userName: user?.user_name,
-        permission: user?.role,  // 返回最新角色
-        userId: session?.user_id,
-        displayName: user?.display_name,
-        loginMethod: session?.auth_method,
-        prefs: getServerPrefs(),
-      },
-    });
+```typescript
+function requireFileAccess(file: File, userId: string) {
+  const isOwner = file.owner === userId;
+  const isServerAdmin = isAdmin(userId);  // 每次调用都会查询数据库
+  if (isOwner || isServerAdmin) {
+    return null;
   }
-});
+  if (UserService.countUserAccess(file.id, userId) > 0) {  // 查询 user_access 表
+    return null;
+  }
+  return 'file-access-not-allowed';
+}
 ```
 
-### 5.3 主动失效机制
+#### 5.2.2 客户端权限检查
 
-#### 5.3.1 更改登录方式时的会话清理
+客户端基于 Redux Store 中缓存的 `user.data.permission` 进行 UI 层面的权限控制：
+
+**位置**: `packages/desktop-client/src/auth/AuthProvider.tsx:23-32`
+
+```typescript
+const hasPermission = (permission?: Permissions) => {
+  if (!permission) {
+    return true;
+  }
+  return (
+    !serverUrl ||
+    userData?.permission?.toUpperCase() === permission?.toUpperCase()
+  );
+};
+```
+
+### 5.3 权限变更生效时序详解
+
+#### 5.3.1 立即生效场景（服务端侧）
+
+以下变更在数据库写入完成后，**下一次 API 请求立即生效**：
+
+| 操作 | 生效时机 | 检查点 |
+|-----|---------|--------|
+| 用户角色 BASIC → ADMIN | 数据库事务提交后 | `isAdmin(userId)` 每次调用查询最新 role |
+| 用户角色 ADMIN → BASIC | 数据库事务提交后 | `isAdmin(userId)` 返回 false |
+| 授予预算访问权限 | `user_access` 记录插入后 | `countUserAccess(fileId, userId)` 返回 > 0 |
+| 撤销预算访问权限 | `user_access` 记录删除后 | `countUserAccess(fileId, userId)` 返回 0 |
+| 启用/禁用用户 | `users.enabled` 字段更新后 | 登录时检查（OpenID 模式） |
+
+**关键代码**（文件列表查询时的权限过滤）：
+
+**位置**: `packages/sync-server/src/app-sync/services/files-service.ts:167-189`
+
+```typescript
+find({ userId, limit = 1000 }: { userId: string; limit?: number }) {
+  const canSeeAll = isAdmin(userId);  // 每次查询都会检查最新角色
+  return (
+    canSeeAll
+      ? this.accountDb.all('SELECT * FROM files WHERE deleted = 0 LIMIT ?', [limit])
+      : this.accountDb.all(
+          `SELECT files.* FROM files WHERE files.owner = ? and deleted = 0
+           UNION
+           SELECT files.* FROM files
+           JOIN user_access ON user_access.file_id = files.id
+             AND user_access.user_id = ?
+           WHERE files.deleted = 0 LIMIT ?`,
+          [userId, userId, limit],
+        )
+  ).map((item: RawFile) => this.validate(item));
+}
+```
+
+#### 5.3.2 依赖下一次校验场景（客户端侧）
+
+客户端 UI 层面的权限展示依赖 `getUserData()` 轮询获取最新信息：
+
+**客户端触发时机**：
+
+1. **应用初始化**：`LoggedInUser` 组件挂载时调用 `initializeUserData()`
+   **位置**: `packages/desktop-client/src/components/LoggedInUser.tsx:59-71`
+   ```typescript
+   const initializeUserData = useCallback(async () => {
+     try {
+       await dispatch(getUserData());
+     } catch (error) {
+       console.error('Failed to initialize user data:', error);
+     } finally {
+       setLoading(false);
+     }
+   }, [dispatch]);
+
+   useEffect(() => {
+     void initializeUserData();
+   }, [initializeUserData]);
+   ```
+
+2. **同步状态变化**：从离线恢复到在线时重新拉取用户信息
+   **位置**: `packages/desktop-client/src/components/LoggedInUser.tsx:73-92`
+   ```typescript
+   useEffect(() => {
+     return listen('sync-event', ({ type }) => {
+       const shouldReinitialize =
+         userData &&
+         ((type === 'success' && userData.offline) ||
+           (type === 'error' && !userData.offline));
+
+       if (shouldReinitialize) {
+         void initializeUserData();
+       }
+     });
+   }, [initializeUserData, userData]);
+   ```
+
+3. **用户手动刷新**：预算文件列表页面的刷新按钮
+   **位置**: `packages/desktop-client/src/components/manager/BudgetFileSelection.tsx:588-591`
+   ```typescript
+   const refresh = () => {
+     void dispatch(getUserData());
+     void dispatch(loadAllFiles());
+   };
+   ```
+
+4. **打开预算列表**：进入文件管理页面时
+   **位置**: `packages/desktop-client/src/components/manager/BudgetFileSelection.tsx:593-596`
+   ```typescript
+   const initialMount = useInitialMount();
+   if (initialMount && quickSwitchMode) {
+     refresh();
+   }
+   ```
+
+#### 5.3.3 需要等待会话过期场景
+
+以下操作**不会立即失效现有会话**，需要等待 token 过期：
+
+| 操作 | 现有会话行为 | 失效时机 |
+|-----|-------------|---------|
+| 禁用用户（enabled = 0） | 现有 Token 仍然有效，可继续访问 | Token 自然过期 / 用户重新登录时检查 |
+| 删除用户 | 现有 Token 仍然有效 | Token 自然过期 / 下次请求时用户不存在 |
+| 修改密码（密码模式） | 不清空现有会话（单用户模式） | 无（单用户永不过期） |
+
+**关键发现**：在 OpenID 登录流程中，会检查 `enabled` 字段，但**会话验证中间件不检查**：
+
+**位置**: `packages/sync-server/src/accounts/openid.ts:285-289`
+```javascript
+const { id: userIdFromDb, display_name: displayName } =
+  accountDb.first(
+    'SELECT id, display_name FROM users WHERE user_name = ? and enabled = 1',
+    [identity],
+  ) || {};
+```
+
+但在 `validateSession` 中**不检查 `enabled` 状态**：
+
+**位置**: `packages/sync-server/src/util/validate-user.ts:10-42`
+```typescript
+export function validateSession(req: Request, res: Response) {
+  // 仅检查 token 是否存在和是否过期
+  // 不检查 users.enabled 字段
+}
+```
+
+### 5.4 主动失效机制
+
+#### 5.4.1 更改登录方式时的会话清理
 
 **位置**: `packages/sync-server/src/account-db.js:147-158`
 
 ```javascript
 export async function enableOpenID(loginSettings) {
   // ... 配置 OpenID
-  getAccountDb().mutate('DELETE FROM sessions');  // 清除所有会话
+  getAccountDb().mutate('DELETE FROM sessions');  // 清除所有会话，强制所有用户重新登录
 }
 ```
 
-#### 5.3.2 Token 过期机制
+#### 5.4.2 Token 过期机制
 
-- 默认密码登录：`TOKEN_EXPIRATION_NEVER = -1`（永不过期）
-- 可配置过期时间：`config.get('token_expiration')` 分钟
-- 定期清理：`clearExpiredSessions()` 清理过期 1 小时以上的会话
+- **密码模式默认**：`TOKEN_EXPIRATION_NEVER = -1`（永不过期）
+- **可配置过期**：`config.get('token_expiration')` 分钟
+- **OpenID 模式**：可配置为跟随 OpenID Provider 的过期时间
+- **定期清理**：`clearExpiredSessions()` 在每次登录时清理过期 1 小时以上的会话
 
-### 5.4 权限变更下发时序
+**位置**: `packages/sync-server/src/account-db.js:259-268`
+```javascript
+export function clearExpiredSessions() {
+  const clearThreshold = Math.floor(Date.now() / 1000) - 3600;
+  const deletedSessions = getAccountDb().mutate(
+    'DELETE FROM sessions WHERE expires_at <> -1 and expires_at < ?',
+    [clearThreshold],
+  ).changes;
+  console.log(`Deleted ${deletedSessions} old sessions`);
+}
+```
+
+### 5.5 完整权限变更下发时序图
 
 ```
-管理员操作（UI）
-    ↓
-发送 API 请求（POST/PATCH /admin/users 或 /admin/access）
-    ↓
-服务端更新数据库（users / user_access 表）
-    ↓
-[即时生效] 后续所有 API 请求使用新权限
-    ↓
-客户端轮询 /validate 端点（定期或操作时）
-    ↓
-获取最新 permission 字段
-    ↓
-更新 Redux Store（usersSlice）
-    ↓
-UI 根据新权限渲染
+管理员在 UI 执行操作
+    │
+    ├─→ 发送 API 请求（PATCH /admin/users）
+    │     │
+    │     └─→ 服务端更新 users 表（事务提交）
+    │           │
+    │           ├─→ [立即生效] 后续所有 API 请求使用新权限
+    │           │     │
+    │           │     ├─→ 同步请求：requireFileAccess() 检查最新权限
+    │           │     ├─→ 文件列表：find() 基于最新角色过滤
+    │           │     └─→ 下载请求：检查文件访问权限
+    │           │
+    │           └─→ [客户端感知] 依赖触发时机
+    │                 │
+    │                 ├─→ 应用初始化：LoggedInUser 调用 getUserData()
+    │                 ├─→ 离线转在线：sync-event 触发重新拉取
+    │                 ├─→ 手动刷新：用户点击刷新按钮
+    │                 └─→ 进入文件列表：BudgetFileSelection 刷新
+    │                       │
+    │                       ├─→ GET /account/validate
+    │                       ├─→ 返回最新 permission 字段
+    │                       ├─→ 更新 Redux state.user.data
+    │                       └─→ UI 重新渲染（隐藏/显示管理员功能）
+    │
+    └─→ [无主动推送] 服务端不主动通知客户端权限变更
 ```
+
+### 5.6 权限变更矩阵
+
+| 变更类型 | 服务端生效 | 客户端 UI 生效 | 现有会话 | 备注 |
+|---------|-----------|--------------|---------|------|
+| 角色 BASIC→ADMIN | 立即（下一次请求） | 下一次 getUserData() | 继续有效 | 用户立即拥有所有文件访问权 |
+| 角色 ADMIN→BASIC | 立即（下一次请求） | 下一次 getUserData() | 继续有效 | 用户失去其他用户文件访问权 |
+| 授予文件访问 | 立即（下一次请求） | 下一次 loadAllFiles() | 继续有效 | 用户可以看到并同步该文件 |
+| 撤销文件访问 | 立即（下一次请求） | 下一次 loadAllFiles() | 继续有效 | 用户无法同步但仍可看本地数据 |
+| 禁用用户 | 登录时检查 | 下一次 getUserData() | 继续有效直到过期 | 现有会话不受影响 |
+| 删除用户 | 立即（用户不存在） | 下一次 getUserData() | 继续有效直到过期 | 文件所有权自动转移 |
+| 修改服务器密码 | 不影响 | 不影响 | 继续有效 | 单用户模式不清空会话 |
+| 切换登录方式 | 立即失效 | 立即失效 | 全部删除 | DELETE FROM sessions |
 
 ## 6. 对历史数据可见性的影响
 
