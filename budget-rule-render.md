@@ -619,6 +619,147 @@ value: "预算本月总收入的 {{percent}}%"
 
 **核心文件**：`packages/desktop-client/src/i18n.ts` 中的 `resolveLanguage` 和 `setI18NextLanguage`
 
+#### 4.6.0 setI18NextLanguage 触发链路（完整）
+
+`setI18NextLanguage` 有 **5 个直接/间接触发入口**，覆盖应用生命周期的各个阶段：
+
+| 触发场景 | 代码位置 | 调用时机 | 参数 | 直接/间接 |
+|---------|---------|---------|------|----------|
+| **应用启动初始化** | `App.tsx:58` | 组件挂载时 | `null`（使用系统默认） | 直接 |
+| **偏好加载（主）** | `prefsSlice.ts:66` | `loadPrefs` 完成后 | `globalPrefs.language ?? ''` | 直接 |
+| **同步事件触发** | `sync-events.ts:64` | `prefs` 表远程同步变化时 | 间接调用 `loadPrefs()` | 间接 |
+| **预算加载/导入后** | `global-events.ts:150,160` | 预算加载/导入完成时 | 间接调用 `loadPrefs()` | 间接 |
+| **设置页手动切换** | `LanguageSettings.tsx:52` | 用户手动选择语言时 | 用户选择的语言代码 | 直接 |
+
+---
+
+**链路 1：应用启动初始化**（最优先）
+
+```typescript
+// App.tsx:49-59
+function AppInner() {
+  // ...
+  useEffect(() => {
+    setI18NextLanguage(null);  // 传入 null → 使用 navigator.languages
+  }, []);  // 空依赖数组，只在挂载时执行一次
+  // ...
+}
+```
+
+- **时机**：React 组件挂载时（应用启动第一帧）
+- **行为**：不传入语言参数，自动检测浏览器语言
+- **优先级**：最先执行，但会被后续偏好加载覆盖
+
+---
+
+**链路 2：偏好加载后应用**（最权威）
+
+```typescript
+// prefsSlice.ts:37-70
+export const loadPrefs = createAppAsyncThunk(
+  `${sliceName}/loadPrefs`,
+  async (_, { dispatch, getState }) => {
+    // 1. 加载本地偏好
+    const prefs = await send('load-prefs');
+    
+    // 2. 加载全局偏好（包含语言设置）
+    const [globalPrefs, syncedPrefs] = await Promise.all([
+      send('load-global-prefs'),
+      send('preferences/get'),
+    ]);
+    
+    // 3. 应用语言设置（必须在渲染前）
+    setI18NextLanguage(globalPrefs.language ?? '');
+    
+    return prefs;
+  },
+);
+```
+
+- **时机**：从本地存储加载全局偏好设置后
+- **行为**：使用用户之前保存的语言偏好，优先级高于浏览器默认
+- **设计意图**：确保用户偏好优先于系统默认
+
+---
+
+**链路 3：同步事件触发（远程偏好变化）**
+
+```typescript
+// sync-events.ts:63-64
+if (tables.includes('prefs')) {
+  void store.dispatch(loadPrefs());  // 重新加载偏好 → 触发语言切换
+}
+```
+
+- **触发条件**：多设备同步时，远程设备修改了偏好设置
+- **行为**：自动重新加载偏好并应用新的语言设置
+- **用户体验**：无需刷新页面，语言自动切换
+
+---
+
+**链路 4：预算加载/导入完成后**
+
+```typescript
+// global-events.ts:147-150
+const unlistenFinishLoad = listen('finish-load', () => {
+  store.dispatch(closeModal());
+  store.dispatch(setAppState({ loadingText: null }));
+  void store.dispatch(loadPrefs());  // 重新加载偏好 → 触发语言切换
+});
+
+// global-events.ts:157-160
+const unlistenFinishImport = listen('finish-import', () => {
+  store.dispatch(closeModal());
+  store.dispatch(setAppState({ loadingText: null }));
+  void store.dispatch(loadPrefs());  // 重新加载偏好 → 触发语言切换
+});
+```
+
+- **触发条件**：
+  - 预算文件加载完成
+  - 交易数据导入完成
+- **行为**：刷新偏好设置（可能包含新的语言设置）
+- **设计意图**：确保预算加载后所有偏好都是最新的
+
+---
+
+**链路 5：设置页手动切换**（用户主动）
+
+```typescript
+// LanguageSettings.tsx:50-53
+onChange={value => {
+  setLanguage(value);           // 1. 保存到全局偏好
+  setI18NextLanguage(value);    // 2. 立即切换语言
+}}
+```
+
+- **时机**：用户在设置页面选择语言时
+- **行为**：
+  1. 调用 `setLanguage`（`useGlobalPref` hook）保存到本地存储
+  2. 调用 `setI18NextLanguage` 立即切换当前语言
+- **用户体验**：所有文本立即刷新，无需重启应用
+
+---
+
+**触发时序图**：
+
+```
+应用启动
+    ↓
+[App.tsx] useEffect → setI18NextLanguage(null) → 浏览器语言
+    ↓
+[App.tsx] init() → dispatch(loadPrefs())
+    ↓
+[prefsSlice.ts] loadPrefs → setI18NextLanguage(globalPrefs.language)
+    ↓ （如果用户有保存的语言偏好，覆盖浏览器语言）
+应用渲染 → 用户看到正确语言的界面
+    ↓
+（运行中）
+    ├─ [LanguageSettings.tsx] 用户切换 → setI18NextLanguage(value)
+    ├─ [sync-events.ts] 远程偏好变化 → loadPrefs() → 重新应用
+    └─ [global-events.ts] 预算加载/导入 → loadPrefs() → 重新应用
+```
+
 #### 4.6.1 语言选择优先级
 
 ```typescript
@@ -1100,7 +1241,69 @@ Template 对象: {
 
 ---
 
-## 八、核心文件索引
+## 八、i18n 完整链路总览（修正版）
+
+### 8.1 翻译资源生命周期
+
+```
+GitHub: actualbudget/translations （独立仓库）
+    │
+    ├─ 构建时 (bin/package-browser)
+    │   ├─ git clone → packages/desktop-client/locale/
+    │   ├─ 过滤 <50% 完成度的语言
+    │   └─ Vite import.meta.glob 打包为独立 chunk
+    │
+    └─ 运行时
+        ├─ 检测 availableLanguages
+        ├─ 用户切换语言时懒加载对应 JSON
+        └─ i18next 渲染 Trans 组件
+```
+
+### 8.2 setI18NextLanguage 完整触发链
+
+```
+          ┌──────────────────────────────────┐
+          │        应用启动 (App.tsx)        │
+          │  useEffect → setI18NextLanguage(null) │
+          └─────────────────┬────────────────┘
+                            │
+                            ▼
+          ┌──────────────────────────────────┐
+          │     偏好加载 (prefsSlice.ts)      │
+          │ loadPrefs → setI18NextLanguage(lang) │
+          └─────────────────┬────────────────┘
+                            │
+                            ▼
+          ┌──────────────────────────────────┐
+          │   用户设置切换 (LanguageSettings.tsx) │
+          │  onChange → setI18NextLanguage(value) │
+          └─────────────────┬────────────────┘
+                            │
+                            ▼
+          ┌──────────────────────────────────┐
+          │     i18n 语言解析 (i18n.ts)      │
+          │   resolveLanguage() 解析链:      │
+          │   精确匹配 → 小写 → 基础语言 → en │
+          └─────────────────┬────────────────┘
+                            │
+                            ▼
+          ┌──────────────────────────────────┐
+          │  i18next.changeLanguage(resolved) │
+          └──────────────────────────────────┘
+```
+
+### 8.3 兜底路径汇总
+
+| 兜底场景 | 触发条件 | 用户可见结果 | 代码位置 |
+|---------|---------|-------------|---------|
+| **无语言资源** | 构建时 `--skip-translations` 或 clone 失败 | 设置页显示 "Language support is not available"，所有文案显示英文 | `LanguageSettings.tsx:38,77-89` |
+| **语言不存在** | 用户选择的语言文件不存在 | 回退到基础语言，最终回退到英文 | `i18n.ts:42-63` |
+| **缺翻译 Key** | 某个句子在当前语言中未翻译 | 直接显示英文原文（key 本身） | `i18n.ts:33 (fallbackLng: false)` |
+| **Playwright 测试** | 测试环境 | `availableLanguages = []`，所有文案显示英文 | `i18n.ts:9-11` |
+
+---
+
+## 九、核心文件索引
 
 | 层级 | 文件路径 | 主要职责 |
 |-----|---------|---------|
