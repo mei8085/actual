@@ -754,6 +754,8 @@ ids.forEach(item => {
 | **`POST /sync/sync`** | 1. validateSession<br>2. requireFileAccess() | ❌ 无所有权、非管理员、无授权 | 403 |
 | **`GET /sync/download-user-file`** | 1. validateSession<br>2. requireFileAccess() | ❌ 同上 | 403 |
 | **`POST /admin/*`** | 1. validateSession<br>2. isAdmin(userId) | ❌ 非管理员 | 403 |
+| **`POST /sync/upload-user-file`（新文件）** | 1. validateSession<br>2. currentFile 不存在 → 跳过权限检查<br>3. 写入文件并创建记录 | ✅ 可创建新文件！owner = 已删除用户ID | 200 |
+| **`POST /sync/upload-user-file`（覆盖现有）** | 1. validateSession<br>2. requireFileAccess() | ❌ 无所有权、非管理员、无授权 | 403 |
 
 **各维度详细分析**：
 
