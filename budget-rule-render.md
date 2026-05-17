@@ -401,6 +401,437 @@ export const BySaveAutomationReadOnly = ({ template }) => {
 
 ---
 
+## 四（补充）：i18n 文案全链路深度分析
+
+### 4.4 i18n 初始化与核心配置
+
+**核心文件**：`packages/desktop-client/src/i18n.ts`
+
+#### 4.4.1 初始化配置
+
+```typescript
+import { initReactI18next } from 'react-i18next';
+import i18n from 'i18next';
+import resourcesToBackend from 'i18next-resources-to-backend';
+
+void i18n
+  .use(initReactI18next)
+  .use(resourcesToBackend(loadLanguage))
+  .init({
+    lng: 'en',                          // 默认语言
+    nsSeparator: false,                 // 禁用命名空间分隔符
+    keySeparator: false,                // 禁用 key 分隔符（关键设计）
+    fallbackLng: false,                 // 禁用语言回退（关键设计）
+    interpolation: {
+      escapeValue: false,               // React 已自动转义
+    },
+    react: {
+      transSupportBasicHtmlNodes: false,
+    },
+  });
+```
+
+**关键设计决策**：
+- `keySeparator: false`：**不使用人工 key**，直接使用英文自然语言作为 key
+- `fallbackLng: false`：**不启用语言回退**，缺 key 时直接显示英文原文
+- `nsSeparator: false`：不使用命名空间，所有翻译在一个层级
+
+#### 4.4.2 翻译资源加载机制
+
+**核心文件**：`packages/desktop-client/src/languages.ts`
+
+```typescript
+// 使用 Vite 的 import.meta.glob 动态导入所有语言文件
+export const languages = import.meta.glob([
+  '/locale/*.json',
+  '!/locale/*_old.json',
+]);
+
+const loadLanguage = (language: string) => {
+  if (!isLanguageAvailable(language)) {
+    throw new Error(`Unknown locale ${language}`);
+  }
+  return languages[`/locale/${language}.json`]();
+};
+```
+
+**资源加载流程**：
+1. 构建时，Vite 通过 `import.meta.glob` 收集 `/locale/*.json` 所有翻译文件
+2. 运行时，通过 `i18next-resources-to-backend` 插件按需懒加载语言资源
+3. 语言文件以 JSON 格式存储，key 是英文原文，value 是对应语言的翻译
+
+#### 4.4.3 翻译资源提取流程
+
+**核心文件**：`packages/desktop-client/i18next-parser.config.js`
+
+```javascript
+module.exports = {
+  input: ['src/**/*.{js,jsx,ts,tsx}', '../loot-core/src/**/*.{js,jsx,ts,tsx}'],
+  output: 'locale/$LOCALE.json',
+  locales: ['en'],                    // 只提取英文
+  sort: true,
+  keySeparator: false,
+  namespaceSeparator: false,
+  defaultValue: (locale, ns, key, value) => {
+    if (locale === 'en') {
+      return value || key;            // 英文的 value 就是 key 本身
+    }
+    return '';
+  },
+};
+```
+
+**提取命令**：
+```bash
+yarn workspace @actual-app/web generate:i18n
+```
+
+**工作原理**：
+1. 扫描 `src/` 和 `loot-core/src/` 下所有使用 `<Trans>` 或 `t()` 的代码
+2. 提取所有英文文本作为 key
+3. 生成 `locale/en.json` 文件，key 和 value 都是英文原文
+4. 其他语言通过 Weblate 平台进行翻译（不接受 GitHub PR 直接修改翻译文件）
+
+### 4.5 自然语言 Key 设计原理
+
+#### 4.5.1 设计理念
+
+**核心原则**：**英文原文即是 Key**
+
+```
+传统方案：
+key: "budget_percentage_of_income"
+value: "Budget {{percent}}% of total income this month"
+
+Actual 方案：
+key: "Budget {{percent}}% of total income this month"
+value: "预算本月总收入的 {{percent}}%"
+```
+
+**优势**：
+- 代码可读性强：直接在代码中看到英文原文
+- 缺 key 时用户仍能看到有意义的英文，而不是无意义的 key
+- 翻译人员直接看到完整的上下文句子
+- 避免了维护两套文本（key + 默认值）的不一致问题
+
+**权衡**：
+- 修改英文原文时，所有语言的翻译 key 都会失效，需要重新翻译
+- 长句子作为 key 会增加翻译文件的体积
+
+#### 4.5.2 Key 提取规则
+
+`i18next-parser` 会提取以下模式：
+
+1. **Trans 组件**（最常用）：
+   ```typescript
+   <Trans>Budget {{ percent }}% of total income</Trans>
+   // → Key: "Budget {{percent}}% of total income"
+   ```
+
+2. **t 函数**：
+   ```typescript
+   t('Save changes')
+   // → Key: "Save changes"
+   ```
+
+3. **带插值的 t 函数**：
+   ```typescript
+   t('You selected {{count}} items', { count: 5 })
+   // → Key: "You selected {{count}} items"
+   ```
+
+4. **复数处理**：
+   ```typescript
+   <Trans count={periodAmount}>
+     Budget {{ amount }} every {{ count: periodAmount }} month
+   </Trans>
+   // → 英文会自动处理复数："month" / "months"
+   ```
+
+### 4.6 语言解析与回退策略
+
+**核心文件**：`packages/desktop-client/src/i18n.ts` 中的 `resolveLanguage` 和 `setI18NextLanguage`
+
+#### 4.6.1 语言选择优先级
+
+```typescript
+export const setI18NextLanguage = (language: string | null) => {
+  // 1. 用户设置优先
+  const defaultLanguages = Array.isArray(navigator.languages)
+    ? navigator.languages
+    : [navigator.language || 'en'];
+  const languagesToTry = language ? [language] : defaultLanguages;
+
+  // 2. 逐个尝试解析
+  for (const lang of languagesToTry) {
+    resolved = resolveLanguage(lang);
+    if (resolved) break;
+  }
+
+  // 3. 最终兜底：英文
+  if (!resolved) {
+    resolved = 'en';
+  }
+};
+```
+
+#### 4.6.2 语言解析链（resolveLanguage）
+
+```
+输入语言: "zh-CN"
+    ↓
+1. 精确匹配: 检查是否有 "zh-CN.json"
+    ├─ 有 → 使用 "zh-CN"
+    └─ 无 → 继续
+    ↓
+2. 小写匹配: 尝试 "zh-cn" (如果输入有大写)
+    ├─ 有 → 使用 "zh-cn"
+    └─ 无 → 继续
+    ↓
+3. 基础语言匹配: 尝试 "zh" (去掉 "-" 后的部分)
+    ├─ 有 → 使用 "zh"
+    └─ 无 → 继续
+    ↓
+4. 最终兜底: 返回 undefined → 调用方使用 "en"
+```
+
+**代码实现**：
+```typescript
+const resolveLanguage = (language: string) => {
+  if (language === 'en') return 'en';  // 英文总是可用
+  
+  if (isLanguageAvailable(language)) return language;
+  
+  // 尝试小写
+  const lowercaseLanguage = language.toLowerCase();
+  if (lowercaseLanguage !== language) {
+    return resolveLanguage(lowercaseLanguage);
+  }
+  
+  // 尝试基础语言（如 zh-CN → zh）
+  if (language.includes('-')) {
+    const fallback = language.split('-')[0];
+    return resolveLanguage(fallback);
+  }
+  
+  return undefined;  // 所有尝试都失败
+};
+```
+
+### 4.7 缺 Key 兜底展示路径
+
+#### 4.7.1 运行时缺 Key 处理
+
+由于配置了 `fallbackLng: false`，i18next 的缺 Key 行为如下：
+
+```
+场景：中文翻译文件中缺少某个 key
+    ↓
+1. i18n 查找当前语言（中文）的 key
+    └─ 未找到
+    ↓
+2. 由于 fallbackLng: false，不回退到英文
+    ↓
+3. i18next 默认行为：直接返回 key 本身（即英文原文）
+    ↓
+4. 用户看到：英文原文（而不是空白或错误）
+```
+
+**这是有意的设计决策**：显示英文总比显示一个无意义的 key 或空白要好。
+
+#### 4.7.2 缺 Key 的用户体验路径
+
+以预算自动化文案为例：
+
+```
+Trans 组件: <Trans>Budget {{ percent }}% of total income this month</Trans>
+    ↓
+中文翻译存在 → "本月预算为总收入的 {{percent}}%"
+    ↓
+中文翻译缺失 → "Budget {{ percent }}% of total income this month"
+    ↓
+用户界面：显示英文原文（虽然不是最佳，但仍可理解）
+```
+
+#### 4.7.3 开发时缺 Key 检测
+
+ESLint 自定义规则 `no-untranslated-strings` 确保所有用户可见文本都被包裹：
+
+**核心文件**：`packages/eslint-plugin-actual/lib/rules/no-untranslated-strings.js`
+
+```
+检测规则：
+- 未被 <Trans> 或 t() 包裹的字符串字面量 → 警告
+- JSX 中的纯文本 → 警告
+- aria-label 等无障碍属性中的文本 → 警告
+```
+
+### 4.8 错误提示组件与 i18n 的协作
+
+#### 4.8.1 协作架构图
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                    错误提示层                            │
+├─────────────────────────────────────────────────────────┤
+│  validateAutomation.ts                                   │
+│  └─ 输出: AutomationErrorKind { kind, ...params }        │
+│                           ↓                              │
+│  automationMessages.tsx                                  │
+│  ├─ AutomationErrorTitle(error)                          │
+│  ├─ AutomationErrorShort(error)                          │
+│  └─ AutomationErrorDetail(error)                         │
+│     └─ 每个 kind 对应 <Trans>...</Trans>                 │
+│                           ↓                              │
+│  i18next (运行时翻译)                                    │
+│  └─ 查找到翻译 → 显示译文                                 │
+│     未找到翻译 → 显示英文原文 (key)                       │
+└─────────────────────────────────────────────────────────┘
+```
+
+#### 4.8.2 错误类型与翻译 Key 的映射
+
+**核心文件**：`packages/desktop-client/src/components/budget/goals/automationMessages.tsx`
+
+每个错误 kind 对应三个层级的翻译 Key：
+
+| 错误 kind | Title Key | Short Key | Detail Key |
+|-----------|-----------|-----------|------------|
+| `schedule-not-found` | "Schedule not found" | "No schedule named \"{{name}}\"" | "Pick an existing schedule..." |
+| `percentage-out-of-range` | "Percentage out of range" | "{{percent}}% must be between 0 and 100" | "Set a value greater than 0%..." |
+| `by-target-past` | "Target is in the past" | "{{month}} has already passed" | "Pick a future month..." |
+| ... | ... | ... | ... |
+
+**代码示例**：
+```typescript
+export function AutomationErrorShort({ error }) {
+  const locale = useLocale();
+  switch (error.kind) {
+    case 'schedule-not-found':
+      return error.name ? (
+        // Key: "No schedule named \"{{name}}\""
+        <Trans>No schedule named &ldquo;{{ name: error.name }}&rdquo;</Trans>
+      ) : (
+        // Key: "Pick a schedule"
+        <Trans>Pick a schedule</Trans>
+      );
+    case 'percentage-out-of-range':
+      // Key: "{{percent}}% must be between 0 and 100"
+      return <Trans>{{ percent: error.percent }}% must be between 0 and 100</Trans>;
+    case 'by-target-past':
+      // Key: "{{month}} has already passed"
+      return <Trans>{{ month: formatMonthLabel(error.month, locale) }} has already passed</Trans>;
+    // ... 其他错误类型
+  }
+}
+```
+
+#### 4.8.3 插值变量的传递
+
+错误消息支持动态插值，变量从 `AutomationErrorKind` 透传到 Trans 组件：
+
+```
+错误对象: { kind: 'schedule-not-found', name: 'NonExistent' }
+    ↓
+Trans 组件: <Trans>No schedule named "{{ name }}"</Trans>
+    ↓
+i18n 处理: 
+  - Key: "No schedule named \"{{name}}\""
+  - 插值: { name: 'NonExistent' }
+    ↓
+中文翻译: "未找到名为 \"{{name}}\" 的日程"
+    ↓
+最终输出: "未找到名为 \"NonExistent\" 的日程"
+```
+
+#### 4.8.4 错误提示的视觉渲染链路
+
+```
+validateAutomation() 输出错误
+    ↓
+AutomationListRow 接收到 error prop
+    ├─ 视觉样式：红色边框、红色背景、警告图标
+    └─ 内容渲染：
+        ├─ error 存在 → 渲染 <AutomationErrorShort error={error} />
+        │   └─ 内部 <Trans> 组件 → i18n 翻译
+        └─ error 不存在 → 渲染 <TemplateSentence template={...} />
+            └─ 内部 <Trans> 组件 → i18n 翻译
+```
+
+#### 4.8.5 全局冲突提示的 i18n 协作
+
+`ConflictBanner` 组件展示跨规则冲突：
+
+```typescript
+export function GlobalConflictDetail({ conflict }) {
+  const format = useFormat();
+  switch (conflict.kind) {
+    case 'over-income':
+      // Key: "This month's automations ask for around {{total}} but only {{income}} is available..."
+      return (
+        <Trans>
+          This month&rsquo;s automations ask for around {{ total: format(conflict.total, 'financial') }}
+          but only {{ income: format(conflict.income, 'financial') }} is available to budget...
+        </Trans>
+      );
+    case 'percent-over-100':
+      // Key: "Your percent automations add up to more than 100% and will be capped at 100%."
+      return <Trans>Your percent automations add up to more than 100% and will be capped at 100%.</Trans>;
+  }
+}
+```
+
+### 4.9 预算自动化文案全链路总结
+
+#### 4.9.1 正常文案路径
+
+```
+Template 对象 (type: 'percentage', percent: 10, category: 'Salary')
+    ↓
+PercentageAutomationReadOnly 组件
+    ↓
+<Trans>Budget {{ percent }}% of &lsquo;{{ category }}&rsquo; this month</Trans>
+    ↓
+i18next:
+  - Key: "Budget {{percent}}% of '{{category}}' this month"
+  - 插值: { percent: 10, category: 'Salary' }
+  - 查找当前语言翻译
+    ├─ 找到 → 返回翻译文本
+    └─ 未找到 → 返回 Key 本身 (英文)
+    ↓
+插值替换 → 最终展示给用户
+```
+
+#### 4.9.2 错误文案路径
+
+```
+validateAutomation() → { kind: 'schedule-not-found', name: 'Rent' }
+    ↓
+AutomationErrorShort 组件
+    ↓
+<Trans>No schedule named &ldquo;{{ name }}&rdquo;</Trans>
+    ↓
+i18next:
+  - Key: "No schedule named \"{{name}}\""
+  - 插值: { name: 'Rent' }
+  - 查找翻译 → 显示结果
+    ↓
+用户可见: "未找到名为 \"Rent\" 的日程" (中文) 或 英文原文
+```
+
+#### 4.9.3 关键链路节点
+
+| 节点 | 文件位置 | 职责 |
+|-----|---------|------|
+| i18n 初始化 | `packages/desktop-client/src/i18n.ts` | 配置 i18next，加载语言资源 |
+| 语言资源 | `packages/desktop-client/locale/*.json` | 存储各语言翻译 |
+| Key 提取 | `packages/desktop-client/i18next-parser.config.js` | 从代码中提取翻译 Key |
+| Trans 渲染 | `*ReadOnly.tsx` 组件 | 将模板数据转换为 Trans 组件 |
+| 错误消息 | `automationMessages.tsx` | 将错误类型映射为 Trans 文本 |
+| 视觉渲染 | `AutomationListRow.tsx` | 根据错误状态选择渲染路径 |
+
+---
+
 ## 五、界面渲染层与错误提示层协作
 
 ### 5.1 预算自动化模态框
