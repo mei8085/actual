@@ -810,6 +810,86 @@ export async function syncAccount(
 - **可插拔**：可以更换 sync-server 而不影响本地预算数据（需要重新配置 Provider）
 - **会话管理**：维护与第三方 API 的 access token 生命周期
 
+### 4.4 状态归属速查表
+
+本小节明确区分 sync-server 本地可持久化的状态与需要通过 GoCardless API 查询的远端状态，避免混淆。
+
+#### 4.4.1 Sync-Server 本地状态（可持久化）
+
+| 状态类型 | 存储位置 | 来源 | 生命周期 | 故障表现 | 代码位置 |
+|----------|----------|------|----------|----------|----------|
+| **API 配置密钥** | SQLite `secrets` 表（持久化） + `_cachedSecrets` Map（内存） | 用户配置界面输入 | 永久存储，直到用户重置/更新 | - 所有 GoCardless 功能不可用<br>- `isConfigured()` 返回 `false`<br>- 调用 API 返回 401 | `secrets-service.js:32-43`, `gocardless-service.ts:92-96` |
+| **GoCardless Access Token** | `GoCardlessApi.#token` 私有字段（内存） | 调用 `/token/new/` 或 `/token/refresh/` API 生成 | 约 24 小时（由 `access_expires` 字段控制），进程重启后丢失 | - `setToken()` 自动刷新<br>- 未刷新时调用 API 返回 401<br>- 抛出 `InvalidGoCardlessTokenError` | `gocardless-api.ts:60,81-86,148-168`, `gocardless-service.ts:98-115` |
+| **GoCardless API 客户端** | `clients` Map（内存，按密钥哈希缓存） | 根据 `secrets` 动态创建 | 进程生命周期，进程重启后重建 | 首次调用时自动重建，无明显故障 | `gocardless-service.ts:46-63` |
+| **用户账户** | SQLite `users` 表（持久化） | 用户注册/登录 | 永久存储 | 用户无法登录，无法访问 sync-server | `accounts/` 目录 |
+| **同步文件元数据** | SQLite `files` 表（持久化） | 预算同步时创建 | 永久存储 | 同步功能异常，文件版本混乱 | `app-sync/services/files-service.ts` |
+| **同步消息队列** | SQLite `messages_binary` / `messages_merkles` 表（持久化） | 预算同步时生成 | 永久存储 | 同步失败，数据不一致 | `sql/messages.sql`, `sync-simple.js` |
+
+#### 4.4.2 GoCardless 远端状态（需 API 查询）
+
+| 状态类型 | 查询 API | 来源 | 生命周期 | 故障表现 | 代码位置 |
+|----------|----------|------|----------|----------|----------|
+| **Requisition 状态** | `GET /requisitions/{id}/` | GoCardless API | CR → ID → LN/RJ/ER → EX（生命周期由 GoCardless 管理） | - 轮询时返回 `requisitionStatus` 非 LN<br>- 抛出 `RequisitionNotLinked`<br>- 账户无法链接 | `gocardless-api.ts:219-223`, `gocardless-service.ts:117-131` |
+| **Requisition 关联账户** | `GET /requisitions/{id}/` → `accounts` 字段 | GoCardless API | 与 Requisition 同生命周期 | - `getRequisitionWithAccounts()` 返回空账户列表<br>- 账户选择模态框无数据 | `gocardless-service.ts:133-171` |
+| **账户详细信息** | `GET /accounts/{id}/` | GoCardless API | 与 Requisition 同生命周期 | 账户名称、掩码等信息缺失或过时 | `gocardless-service.ts:197-222` |
+| **账户余额** | `GET /accounts/{id}/balances/` | GoCardless API | 实时数据，每次同步重新获取 | 余额显示不准确，账户对账失败 | `gocardless-service.ts:224-260` |
+| **交易记录** | `GET /accounts/{id}/transactions/` | GoCardless API | 历史数据永久，新交易持续产生 | 同步失败，交易缺失或重复 | `gocardless-service.ts:262-335` |
+| **机构（银行）列表** | `GET /institutions/` | GoCardless API | 相对稳定，可能增减 | 银行选择下拉框为空或数据过时 | `gocardless-service.ts:337-373` |
+| **机构（银行）详情** | `GET /institutions/{id}/` | GoCardless API | 相对稳定 | 银行 Logo、名称等信息缺失 | `gocardless-service.ts:375-390` |
+
+#### 4.4.3 Requisition 状态流转说明
+
+GoCardless Requisition 的状态流转（`RequisitionStatus` 枚举）：
+
+| 状态码 | 含义 | 说明 |
+|--------|------|------|
+| `CR` | CREATED | Requisition 已创建，等待用户授权 |
+| `ID` | IDENTIFIED | 用户已通过身份验证 |
+| `LN` | LINKED | 账户已成功链接，可获取数据 |
+| `RJ` | REJECTED | 用户拒绝了授权请求 |
+| `ER` | ERROR | 授权过程中发生错误 |
+| `SU` | SUSPENDED | 授权被暂停（通常是由于 SCA 超时） |
+| `EX` | EXPIRED | Requisition 已过期（超过 `access_valid_for_days`） |
+| `GC` | GIVING_CONSENT | 用户正在给予同意 |
+| `UA` | UNDERGOING_AUTHENTICATION | 用户正在进行身份验证 |
+| `GA` | GRANTING_ACCESS | 正在授予访问权限 |
+| `SA` | SELECTING_ACCOUNTS | 用户正在选择账户 |
+
+> **关键点**：只有状态为 `LN` (LINKED) 的 Requisition 才能正常获取账户和交易数据。轮询时如果状态不是 `LN`，会抛出 `RequisitionNotLinked` 异常并将当前状态返回给前端。
+
+#### 4.4.4 边界划分总结
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                  Sync-Server 本地                            │
+│  ┌───────────────────────────────────────────────────────┐  │
+│  │  ✅ 完全可控                                          │  │
+│  │  ─────────────────                                    │  │
+│  │  • secrets (API 密钥)                                 │  │
+│  │  • users (用户账户)                                   │  │
+│  │  • files/messages (同步数据)                          │  │
+│  │  • Access Token (内存缓存，可自动刷新)                 │  │
+│  │  • API 客户端 (内存缓存)                              │  │
+│  └───────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                        HTTP API 调用
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│                GoCardless 远端（第三方）                     │
+│  ┌───────────────────────────────────────────────────────┐  │
+│  │  ❌ 只读，不可控                                      │  │
+│  │  ─────────────────                                    │  │
+│  │  • Requisition 状态                                   │  │
+│  │  • 账户列表与详情                                     │  │
+│  │  • 账户余额                                           │  │
+│  │  • 交易记录                                           │  │
+│  │  • 机构列表                                           │  │
+│  └───────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────┘
+```
+
 ---
 
 ## 五、数据模型
