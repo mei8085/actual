@@ -819,7 +819,7 @@ export async function syncAccount(
 | 状态类型 | 存储位置 | 来源 | 生命周期 | 故障表现 | 代码位置 |
 |----------|----------|------|----------|----------|----------|
 | **API 配置密钥** | SQLite `secrets` 表（持久化） + `_cachedSecrets` Map（内存） | 用户配置界面输入 | 永久存储，直到用户重置/更新 | - 所有 GoCardless 功能不可用<br>- `isConfigured()` 返回 `false`<br>- 调用 API 返回 401 | `secrets-service.js:32-43`, `gocardless-service.ts:92-96` |
-| **GoCardless Access Token** | `GoCardlessApi.#token` 私有字段（内存） | 调用 `/token/new/` 或 `/token/refresh/` API 生成 | 约 24 小时（由 `access_expires` 字段控制），进程重启后丢失 | - `setToken()` 自动刷新<br>- 未刷新时调用 API 返回 401<br>- 抛出 `InvalidGoCardlessTokenError` | `gocardless-api.ts:60,81-86,148-168`, `gocardless-service.ts:98-115` |
+| **GoCardless Access Token** | `GoCardlessApi.#token` 私有字段（内存） | 调用 `/token/new/` 生成，通过解析 JWT `exp` 字段判断过期 | 约 24 小时（由 JWT `exp` 声明控制），进程重启后丢失 | - `setToken()` 自动检查 JWT 过期并刷新<br>- 未刷新时调用 API 返回 401<br>- 抛出 `InvalidGoCardlessTokenError` | `gocardless-api.ts:60,81-86,147-157`, `gocardless-service.ts:98-115` |
 | **GoCardless API 客户端** | `clients` Map（内存，按密钥哈希缓存） | 根据 `secrets` 动态创建 | 进程生命周期，进程重启后重建 | 首次调用时自动重建，无明显故障 | `gocardless-service.ts:46-63` |
 | **用户账户** | SQLite `users` 表（持久化） | 用户注册/登录 | 永久存储 | 用户无法登录，无法访问 sync-server | `accounts/` 目录 |
 | **同步文件元数据** | SQLite `files` 表（持久化） | 预算同步时创建 | 永久存储 | 同步功能异常，文件版本混乱 | `app-sync/services/files-service.ts` |
@@ -1013,6 +1013,8 @@ Actual Budget 的银行连接架构采用了清晰的分层设计：
 
 多渠道并存时，通过 `account_sync_source` 字段实现逻辑隔离，通过 sync-server 的独立子应用实现物理隔离，确保架构清晰且易于维护。
 
+**特别提醒**：开发和运维时需严格区分本地可控状态与远端只读状态，避免对 GoCardless 远端状态做任何缓存假设。所有授权状态、账户可用性必须通过实时 API 查询确认。
+
 ---
 
 ## 纠偏记录
@@ -1021,3 +1023,4 @@ Actual Budget 的银行连接架构采用了清晰的分层设计：
 |--------|--------|------|
 | 凭据加密存储 | 凭据明文存储 | `secrets-service.js:38-40` 直接 INSERT 明文，无加密逻辑 |
 | sync-server 是无状态的 | sync-server 是有状态的 | 持久化 secrets、users、files 等表，并有内存缓存 |
+| （新增）状态归属不明确 | 新增"状态归属速查表"小节 | 区分本地可控状态（secrets、token、users 等）与远端只读状态（requisition、account、balance 等） |
