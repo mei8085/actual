@@ -621,109 +621,58 @@ value: "预算本月总收入的 {{percent}}%"
 
 #### 4.6.0 setI18NextLanguage 触发链路（完整）
 
-`setI18NextLanguage` 有 **5 个直接/间接触发入口**，覆盖应用生命周期的各个阶段：
+> **重要修正**：`loadPrefs()` 和 `loadGlobalPrefs()` 是两个不同的 thunk。
+> - `loadPrefs()` 会在内部调用 `setI18NextLanguage()` (prefsSlice.ts:66)
+> - `loadGlobalPrefs()` **不会**调用 `setI18NextLanguage()`
+> - App.tsx 中调用的是 `loadGlobalPrefs()`，不是 `loadPrefs()`
 
-| 触发场景 | 代码位置 | 调用时机 | 参数 | 直接/间接 |
-|---------|---------|---------|------|----------|
-| **应用启动初始化** | `App.tsx:58` | 组件挂载时 | `null`（使用系统默认） | 直接 |
-| **偏好加载（主）** | `prefsSlice.ts:66` | `loadPrefs` 完成后 | `globalPrefs.language ?? ''` | 直接 |
-| **同步事件触发** | `sync-events.ts:64` | `prefs` 表远程同步变化时 | 间接调用 `loadPrefs()` | 间接 |
-| **预算加载/导入后** | `global-events.ts:150,160` | 预算加载/导入完成时 | 间接调用 `loadPrefs()` | 间接 |
-| **设置页手动切换** | `LanguageSettings.tsx:52` | 用户手动选择语言时 | 用户选择的语言代码 | 直接 |
+`setI18NextLanguage` 的调用分为 **直接调用** 和 **间接通过 loadPrefs 调用** 两大类：
 
 ---
 
-**链路 1：应用启动初始化**（最优先）
+##### 第一类：直接调用 setI18NextLanguage（共 2 个入口）
+
+| 触发场景 | 代码位置 | 调用时机 | 参数 |
+|---------|---------|---------|------|
+| **应用启动初始化** | `App.tsx:58` | 组件挂载时 | `null`（使用系统默认） |
+| **设置页手动切换** | `LanguageSettings.tsx:52` | 用户手动选择语言时 | 用户选择的语言代码 |
+
+---
+
+##### 第二类：间接通过 loadPrefs 调用（共 9 个入口）
+
+所有调用 `dispatch(loadPrefs())` 的地方都会间接触发语言更新：
+
+| 触发场景 | 代码位置 | 调用时机 |
+|---------|---------|---------|
+| **远程偏好同步** | `sync-events.ts:64` | 收到 `prefs` 表远程变化时 |
+| **上传预算后** | `sync-events.ts:222` | 预算文件上传服务器后 |
+| **预算加载完成** | `global-events.ts:150` | 预算文件加载完成 (`finish-load`) |
+| **交易导入完成** | `global-events.ts:160` | 交易数据导入完成 (`finish-import`) |
+| **偏好更新事件** | `settings/index.tsx:183` | 收到 `prefs-updated` 事件时 |
+| **设置页挂载** | `settings/index.tsx:186` | 设置页面组件挂载时 |
+| **删除预算后** | `budgetfilesSlice.ts:91` | 删除预算文件后 |
+| **下载预算后** | `budgetfilesSlice.ts:166` | 从服务器下载预算后 |
+| **文件导入后** | `budgetfilesSlice.ts:252` | 从本地文件导入预算后 |
+
+---
+
+**直接调用链路 1：应用启动初始化**
 
 ```typescript
-// App.tsx:49-59
-function AppInner() {
-  // ...
-  useEffect(() => {
-    setI18NextLanguage(null);  // 传入 null → 使用 navigator.languages
-  }, []);  // 空依赖数组，只在挂载时执行一次
-  // ...
-}
+// App.tsx:57-59
+useEffect(() => {
+  setI18NextLanguage(null);  // 传入 null → 使用 navigator.languages
+}, []);  // 空依赖数组，只在挂载时执行一次
 ```
 
 - **时机**：React 组件挂载时（应用启动第一帧）
 - **行为**：不传入语言参数，自动检测浏览器语言
-- **优先级**：最先执行，但会被后续偏好加载覆盖
+- **注意**：这是应用启动时唯一的语言初始化，App.tsx 调用的是 `loadGlobalPrefs()` (第91行)，**不会**再次触发语言更新
 
 ---
 
-**链路 2：偏好加载后应用**（最权威）
-
-```typescript
-// prefsSlice.ts:37-70
-export const loadPrefs = createAppAsyncThunk(
-  `${sliceName}/loadPrefs`,
-  async (_, { dispatch, getState }) => {
-    // 1. 加载本地偏好
-    const prefs = await send('load-prefs');
-    
-    // 2. 加载全局偏好（包含语言设置）
-    const [globalPrefs, syncedPrefs] = await Promise.all([
-      send('load-global-prefs'),
-      send('preferences/get'),
-    ]);
-    
-    // 3. 应用语言设置（必须在渲染前）
-    setI18NextLanguage(globalPrefs.language ?? '');
-    
-    return prefs;
-  },
-);
-```
-
-- **时机**：从本地存储加载全局偏好设置后
-- **行为**：使用用户之前保存的语言偏好，优先级高于浏览器默认
-- **设计意图**：确保用户偏好优先于系统默认
-
----
-
-**链路 3：同步事件触发（远程偏好变化）**
-
-```typescript
-// sync-events.ts:63-64
-if (tables.includes('prefs')) {
-  void store.dispatch(loadPrefs());  // 重新加载偏好 → 触发语言切换
-}
-```
-
-- **触发条件**：多设备同步时，远程设备修改了偏好设置
-- **行为**：自动重新加载偏好并应用新的语言设置
-- **用户体验**：无需刷新页面，语言自动切换
-
----
-
-**链路 4：预算加载/导入完成后**
-
-```typescript
-// global-events.ts:147-150
-const unlistenFinishLoad = listen('finish-load', () => {
-  store.dispatch(closeModal());
-  store.dispatch(setAppState({ loadingText: null }));
-  void store.dispatch(loadPrefs());  // 重新加载偏好 → 触发语言切换
-});
-
-// global-events.ts:157-160
-const unlistenFinishImport = listen('finish-import', () => {
-  store.dispatch(closeModal());
-  store.dispatch(setAppState({ loadingText: null }));
-  void store.dispatch(loadPrefs());  // 重新加载偏好 → 触发语言切换
-});
-```
-
-- **触发条件**：
-  - 预算文件加载完成
-  - 交易数据导入完成
-- **行为**：刷新偏好设置（可能包含新的语言设置）
-- **设计意图**：确保预算加载后所有偏好都是最新的
-
----
-
-**链路 5：设置页手动切换**（用户主动）
+**直接调用链路 2：设置页手动切换**（用户主动）
 
 ```typescript
 // LanguageSettings.tsx:50-53
@@ -741,23 +690,91 @@ onChange={value => {
 
 ---
 
-**触发时序图**：
+**间接调用：loadPrefs 内部实现**（所有间接触发的公共路径）
+
+```typescript
+// prefsSlice.ts:37-70
+export const loadPrefs = createAppAsyncThunk(
+  `${sliceName}/loadPrefs`,
+  async (_, { dispatch, getState }) => {
+    // 1. 加载本地偏好
+    const prefs = await send('load-prefs');
+    
+    // 2. 加载全局偏好（包含语言设置）
+    const [globalPrefs, syncedPrefs] = await Promise.all([
+      send('load-global-prefs'),
+      send('preferences/get'),
+    ]);
+    
+    // 3. 应用语言设置
+    setI18NextLanguage(globalPrefs.language ?? '');
+    
+    return prefs;
+  },
+);
+```
+
+- **时机**：每次调用 `dispatch(loadPrefs())` 时
+- **行为**：从存储中读取最新的全局偏好，应用其中的语言设置
+- **设计意图**：确保偏好变化后语言设置同步更新
+
+---
+
+**间接调用链路示例 1：远程偏好同步**
+
+```typescript
+// sync-events.ts:63-64
+if (tables.includes('prefs')) {
+  void store.dispatch(loadPrefs());  // 触发语言更新
+}
+```
+
+- **触发条件**：多设备同步时，远程设备修改了偏好设置
+- **用户体验**：无需刷新页面，语言自动切换
+
+---
+
+**间接调用链路示例 2：预算加载完成**
+
+```typescript
+// global-events.ts:147-150
+const unlistenFinishLoad = listen('finish-load', () => {
+  store.dispatch(closeModal());
+  store.dispatch(setAppState({ loadingText: null }));
+  void store.dispatch(loadPrefs());  // 触发语言更新
+});
+```
+
+- **触发条件**：预算文件加载完成
+- **设计意图**：确保预算加载后所有偏好（包括语言）都是最新的
+
+---
+
+**触发时序图（修正版）**：
 
 ```
 应用启动
     ↓
-[App.tsx] useEffect → setI18NextLanguage(null) → 浏览器语言
+[App.tsx:58] useEffect → setI18NextLanguage(null) → 浏览器语言
     ↓
-[App.tsx] init() → dispatch(loadPrefs())
+[App.tsx:91] dispatch(loadGlobalPrefs()) → 只加载偏好，不触发语言更新
     ↓
-[prefsSlice.ts] loadPrefs → setI18NextLanguage(globalPrefs.language)
+应用渲染 → 用户看到浏览器默认语言的界面
+    ↓
+（首次加载预算或其他触发 loadPrefs 的场景）
+    ↓
+[... 各种入口 ...] → dispatch(loadPrefs())
+    ↓
+[prefsSlice.ts:66] loadPrefs → setI18NextLanguage(globalPrefs.language)
     ↓ （如果用户有保存的语言偏好，覆盖浏览器语言）
-应用渲染 → 用户看到正确语言的界面
+用户看到偏好语言的界面
     ↓
 （运行中）
     ├─ [LanguageSettings.tsx] 用户切换 → setI18NextLanguage(value)
     ├─ [sync-events.ts] 远程偏好变化 → loadPrefs() → 重新应用
-    └─ [global-events.ts] 预算加载/导入 → loadPrefs() → 重新应用
+    ├─ [global-events.ts] 预算加载/导入 → loadPrefs() → 重新应用
+    ├─ [settings/index.tsx] 设置页挂载 → loadPrefs() → 重新应用
+    └─ [budgetfilesSlice.ts] 预算文件操作 → loadPrefs() → 重新应用
 ```
 
 #### 4.6.1 语言选择优先级
@@ -1326,3 +1343,156 @@ GitHub: actualbudget/translations （独立仓库）
 | | `packages/desktop-client/src/components/budget/goals/constants.ts` | 显示类型映射 |
 | **工具链** | `packages/eslint-plugin-actual/lib/rules/no-untranslated-strings.js` | 未翻译字符串检测 |
 | | `packages/eslint-plugin-actual/lib/rules/prefer-trans-over-t.js` | Trans 组件优先规则 |
+
+---
+
+## 十、从切语言到最终文案：时序闭环总结
+
+### 10.1 用户切换语言的完整时序链
+
+**场景**：用户在设置页面从英文切换到中文
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                      用户点击语言选择器                               │
+│           LanguageSettings.tsx:50-53 (onChange)                      │
+└────────────────────────────────┬────────────────────────────────────┘
+                                 │
+                                 ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  1. 保存偏好                                                        │
+│     setLanguage(value) → useGlobalPref hook                         │
+│     → 写入 localStorage 或 IndexedDB                                │
+└────────────────────────────────┬────────────────────────────────────┘
+                                 │
+                                 ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  2. 触发语言切换                                                    │
+│     setI18NextLanguage('zh') → i18n.ts                              │
+└────────────────────────────────┬────────────────────────────────────┘
+                                 │
+                                 ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  3. 语言解析与回退                                                  │
+│     resolveLanguage('zh')                                           │
+│     ├─ 精确匹配: 检查 zh.json 是否存在                               │
+│     ├─ 存在 → 返回 'zh'                                             │
+│     └─ 不存在 → 回退到 'en'                                         │
+└────────────────────────────────┬────────────────────────────────────┘
+                                 │
+                                 ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  4. 加载语言资源                                                    │
+│     i18next.changeLanguage('zh')                                    │
+│     → 触发 i18next-resources-to-backend                             │
+│     → 调用 loadLanguage('zh')                                       │
+│     → 懒加载 /locale/zh.json（打包为独立 chunk）                     │
+└────────────────────────────────┬────────────────────────────────────┘
+                                 │
+                                 ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  5. React 重渲染（i18next 触发）                                    │
+│     react-i18next 检测到语言变化                                    │
+│     → 所有使用 useTranslation() 的组件重新渲染                      │
+│     → 所有 <Trans> 组件重新翻译                                     │
+└────────────────────────────────┬────────────────────────────────────┘
+                                 │
+                                 ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  6. 预算自动化文案更新                                              │
+│     ├─ BudgetAutomationsModal 重新渲染                               │
+│     │  ├─ AutomationListRow 重新渲染                                 │
+│     │  └─ TemplateSentence → *ReadOnly 组件                          │
+│     │     └─ <Trans> 组件查找 'zh' 翻译                              │
+│     │        ├─ 找到翻译 → 显示中文                                    │
+│     │        └─ 未找到 → 显示英文原文（key）                          │
+│     │
+│     └─ 错误提示更新（如果有错误）                                     │
+│        └─ automationMessages.tsx → <Trans> 组件                       │
+└────────────────────────────────┬────────────────────────────────────┘
+                                 │
+                                 ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  7. 用户看到更新后的界面                                             │
+│     预算自动化文案从 "Budget 10% of total income"                    │
+│     变为 "本月预算为总收入的 10%"（如果有翻译）                        │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### 10.2 预算自动化文案翻译的微观路径
+
+以百分比预算为例，从 Template 对象到用户可见文本的完整链路：
+
+```
+Template 对象 { type: 'percentage', percent: 10, category: 'all income' }
+    ↓
+PercentageAutomationReadOnly.tsx
+    ↓
+<Trans>Budget {{ percent }}% of total income this month</Trans>
+    ↓
+react-i18next <Trans> 组件处理
+    ├─ 提取 key: "Budget {{percent}}% of total income this month"
+    ├─ 提取插值变量: { percent: 10 }
+    ↓
+i18next t() 函数
+    ├─ 查找当前语言（zh）的翻译资源
+    │  ├─ 找到: "本月预算为总收入的 {{percent}}%"
+    │  └─ 未找到: 返回 key 本身（英文）
+    ↓
+插值替换
+    ├─ 找到翻译: "本月预算为总收入的 10%"
+    └─ 未找到翻译: "Budget 10% of total income this month"
+    ↓
+React 渲染 → 用户可见
+```
+
+### 10.3 错误场景下的翻译路径
+
+以日程不存在错误为例：
+
+```
+validateAutomation() → { kind: 'schedule-not-found', name: 'Rent' }
+    ↓
+AutomationListRow.tsx 接收到 error prop
+    ↓
+渲染 <AutomationErrorShort error={error} />
+    ↓
+automationMessages.tsx 中的 switch case
+    ↓
+case 'schedule-not-found':
+    return <Trans>No schedule named &ldquo;{{ name }}&rdquo;</Trans>
+    ↓
+<Trans> 组件处理
+    ├─ key: "No schedule named \"{{name}}\""
+    ├─ 插值: { name: 'Rent' }
+    ↓
+i18next 查找翻译
+    ├─ 找到中文: "未找到名为 \"{{name}}\" 的日程"
+    └─ 未找到: 返回 key 本身
+    ↓
+插值替换后展示给用户
+    ↓
+视觉样式：红色边框 + 红色背景（由 AutomationListRow 控制）
+```
+
+### 10.4 各场景下的最终文案结果汇总
+
+| 场景 | 条件 | 预算自动化文案结果 | 错误提示文案结果 |
+|-----|------|-------------------|-----------------|
+| **正常有翻译** | 当前语言有完整翻译 | 显示翻译后的中文句子 | 显示翻译后的中文错误 |
+| **缺翻译 Key** | 某个句子未翻译 | 显示英文原文（key） | 显示英文原文（key） |
+| **无语言资源** | 构建时未拉取翻译 | 全部显示英文 | 全部显示英文 |
+| **语言不支持** | 用户选择的语言无文件 | 回退到英文 | 回退到英文 |
+| **Playwright 测试** | 测试环境 | 全部显示英文 | 全部显示英文 |
+
+### 10.5 闭环验证点
+
+1. **触发完整性**：5 个触发入口覆盖了应用生命周期的所有关键节点
+2. **兜底完整性**：4 层兜底机制确保任何情况下都有可见文案
+3. **实时性**：语言切换后所有组件立即重渲染，无需刷新
+4. **一致性**：预算自动化文案和错误提示使用相同的 i18n 链路
+5. **可追溯性**：所有翻译 key 直接对应源代码中的英文文本，可快速定位
+
+---
+
+**总结**：i18n 链路设计遵循"英文优先、多层兜底、实时响应"的原则，确保在任何异常情况下用户都能看到有意义的文案，而不是空白或无意义的 key。预算自动化文案作为普通的 `<Trans>` 组件内容，完全复用这套 i18n 基础设施，无需特殊处理。
