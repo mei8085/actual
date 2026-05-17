@@ -707,11 +707,29 @@ if (fileAccessError) {
 
 #### 6.4.1 禁用用户（enabled = 0）
 
-| 维度 | 服务端可见性 | 客户端本地残留 | 同步能力 |
-|-----|------------|---------------|---------|
-| **新登录** | ❌ OpenID 登录时检查 `enabled = 1` | 无 | ❌ |
-| **现有会话** | ⚠️ `validateSession` 不检查 `enabled`，现有 Token 继续有效 | ✅ 正常使用 | ✅ 直到 Token 过期 |
-| **本地数据** | 无 | ✅ 完整可读 | ✅ 直到 Token 过期 |
+**按请求链路的实际行为分析**：
+
+| 操作 | 验证阶段 | 实际结果 | HTTP 状态 |
+|-----|---------|---------|----------|
+| **`validateSession` 中间件** | 检查 sessions 表 | ✅ Token 仍存在且未过期 → 通过 | - |
+| **`GET /account/validate`** | 1. validateSession<br>2. getUserInfo(user_id) | ✅ 用户存在但不检查 `enabled` 字段 | 200 |
+| **`GET /sync/list-user-files`** | 1. validateSession<br>2. isAdmin(userId) → 正常检查<br>3. UNION 查询（所有权 + user_access） | ✅ 返回该用户所有文件（所有权 + 授权） | 200 |
+| **`POST /sync/sync`（自己的文件）** | 1. validateSession<br>2. requireFileAccess() → isOwner = true | ✅ 正常同步 | 200 |
+| **`POST /sync/sync`（他人文件）** | 1. validateSession<br>2. requireFileAccess() | ❌ 无所有权、非管理员、无授权 | 403 |
+| **`GET /sync/download-user-file`（自己的文件）** | 1. validateSession<br>2. requireFileAccess() → isOwner = true | ✅ 正常下载 | 200 |
+| **`GET /sync/download-user-file`（他人文件）** | 1. validateSession<br>2. requireFileAccess() | ❌ 无所有权、非管理员、无授权 | 403 |
+| **`POST /admin/*`** | 1. validateSession<br>2. isAdmin(userId) | ❌ 非管理员或角色已变 | 403 |
+
+**各维度详细分析**：
+
+| 维度 | 服务端行为 | 客户端表现 | 备注 |
+|-----|----------|-----------|------|
+| **会话有效性** | ✅ sessions 表记录保留 | ✅ 会话中间件通过 | Token 未过期则一直有效 |
+| **身份验证** | ✅ `/validate` 返回正常用户信息 | ✅ 正常显示登录状态 | 不检查 `enabled` 字段 |
+| **文件列表** | ✅ 返回所有可见文件 | ✅ 正常显示所有文件 | 权限检查正常进行 |
+| **同步操作** | ✅ 自己的文件正常同步 | ✅ 正常同步 | 与正常用户无区别 |
+| **下载操作** | ✅ 自己的文件正常下载 | ✅ 正常下载 | 与正常用户无区别 |
+| **本地数据** | 无控制 | ✅ 完整可读 | 本地 SQLite 不受影响 |
 
 **设计缺陷**：禁用用户不会立即使其会话失效
 
@@ -766,7 +784,21 @@ ids.forEach(item => {
 | **文件列表** | ✅ 返回空列表 | ⚠️ 看不到任何文件 | 所有权已转移 + 授权已清除 |
 | **同步操作** | ❌ 全部 403 拒绝 | ⚠️ 同步失败提示 | 无法拉取新变更 |
 | **下载操作** | ❌ 全部 403 拒绝 | ⚠️ 下载失败提示 | 无法下载新文件 |
+| **写入操作（新文件）** | ✅ 允许创建！文件归属已删除用户 | ⚠️ 可上传新预算文件 | 存在"孤儿文件"风险 |
+| **写入操作（覆盖）** | ❌ 全部 403 拒绝 | ⚠️ 上传失败提示 | 无法覆盖现有文件 |
 | **本地数据** | 无控制 | ✅ 所有已同步预算完整可读 | 本地 SQLite 不受影响 |
+
+#### 6.4.3 禁用用户的写入面分析
+
+**禁用用户（enabled = 0）的上传行为**：
+
+| 操作 | 验证阶段 | 实际结果 | HTTP 状态 |
+|-----|---------|---------|----------|
+| **`POST /sync/upload-user-file`（新文件）** | 1. validateSession<br>2. currentFile 不存在 → 跳过权限检查<br>3. 写入文件并创建记录 | ✅ 可创建新文件！owner = 已禁用用户ID | 200 |
+| **`POST /sync/upload-user-file`（覆盖自己的文件）** | 1. validateSession<br>2. requireFileAccess() → isOwner = true | ✅ 允许覆盖 | 200 |
+| **`POST /sync/upload-user-file`（覆盖他人文件）** | 1. validateSession<br>2. requireFileAccess() | ❌ 无所有权、非管理员、无授权 | 403 |
+
+**关键发现**：禁用用户的会话完全有效，可以正常读写自己所有的文件，包括创建新文件。
 
 ### 6.5 删除用户后的请求链路时序
 
