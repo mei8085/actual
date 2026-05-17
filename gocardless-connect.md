@@ -857,6 +857,74 @@ GoCardless Requisition 的状态流转（`RequisitionStatus` 枚举）：
 
 > **关键点**：只有状态为 `LN` (LINKED) 的 Requisition 才能正常获取账户和交易数据。轮询时如果状态不是 `LN`，会抛出 `RequisitionNotLinked` 异常并将当前状态返回给前端。
 
+#### 4.4.3.1 GoCardless Access Token 时效机制实现详解
+
+GoCardless API 返回的 token 响应包含 4 个字段，但代码实现的实际依赖与字段定义存在差异：
+
+```typescript
+// TokenResponse 类型定义（gocardless-api.ts:19-24）
+export type TokenResponse = {
+  access: string;           // JWT access token
+  refresh: string;          // Refresh token（实现中未使用）
+  access_expires: number;   // Access token 过期时间（秒，实现中未使用）
+  refresh_expires: number;  // Refresh token 过期时间（秒，实现中未使用）
+};
+```
+
+**实际实现逻辑**（`gocardless-service.ts:98-115`）：
+
+```typescript
+setToken: async (): Promise<void> => {
+  const isExpiredJwtToken = (token: string | null): boolean => {
+    if (!token) return true;
+    try {
+      // 解析 JWT payload，提取 exp 声明
+      const payload = JSON.parse(
+        Buffer.from(token.split('.')[1], 'base64url').toString(),
+      );
+      const clockTimestamp = Math.floor(Date.now() / 1000);
+      // 直接比较当前时间戳与 JWT exp 声明
+      return clockTimestamp >= payload.exp;
+    } catch {
+      return true;  // 解析失败视为过期
+    }
+  };
+
+  if (isExpiredJwtToken(getGocardlessClient().token)) {
+    // 过期则调用 generateToken() 获取新 token
+    // 注意：使用的是 /token/new/ 而非 /token/refresh/
+    await client.generateToken().catch(handleGoCardlessError);
+  }
+},
+```
+
+**关键实现要点**：
+
+1. **过期判定基于 JWT exp 声明**：代码不依赖 `access_expires` 字段，而是直接解析 JWT payload 中的 `exp` 声明进行过期判定。这是更可靠的方式，因为 JWT 本身包含过期信息。
+
+2. **刷新机制不使用 refresh token**：代码定义了 `exchangeToken()` 方法（使用 `/token/refresh/`），但实际从未调用。过期时直接调用 `generateToken()`（使用 `/token/new/`）重新获取全新 token。
+
+3. **`access_expires` 和 `refresh_expires` 字段存在但未使用**：这两个字段在类型定义中存在，但在实际过期判定逻辑中完全未被引用。开发者不应假设代码会使用这些字段。
+
+4. **无主动刷新机制**：仅在调用 GoCardless API 前通过 `setToken()` 被动检查，没有后台定时刷新任务。
+
+**调用时机**：
+- `get-banks` 接口调用前：`app-gocardless.js:124`
+- `get-accounts` 接口内部（通过 `getRequisitionWithAccounts`）：隐式调用
+- `get-transactions` 接口内部：隐式调用
+
+##### 字段存在但实现未直接依赖的说明
+
+`TokenResponse` 类型中虽然定义了 `access_expires` 和 `refresh_expires` 两个字段，但当前实现有以下特点：
+
+- **不作为过期判断条件**：本地过期判断完全通过解析 JWT token 本身的 `exp` 声明完成，不依赖这两个字段的值。`setToken()` 方法中的 `isExpiredJwtToken()` 函数直接从 token 字符串中提取过期时间。
+
+- **仅用于响应载荷定义**：这两个字段保留在类型定义中主要是为了与 GoCardless API 的响应结构保持一致，方便未来可能的使用，但目前没有任何业务逻辑读取它们。
+
+- **潜在维护风险**：如果未来需要修改过期判断逻辑，开发者需要注意：现有实现不依赖这两个字段，不能假设它们会被自动使用。
+
+- **refresh token 同理**：`refresh` 字段和对应的 `exchangeToken()` 方法同样存在于代码中，但从未被调用。当前策略是过期后直接申请新 token，而非使用 refresh token 续期。
+
 #### 4.4.4 边界划分总结
 
 ```
@@ -1023,4 +1091,6 @@ Actual Budget 的银行连接架构采用了清晰的分层设计：
 |--------|--------|------|
 | 凭据加密存储 | 凭据明文存储 | `secrets-service.js:38-40` 直接 INSERT 明文，无加密逻辑 |
 | sync-server 是无状态的 | sync-server 是有状态的 | 持久化 secrets、users、files 等表，并有内存缓存 |
-| （新增）状态归属不明确 | 新增"状态归属速查表"小节 | 区分本地可控状态（secrets、token、users 等）与远端只读状态（requisition、account、balance 等） |
+| （新增）状态归属不明确 | 新增"状态归属速查表"小节 | 区分本地可控状态与远端只读状态 |
+| Access Token 生命周期由 `access_expires` 字段控制 | Access Token 过期判定基于 JWT `exp` 声明解析 | `gocardless-service.ts:98-115` 的 `isExpiredJwtToken` 函数直接解析 JWT payload |
+| （新增）字段与实现差异 | 补充说明 `access_expires`、`refresh_expires` 字段存在但未使用，`exchangeToken()` 定义但未调用 | `gocardless-api.ts:19-24,147-170` 类型定义与实际调用路径对比 |
