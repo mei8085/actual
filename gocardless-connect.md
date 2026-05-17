@@ -2,7 +2,7 @@
 
 ## 概述
 
-Actual Budget 支持多种银行同步渠道（GoCardless、SimpleFIN、Pluggy.ai、Enable Banking），采用统一的架构模式进行管理。本文档详细梳理从用户发起绑定到写入本地预算的完整流程，重点说明多渠道并存时的职责划分。
+Actual Budget 支持多种银行同步渠道（GoCardless、SimpleFIN、Pluggy.ai、Enable Banking），采用统一的架构模式进行管理。本文档详细梳理从用户发起绑定到写入本地预算的完整流程，重点说明界面驱动逻辑、数据传递路径、与同步服务的边界划分，以及多渠道并存时的职责划分。
 
 ---
 
@@ -41,6 +41,8 @@ Actual Budget 支持多种银行同步渠道（GoCardless、SimpleFIN、Pluggy.a
 │  │  Provider 子应用: app-gocardless、app-simplefin 等    │  │
 │  ├───────────────────────────────────────────────────────┤  │
 │  │  凭据服务: secrets-service (存储 API 密钥)            │  │
+│  ├───────────────────────────────────────────────────────┤  │
+│  │  会话管理: access token 缓存、requisition 状态        │  │
 │  ├───────────────────────────────────────────────────────┤  │
 │  │  外部 API: GoCardless Bank Account Data API           │  │
 │  └───────────────────────────────────────────────────────┘  │
@@ -108,7 +110,13 @@ Actual Budget 支持多种银行同步渠道（GoCardless、SimpleFIN、Pluggy.a
         │
         ▼
 ┌─────────────────────────┐
-│ 轮询授权结果            │
+│ 银行回调 sync-server    │
+│ /gocardless/link        │
+└─────────────────────────┘
+        │
+        ▼
+┌─────────────────────────┐
+│ 前端轮询授权结果        │
 │ gocardless-poll-web-token │
 └─────────────────────────┘
         │
@@ -162,9 +170,15 @@ type BuiltInBankSyncProviderState = {
 };
 ```
 
+**界面驱动逻辑**：
+- `useBuiltInBankSyncProviders` hook 在组件挂载时自动加载所有 Provider 的配置状态
+- 每个 Provider 通过 `isConfigured` 字段显示"已配置"或"未配置"状态
+- 用户点击"配置"按钮触发 `onConfigure`，弹出对应 Provider 的配置模态框
+- 用户点击"链接账户"按钮触发 `onLink`，进入银行选择流程
+
 **职责**：
 - 统一管理所有支持的银行同步 Provider
-- 检查每个 Provider 的配置状态
+- 检查每个 Provider 的配置状态（通过调用 `gocardless-status` 等接口）
 - 提供一致的配置、链接、重置操作接口
 - 权限控制（多用户模式下只有管理员可配置）
 
@@ -195,16 +209,19 @@ class SecretsDb {
   set(name, value) {
     this.db.mutate(
       `INSERT OR REPLACE INTO secrets (name, value) VALUES (?,?)`,
-      [name, value]
+      [name, value]  // ⚠️ 明文存储，未加密
     );
   }
 }
 ```
 
+> **⚠️ 关键更正**：第三方 API 密钥**以明文形式**存储在 sync-server 的 SQLite 数据库中，**未进行加密处理**。`secrets-service.js:37` 的 debug 日志甚至直接打印明文值：`setting secret '${name}' to '${value}'`。
+
 > **关键点**：第三方 API 密钥**不存储**在用户的本地预算文件中，而是存储在 sync-server 的独立数据库中。这意味着：
 > - 预算文件本身不包含敏感凭据
 > - 切换 sync-server 需要重新配置 Provider
 > - 多用户共享同一 sync-server 时，Provider 配置共享
+> - ⚠️ sync-server 数据库文件需妥善保护，避免泄露
 
 #### 2.2.3 银行列表加载
 
@@ -250,98 +267,282 @@ app.post('/get-banks', async (req, res) => {
 });
 ```
 
-#### 2.2.4 OAuth 授权流程
+#### 2.2.4 OAuth 授权完整流程
 
-1. **创建授权会话** (`gocardless-create-web-token`)
-
-   ```typescript
-   // gocardless.ts:26-29
-   const resp = await send('gocardless-create-web-token', {
-     institutionId,
-     accessValidForDays: 90,
-   });
-   ```
-
-   sync-server 端创建 requisition（授权请求）：
-   ```typescript
-   // gocardless-service.ts:276-326
-   createRequisition({ institutionId, host }) {
-     const body = {
-       redirectUrl: host + '/gocardless/link',  // 授权完成回调地址
-       institutionId,
-       referenceId: uuidv4(),
-       accessValidForDays: institution.max_access_valid_for_days,
-       // ...
-     };
-     return client.initSession(body);
-   }
-   ```
-
-2. **浏览器跳转授权**
-
-   ```typescript
-   // gocardless.ts:33
-   window.Actual.openURLInBrowser(link);
-   ```
-
-3. **轮询授权结果** (`gocardless-poll-web-token`)
-
-   ```typescript
-   // app.ts:683-756
-   async function pollGoCardlessWebToken({ requisitionId }) {
-     // 最长轮询 10 分钟，每 3 秒轮询一次
-     const startTime = Date.now();
-     stopPolling = false;
-     
-     async function getData(cb) {
-       if (Date.now() - startTime >= 1000 * 60 * 10) {
-         cb({ status: 'timeout' });
-         return;
-       }
-       
-       const data = await post(
-         serverConfig.GOCARDLESS_SERVER + '/get-accounts',
-         { requisitionId }
-       );
-       
-       if (data && !data.error_code) {
-         cb({ status: 'success', data });
-       } else {
-         setTimeout(() => getData(cb), 3000);
-       }
-     }
-     
-     return new Promise(resolve => {
-       void getData(data => resolve(data));
-     });
-   }
-   ```
-
-#### 2.2.5 账户选择与映射
-
-**SelectLinkedAccountsModal.tsx** 提供账户映射界面：
+##### 2.2.4.1 创建授权会话 (`gocardless-create-web-token`)
 
 ```typescript
-// 显示外部银行账户列表，用户选择映射到本地账户
-Object.entries(chosenAccounts).forEach(
-  ([externalAccountId, localAccountId]) => {
-    // 根据 syncSource 调用不同的链接方法
-    if (syncSource === 'goCardless') {
-      linkAccount.mutate({
-        requisitionId,
-        account: externalAccount,
-        upgradingId: localAccountId,  // 现有本地账户 ID（如适用）
-        offBudget,
-        startingDate,
-        startingBalance,
-      });
-    }
-    // ... 其他 Provider 类似
-  }
-);
+// gocardless.ts:26-29
+const resp = await send('gocardless-create-web-token', {
+  institutionId,
+  accessValidForDays: 90,
+});
 ```
 
-#### 2.2.6 写入本地预算文件
+sync-server 端创建 requisition（授权请求）：
+```typescript
+// gocardless-service.ts:276-326
+createRequisition({ institutionId, host }) {
+  const body = {
+    redirectUrl: host + '/gocardless/link',  // 授权完成回调地址
+    institutionId,
+    referenceId: uuidv4(),
+    accessValidForDays: institution.max_access_valid_for_days,
+  };
+  return client.initSession(body);
+}
+```
+
+**返回数据**：
+```typescript
+{
+  link: 'https://bank.example.com/authorize?requisition_id=xxx',
+  requisitionId: 'req-12345678-1234-1234-1234-1234567890ab'
+}
+```
+
+##### 2.2.4.2 浏览器跳转授权
+
+```typescript
+// gocardless.ts:33
+window.Actual.openURLInBrowser(link);
+```
+
+用户在银行网站完成 OAuth 授权后，银行会重定向到：
+```
+https://<sync-server-host>/gocardless/link?ref=req-12345678-1234-1234-1234-1234567890ab
+```
+
+##### 2.2.4.3 银行回调处理 (`/gocardless/link`)
+
+sync-server 端的回调处理非常简单：
+```javascript
+// app-gocardless.js:44-46
+app.get('/link', function (req, res) {
+  res.sendFile('link.html', { root: path.resolve('./src/app-gocardless') });
+});
+```
+
+`link.html` 内容：
+```html
+<script>
+  window.close();
+</script>
+<p>Please wait...</p>
+```
+
+> **关键点**：sync-server 不主动通知前端授权完成，而是依靠前端轮询来检测状态。回调页面仅关闭浏览器窗口。
+
+##### 2.2.4.4 前端轮询授权结果 (`gocardless-poll-web-token`)
+
+```typescript
+// app.ts:683-756
+async function pollGoCardlessWebToken({ requisitionId }) {
+  // 最长轮询 10 分钟，每 3 秒轮询一次
+  const startTime = Date.now();
+  stopPolling = false;
+  
+  async function getData(cb) {
+    if (Date.now() - startTime >= 1000 * 60 * 10) {
+      cb({ status: 'timeout' });
+      return;
+    }
+    
+    const data = await post(
+      serverConfig.GOCARDLESS_SERVER + '/get-accounts',
+      { requisitionId }
+    );
+    
+    if (data && !data.error_code) {
+      cb({ status: 'success', data });
+    } else {
+      setTimeout(() => getData(cb), 3000);
+    }
+  }
+  
+  return new Promise(resolve => {
+    void getData(data => resolve(data));
+  });
+}
+```
+
+##### 2.2.4.5 sync-server 获取账户列表 (`/get-accounts`)
+
+```javascript
+// app-gocardless.js:83-116
+app.post('/get-accounts', async (req, res) => {
+  const requisitionId = sanitizeId((req.body || {}).requisitionId);
+  
+  try {
+    const { requisition, accounts } =
+      await goCardlessService.getRequisitionWithAccounts(requisitionId);
+    
+    res.send({
+      status: 'ok',
+      data: {
+        ...requisition,
+        accounts: await Promise.all(
+          accounts.map(async account =>
+            account?.iban
+              ? { ...account, iban: sha256String(account.iban) }  // IBAN 哈希处理
+              : account,
+          ),
+        ),
+      },
+    });
+  } catch (error) {
+    if (error instanceof RequisitionNotLinked) {
+      res.send({
+        status: 'ok',
+        requisitionStatus: error.details.requisitionStatus,
+      });
+    } else {
+      throw error;
+    }
+  }
+});
+```
+
+**成功时返回的数据结构**：
+```typescript
+{
+  status: 'ok',
+  data: {
+    id: 'req-12345678-1234-1234-1234-1234567890ab',  // requisitionId
+    accounts: [
+      {
+        account_id: 'acc-11111111-2222-3333-4444-555555555555',
+        mask: '1234',
+        name: 'Main Account',
+        official_name: 'Personal Checking Account',
+        institution: { id: 'SANDBOXFINANCE_SFIN0000', name: 'Sandbox Finance' },
+        balance: 1234.56,
+        iban: 'sha256_hashed_value'  // 已哈希，不是明文
+      },
+      // ... 更多账户
+    ]
+  }
+}
+```
+
+#### 2.2.5 从授权回落到账户落库的完整调用链
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  银行 OAuth 授权完成                                         │
+│  重定向到: https://<sync-server>/gocardless/link?ref=xxx    │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│  sync-server: GET /gocardless/link                          │
+│  返回 link.html，执行 window.close()                        │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│  前端: pollGoCardlessWebToken(requisitionId)               │
+│  每 3 秒调用 /gocardless/get-accounts                       │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│  sync-server: POST /gocardless/get-accounts                 │
+│  调用 goCardlessService.getRequisitionWithAccounts()        │
+│  返回: { requisition, accounts: [...] }                     │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│  前端: 打开 SelectLinkedAccountsModal                       │
+│  显示账户列表，用户选择映射到本地账户                        │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│  前端: linkAccount.mutate({                                  │
+│    requisitionId,                                            │
+│    account: externalAccount,  // { account_id, name, ... }  │
+│    upgradingId: localAccountId, // 可选，现有账户            │
+│    startingDate,                                              │
+│    startingBalance                                            │
+│  })                                                          │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│  本地核心: linkGoCardlessAccount()                          │
+│  1. findOrCreateBank(institution, requisitionId)            │
+│  2. 创建或更新 accounts 记录                                 │
+│  3. 调用 syncAccount() 触发首次同步                          │
+└─────────────────────────────────────────────────────────────┘
+```
+
+#### 2.2.6 数据传递路径详解
+
+##### Token 传递链
+
+```
+GoCardless API (access token)
+        │
+        ▼  存储在内存缓存
+sync-server: goCardlessService._token
+        │
+        ▼  用于 API 调用
+sync-server: 调用 GoCardless API 获取账户/交易数据
+        │
+        ▼  从不传递到前端
+        ▼  前端仅获得业务数据
+```
+
+> **关键点**：GoCardless 的 access token 仅在 sync-server 内部使用，**从不传递到前端或本地预算文件**。
+
+##### Requisition ID 传递链
+
+```
+sync-server: createRequisition() → { requisitionId }
+        │
+        ▼  返回前端
+前端: 保存到 state，用于轮询和后续操作
+        │
+        ▼  作为参数传递
+前端: pollGoCardlessWebToken(requisitionId)
+        │
+        ▼  作为参数传递
+前端: linkAccount.mutate({ requisitionId, account, ... })
+        │
+        ▼  传入本地核心
+本地核心: linkGoCardlessAccount({ requisitionId, ... })
+        │
+        ▼  写入 banks 表
+本地预算文件: banks.bank_id = requisitionId
+```
+
+##### Account ID 传递链
+
+```
+GoCardless API: 账户详情 → { id: accountId }
+        │
+        ▼
+sync-server: getRequisitionWithAccounts()
+        │
+        ▼  标准化处理
+sync-server: 返回 { account_id: accountId, ... }
+        │
+        ▼
+前端: 保存到 state，用于账户映射
+        │
+        ▼  作为参数传递
+前端: linkAccount.mutate({ account: { account_id, ... }, ... })
+        │
+        ▼  传入本地核心
+本地核心: linkGoCardlessAccount({ account, ... })
+        │
+        ▼  写入 accounts 表
+本地预算文件: accounts.account_id = account.account_id
+```
+
+#### 2.2.7 写入本地预算文件
 
 **核心方法**：`linkGoCardlessAccount` (app.ts:159-226)
 
@@ -387,7 +588,7 @@ async function linkGoCardlessAccount({
   // 3. 触发首次同步
   const syncRes = await bankSync.syncAccount(
     undefined, undefined, id,
-    account.account_id, bank.bank_id,
+    account.account_id, bank.bank_id,  // bank.bank_id = requisitionId
     startingDate, startingBalance
   );
   
@@ -396,6 +597,19 @@ async function linkGoCardlessAccount({
   return 'ok';
 }
 ```
+
+**写入的数据**：
+
+| 表 | 字段 | 值来源 | 说明 |
+|----|------|--------|------|
+| `banks` | `bank_id` | `requisitionId` | GoCardless 授权会话 ID |
+| `banks` | `name` | `account.institution.name` | 银行名称 |
+| `accounts` | `account_id` | `account.account_id` | GoCardless 账户 ID |
+| `accounts` | `bank` | `bank.id` | 关联 banks 表的本地 UUID |
+| `accounts` | `account_sync_source` | `'goCardless'` | 同步来源标记 |
+| `accounts` | `mask` | `account.mask` | 账号掩码（最后 4 位） |
+| `accounts` | `name` | `account.name` | 账户名称 |
+| `accounts` | `official_name` | `account.official_name` | 账户官方名称 |
 
 **银行记录管理**：`link.ts:6-24`
 
@@ -520,7 +734,7 @@ export async function syncAccount(
 | **UI 层** | 统一的 Provider 选择界面、配置模态框、账户映射界面 | `useBuiltInBankSyncProviders.ts`、`SelectLinkedAccountsModal.tsx` |
 | **前端 API 层** | 封装各 Provider 的调用方法，暴露统一接口 | `gocardless.ts`、`enablebanking.ts`、`mutations.ts` |
 | **本地核心层** | 账户管理、交易对账、本地数据持久化 | `app.ts`、`sync.ts`、`link.ts` |
-| **Sync-Server 层** | 第三方 API 调用、凭据管理、Provider 特定逻辑 | `app-gocardless/`、`secrets-service.js` |
+| **Sync-Server 层** | 第三方 API 调用、凭据管理、Provider 特定逻辑、会话状态 | `app-gocardless/`、`secrets-service.js` |
 | **第三方 API** | 银行数据获取、OAuth 授权 | GoCardless API、SimpleFIN Bridge 等 |
 
 ### 4.2 各 Provider 职责边界
@@ -531,6 +745,7 @@ export async function syncAccount(
 - **银行 ID 策略**：`requisitionId`（授权会话级）
 - **同步模式**：单账户同步
 - **特点**：支持 90 天历史数据，需要定期重新授权
+- **回调处理**：`/gocardless/link`，前端轮询
 
 #### SimpleFIN (北美)
 - **范围**：北美银行（通过 SimpleFIN Bridge）
@@ -551,6 +766,7 @@ export async function syncAccount(
 - **银行 ID 策略**：`account_id`（账户级，每个账户独立会话）
 - **同步模式**：单账户同步
 - **特点**：功能标志控制 (`enableBanking`)，默认不启用
+- **回调处理**：`/auth_callback`，sync-server 主动接收回调
 
 ### 4.3 关键边界
 
@@ -558,11 +774,12 @@ export async function syncAccount(
 
 | 本地预算文件 (SQLite) | Sync-Server (SQLite) |
 |----------------------|---------------------|
-| accounts 表（账户信息） | secrets 表（API 密钥） |
-| banks 表（银行记录） | 临时授权 token |
-| transactions 表（交易记录） | Provider 会话状态 |
+| accounts 表（账户信息） | secrets 表（API 密钥，明文存储） |
+| banks 表（银行记录） | 内存缓存的 access token |
+| transactions 表（交易记录） | Provider 会话状态（内存中） |
 | 永久存储，用户可导出/备份 | 独立于预算文件，可更换 |
 | **不包含**第三方 API 密钥 | **不包含**用户预算数据 |
+| 用户完全拥有 | 管理员维护 |
 
 #### 4.3.2 Provider 之间的隔离
 
@@ -570,13 +787,28 @@ export async function syncAccount(
 2. **配置独立**：各 Provider 的密钥配置独立，互不影响
 3. **同步独立**：每个账户独立同步，一个 Provider 失败不影响其他
 4. **银行记录独立**：`banks` 表通过 `bank_id` 区分不同 Provider 的银行
+5. **代码隔离**：各 Provider 在 sync-server 中有独立的子应用目录
 
 #### 4.3.3 同步服务边界
 
-- **sync-server 是无状态的**：不持久化用户预算数据，仅作为网关
+> **⚠️ 关键更正**：sync-server **不是无状态的**，它维护以下状态：
+
+- **持久化状态**：
+  - `secrets` 表：存储所有 Provider 的 API 密钥（明文）
+  - `users` 表：用户账户信息
+  - `files` 表：同步文件元数据
+  - `messages` 表：同步消息队列
+- **内存状态**：
+  - `_cachedSecrets`：凭据缓存（`secrets-service.js:59`）
+  - `goCardlessService._token`：GoCardless access token 缓存
+  - 会话管理：用户登录状态
+
+> **正确表述**：sync-server 是**有状态的服务**，但**不持久化用户的预算数据**，仅作为 API 网关和凭据管理器。预算数据完全存储在客户端本地。
+
 - **多用户支持**：同一 sync-server 可服务多个预算文件
 - **凭据共享**：同一 sync-server 上的所有预算文件共享 Provider 配置
 - **可插拔**：可以更换 sync-server 而不影响本地预算数据（需要重新配置 Provider）
+- **会话管理**：维护与第三方 API 的 access token 生命周期
 
 ---
 
@@ -602,7 +834,7 @@ export async function syncAccount(
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | `id` | TEXT | 本地银行 ID (UUID) |
-| `bank_id` | TEXT | Provider 级别的银行标识（见 2.2.6） |
+| `bank_id` | TEXT | Provider 级别的银行标识（见 2.2.7） |
 | `name` | TEXT | 银行名称 |
 
 ### 5.3 凭据表 (secrets, sync-server)
@@ -610,7 +842,7 @@ export async function syncAccount(
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | `name` | TEXT | 凭据名称 (如: `gocardless_secretId`) |
-| `value` | TEXT | 凭据值（加密存储） |
+| `value` | TEXT | 凭据值（⚠️ 明文存储，未加密） |
 
 ---
 
@@ -618,10 +850,11 @@ export async function syncAccount(
 
 ### 6.1 为什么凭据不存储在本地预算文件？
 
-1. **安全**：预算文件可能被共享或备份，不应包含第三方 API 密钥
-2. **多用户**：sync-server 模式下，多个用户共享同一 Provider 配置
-3. **隔离**：预算文件是纯财务数据，不应包含基础设施配置
-4. **可更换**：可以更换 sync-server 而无需修改预算文件
+1. **安全边界**：预算文件可能被共享或备份，不应包含第三方 API 密钥
+2. **多用户场景**：sync-server 模式下，多个用户共享同一 Provider 配置
+3. **关注点分离**：预算文件是纯财务数据，不应包含基础设施配置
+4. **可更换性**：可以更换 sync-server 而无需修改预算文件
+5. ⚠️ **风险提示**：凭据在 sync-server 端明文存储，需加强数据库文件保护
 
 ### 6.2 为什么使用 `account_sync_source` 字段？
 
@@ -639,6 +872,13 @@ SimpleFIN Bridge 的 API 设计支持一次请求获取多个账户的交易记�
 
 其他 Provider（GoCardless、Pluggy.ai、Enable Banking）的 API 是单账户设计，因此只能逐个同步。
 
+### 6.4 为什么采用轮询而非 WebSocket/回调通知？
+
+1. **简化架构**：不需要维护长连接，前端和 sync-server 都是无连接的 HTTP 交互
+2. **跨平台兼容**：桌面应用可能在后台运行，轮询更可靠
+3. **银行限制**：部分银行的 OAuth 回调只能到达 sync-server，无法直接通知前端
+4. **错误处理**：轮询可以方便地处理超时、网络中断等情况
+
 ---
 
 ## 七、错误处理与恢复
@@ -652,6 +892,7 @@ SimpleFIN Bridge 的 API 设计支持一次请求获取多个账户的交易记�
 | **速率限制** | 显示友好提示，建议稍后重试 |
 | **银行 API 错误** | 保留原始错误信息，便于排查 |
 | **网络中断** | 不修改本地数据，下次同步重试 |
+| **轮询超时** | 显示超时提示，允许用户手动重试 |
 
 ### 7.2 账户解绑
 
@@ -683,10 +924,20 @@ async function unlinkAccount({ id }) {
 
 Actual Budget 的银行连接架构采用了清晰的分层设计：
 
-1. **统一的用户体验**：所有 Provider 共享相同的 UI 模式和交互流程
-2. **清晰的职责边界**：UI、本地核心、sync-server、第三方 API 四层分离
-3. **安全的凭据管理**：API 密钥与预算数据物理隔离
-4. **灵活的扩展能力**：新 Provider 只需实现对应接口即可接入
-5. **本地优先的数据模型**：用户始终掌握自己的财务数据
+1. **统一的用户体验**：所有 Provider 共享相同的 UI 模式和交互流程，通过 `useBuiltInBankSyncProviders` 统一管理
+2. **清晰的职责边界**：UI、本地核心、sync-server、第三方 API 四层分离，各层职责明确
+3. **凭据隔离但未加密**：API 密钥与预算数据物理隔离，但在 sync-server 端明文存储，需注意安全
+4. **有状态的 sync-server**：sync-server 维护凭据、会话和同步状态，但不持久化用户预算数据
+5. **灵活的扩展能力**：新 Provider 只需实现对应接口即可接入，通过 `account_sync_source` 路由
+6. **本地优先的数据模型**：用户始终掌握自己的财务数据，sync-server 仅作为网关
 
-多渠道并存时，通过 `account_sync_source` 字段实现逻辑隔离，通过 sync-server 实现 Provider 特定逻辑的封装，确保架构清晰且易于维护。
+多渠道并存时，通过 `account_sync_source` 字段实现逻辑隔离，通过 sync-server 的独立子应用实现物理隔离，确保架构清晰且易于维护。
+
+---
+
+## 纠偏记录
+
+| 原表述 | 更正后 | 依据 |
+|--------|--------|------|
+| 凭据加密存储 | 凭据明文存储 | `secrets-service.js:38-40` 直接 INSERT 明文，无加密逻辑 |
+| sync-server 是无状态的 | sync-server 是有状态的 | 持久化 secrets、users、files 等表，并有内存缓存 |
