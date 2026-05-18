@@ -2,39 +2,39 @@
 
 ## 一、概述
 
-Actual Budget 的主题系统采用「CSS 变量 + Redux 状态管理 + 应用级偏好持久化」的三层架构。主题是**应用级别的配置，而非预算文件粒度的持久化，所有预算文件共享同一套主题设置。
+Actual Budget 的主题系统采用「CSS 变量 + Redux 状态管理 + 应用级偏好持久化」的五层架构。主题是**应用级别的配置，而非预算文件粒度的持久化**，所有预算文件共享同一套主题设置。
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│  用户偏好持久化 (global-store.json)              │
-│  ┌─────────────────────────────────────────┐    │
-│  │ theme: 'light' | 'dark' | 'auto'   │    │
-│  │ preferredDarkTheme: 'dark' | 'midnight'     │    │
-│  │ installedCustomLightTheme: JSON string       │    │
-│  │ installedCustomDarkTheme: JSON string        │    │
-│  │ customCssOverride: CSS string               │    │
-│  └─────────────────────────────────────────┘    │
-└───────────────────┬─────────────────────────────┘
-                    │
-┌───────────────────▼─────────────────────────────┐
-│  Redux 状态管理 (prefsSlice)                │
-│  useGlobalPref('theme')                      │
-└───────────────────┬─────────────────────────────┘
-                    │
-┌───────────────────▼─────────────────────────────┐
-│  主题样式注入 (ThemeStyle + CustomThemeStyle │
-│  <style> 标签注入 CSS 变量               │
-└───────────────────┬─────────────────────────────┘
-                    │
-┌───────────────────▼─────────────────────────────┐
-│  组件库主题映射 (@actual-app/components/theme │
-│  theme.pageBackground → var(--color-*)       │
-└───────────────────┬─────────────────────────────┘
-                    │
-┌───────────────────▼─────────────────────────────┐
-│  视图组件消费 (View, Text, Button 等)        │
-│  style={{ backgroundColor: theme.pageBackground }} │
-└─────────────────────────────────────────────────┘
+│  持久化层 (global-store.json)                          │
+│  ┌──────────────────────────────────────────────────┐ │
+│  │ theme: 'light' | 'dark' | 'auto'                │ │
+│  │ preferredDarkTheme: 'dark' | 'midnight'         │ │
+│  │ installedCustomLightTheme: JSON string          │ │
+│  │ installedCustomDarkTheme: JSON string           │ │
+│  │ customCssOverride: CSS string                   │ │
+│  └──────────────────────────────────────────────────┘ │
+└──────────────────────────┬──────────────────────────────┘
+                           │
+┌──────────────────────────▼──────────────────────────────┐
+│  状态管理层 (Redux prefsSlice)                         │
+│  useGlobalPref('theme') → [value, setter]             │
+└──────────────────────────┬──────────────────────────────┘
+                           │
+┌──────────────────────────▼──────────────────────────────┐
+│  主题注入层 (ThemeStyle + CustomThemeStyle)            │
+│  <style> 标签注入 CSS 变量                            │
+└──────────────────────────┬──────────────────────────────┘
+                           │
+┌──────────────────────────▼──────────────────────────────┐
+│  组件库映射层 (@actual-app/components/theme)            │
+│  theme.pageBackground → 'var(--color-pageBackground)' │
+└──────────────────────────┬──────────────────────────────┘
+                           │
+┌──────────────────────────▼──────────────────────────────┐
+│  视图组件消费层 (View, Text, Button 等)                 │
+│  style={{ backgroundColor: theme.pageBackground }}     │
+└─────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -47,29 +47,43 @@ Actual Budget 的主题系统采用「CSS 变量 + Redux 状态管理 + 应用�
 
 | 偏好类型 | 存储位置 | 说明 |
 |---------|---------|------|
-| GlobalPrefs | `global-store.json | 应用级别，所有预算文件共享 |
+| GlobalPrefs | `global-store.json` | 应用级别，所有预算文件共享 |
 | MetadataPrefs | 每个预算目录下的 `metadata.json` | 预算文件级别，但**不包含主题设置** |
 | SyncedPrefs | 预算数据库的 `preferences` 表 | 跨设备同步的预算级偏好，**不包含主题设置** |
 
 ### 2.2 主题相关的 GlobalPrefs 字段
 
-定义在 `packages/loot-core/src/types/prefs.ts:99-124
+定义在 `packages/loot-core/src/types/prefs.ts:99-124`
 
 ```typescript
+export type Theme = 'light' | 'dark' | 'auto' | 'midnight' | string;
+export type DarkTheme = 'dark' | 'midnight';
+
 export type GlobalPrefs = Partial<{
-  theme: Theme;                          // 'light' | 'dark' | 'auto' | 'midnight'
-  preferredDarkTheme: DarkTheme;            // 'dark' | 'midnight'
-  installedCustomLightTheme?: string;          // JSON string of InstalledTheme
-  installedCustomDarkTheme?: string;          // JSON string of InstalledTheme
-  customCssOverride?: string;                 // 用户自定义 CSS 覆盖
+  theme: Theme;                          // 主题模式
+  preferredDarkTheme: DarkTheme;            // auto 模式下的暗色主题偏好
+  installedCustomLightTheme?: string;        // 亮色自定义主题（JSON 序列化的 InstalledTheme）
+  installedCustomDarkTheme?: string;         // 暗色自定义主题（JSON 序列化的 InstalledTheme）
+  customCssOverride?: string;               // 用户自定义 CSS 覆盖
 }>;
+```
+
+**InstalledTheme 结构**（`packages/desktop-client/src/style/customThemes.ts:15-21`）：
+```typescript
+export type InstalledTheme = {
+  id: string;
+  name: string;
+  repo: string;
+  cssContent: string;    // 主题 CSS 内容
+  baseTheme?: BaseTheme; // 基础主题：'light' | 'dark' | 'midnight'
+};
 ```
 
 ### 2.3 后端存储实现
 
-**存储后端：`packages/loot-core/src/server/preferences/app.ts:66-191
+**存储后端**：`packages/loot-core/src/server/preferences/app.ts:66-191`
 
-- **保存** (`saveGlobalPrefs`): 通过 `asyncStorage.setItem()` 写入 `global-store.json
+- **保存** (`saveGlobalPrefs`): 通过 `asyncStorage.setItem()` 写入 `global-store.json`
 - **加载** (`loadGlobalPrefs`): 通过 `asyncStorage.multiGet()` 读取
 
 ```typescript
@@ -84,9 +98,9 @@ const { theme } = await asyncStorage.multiGet(['theme']);
 
 ### 2.4 预算文件粒度的主题？
 
-**重要说明**：Actual Budget 目前**没有实现预算文件粒度的主题持久化。主题是**所有预算文件共享同一套主题设置。
+**重要说明**：Actual Budget 目前**没有实现**预算文件粒度的主题持久化。主题是**应用级别的**，所有预算文件共享同一套主题设置。
 
-如果需要实现预算文件粒度的主题，需要将主题相关字段从 GlobalPrefs 移动到 MetadataPrefs，并在加载预算时从该预算的 metadata.json 中读取。
+如果需要实现预算文件粒度的主题，需要将主题相关字段从 `GlobalPrefs` 移动到 `MetadataPrefs`，并在加载预算时从该预算的 `metadata.json` 中读取。详见本文第八节的可落地改造方案。
 
 ---
 
@@ -94,19 +108,25 @@ const { theme } = await asyncStorage.multiGet(['theme']);
 
 ### 3.1 Redux Slice
 
-`packages/desktop-client/src/prefs/prefsSlice.ts
+`packages/desktop-client/src/prefs/prefsSlice.ts`
 
 ```typescript
 type PrefsState = {
-  local: MetadataPrefs;    // 预算文件元数据
-  global: GlobalPrefs;  // 应用级全局偏好
-  synced: SyncedPrefs; // 跨设备同步偏好
+  local: MetadataPrefs;    // 预算文件元数据（从 metadata.json 加载）
+  global: GlobalPrefs;  // 应用级全局偏好（从 global-store.json 加载）
+  synced: SyncedPrefs; // 跨设备同步偏好（从预算数据库加载）
 };
+```
+
+**加载流程**（`App.tsx:91`）：
+```typescript
+// 应用启动时加载全局偏好
+await dispatch(loadGlobalPrefs());
 ```
 
 ### 3.2 useGlobalPref Hook
 
-`packages/desktop-client/src/hooks/useGlobalPref.ts:12-34
+`packages/desktop-client/src/hooks/useGlobalPref.ts:12-34`
 
 ```typescript
 export function useGlobalPref<K extends keyof GlobalPrefs>(
@@ -114,36 +134,41 @@ export function useGlobalPref<K extends keyof GlobalPrefs>(
   onSaveGlobalPrefs?: () => void,
 ): [GlobalPrefs[K], SetGlobalPrefAction<K>] {
   const dispatch = useDispatch();
+  
+  // 创建 setter 函数
   const setGlobalPref = useCallback<SetGlobalPrefAction<K>>(
     value => {
       void dispatch(
         saveGlobalPrefs({
-        prefs: { [prefName]: value },
-        onSaveGlobalPrefs,
-      }),
+          prefs: { [prefName]: value },
+          onSaveGlobalPrefs,
+        }),
       );
     },
     [prefName, dispatch, onSaveGlobalPrefs],
   );
+  
+  // 从 Redux state 读取值
   const globalPref = useSelector(
     state => state.prefs.global?.[prefName] as GlobalPrefs[K],
   );
+  
   return [globalPref, setGlobalPref];
 }
 ```
 
-**使用方式：
-
+**使用方式**：
 ```typescript
-// 读取主题
+// 读取主题，默认值为 'auto'
 const [theme, setTheme] = useGlobalPref('theme');
-// 切换主题
-setTheme('dark'); // 自动触发 saveGlobalPrefs → 写入 global-store.json
+
+// 切换主题：自动触发 saveGlobalPrefs → 写入 global-store.json
+setTheme('dark');
 ```
 
 ### 3.3 主题相关 Hooks
 
-`packages/desktop-client/src/style/theme.tsx:36-45
+`packages/desktop-client/src/style/theme.tsx:36-45`
 
 ```typescript
 export function useTheme() {
@@ -159,11 +184,11 @@ export function usePreferredDarkTheme() {
 
 ---
 
-## 四、主题注入层：CSS 变量注入
+## 四、主题注入层：CSS 变量注入（深入解析）
 
 ### 4.1 主题 CSS 文件结构
 
-`packages/component-library/src/themes/
+`packages/component-library/src/themes/`
 
 | 文件 | 作用 |
 |------|------|
@@ -172,7 +197,7 @@ export function usePreferredDarkTheme() {
 | `dark.css` | 暗色主题语义化颜色 |
 | `midnight.css` | 午夜主题语义化颜色 |
 
-**调色板层** (`palette.css`):
+**调色板层** (`palette.css`)：
 ```css
 :root {
   --palette-navy100: #e8ecf0;
@@ -182,7 +207,7 @@ export function usePreferredDarkTheme() {
 }
 ```
 
-**主题层** (`light.css`):
+**主题层** (`light.css`)：
 ```css
 :root {
   --color-pageBackground: var(--palette-navy100);
@@ -192,48 +217,146 @@ export function usePreferredDarkTheme() {
 }
 ```
 
-### 4.2 ThemeStyle 组件
+### 4.2 状态层到样式注入的衔接（核心链路）
 
-`packages/desktop-client/src/style/theme.tsx:95-174
+这是最容易让人困惑的部分，让我们从**Redux state 变化 → 组件重新渲染 → CSS 变量注入**的完整链路拆解：
 
-**核心逻辑：
+```
+Redux state.prefs.global.theme 变化
+           ↓
+useSelector 触发订阅组件重新渲染
+           ↓
+useGlobalPref('theme') 返回新值
+           ↓
+useTheme() 返回新的 activeTheme
+           ↓
+ThemeStyle 组件重新执行
+           ↓
+useEffect 检测到 activeTheme 依赖变化
+           ↓
+执行 effect 逻辑，计算新的 themeColors
+           ↓
+setThemeColors(newColors) 更新本地 state
+           ↓
+组件重新渲染，<style>{themeColors}</style> 注入新 CSS
+           ↓
+浏览器重新解析 --color-* 变量
+           ↓
+所有使用 theme.* 的组件样式自动更新
+```
+
+**关键代码**（`theme.tsx:106-164`）：
+```typescript
+export function ThemeStyle() {
+  // 1. 从 Redux 读取状态
+  const [activeTheme] = useTheme();
+  const [darkThemePreference] = usePreferredDarkTheme();
+  const [installedCustomLightThemeJson] = useGlobalPref('installedCustomLightTheme');
+  const [installedCustomDarkThemeJson] = useGlobalPref('installedCustomDarkTheme');
+  
+  // 2. 本地 state 存储当前注入的 CSS
+  const [themeColors, setThemeColors] = useState<string | undefined>(undefined);
+
+  // 3. 依赖数组：任何一个变化都会重新执行 effect
+  useEffect(() => {
+    // ... 计算 themeColors 的逻辑 ...
+  }, [activeTheme, darkThemePreference, installedCustomLightThemeJson, installedCustomDarkThemeJson]);
+
+  // 4. 注入 CSS
+  if (!themeColors) return null;
+  return (
+    <>
+      <style>{paletteCss}</style>      {/* 调色板：永远不变 */}
+      <style>{themeColors}</style>    {/* 主题颜色：随状态变化 */}
+    </>
+  );
+}
+```
+
+**关键点理解**：
+- `paletteCss` 是静态的，永远不会变化，只注入一次
+- `themeColors` 是动态的，随主题状态变化而变化
+- `useEffect` 的依赖数组确保了**任何相关状态变化都会触发重新计算**
+- 不需要使用 React Context，因为 CSS 变量是全局的，一旦注入到 `<style>` 中，整个文档都能访问
+
+### 4.3 ThemeStyle 组件：auto 模式明暗选择深入解析
+
+`packages/desktop-client/src/style/theme.tsx:95-174`
+
+这是整个主题系统最复杂的部分，让我们逐行拆解：
 
 ```typescript
 export function ThemeStyle() {
   const [activeTheme] = useTheme();
   const [darkThemePreference] = usePreferredDarkTheme();
+  const [installedCustomLightThemeJson] = useGlobalPref('installedCustomLightTheme');
+  const [installedCustomDarkThemeJson] = useGlobalPref('installedCustomDarkTheme');
   const [themeColors, setThemeColors] = useState<string | undefined>(undefined);
 
   useEffect(() => {
     if (activeTheme === 'auto') {
-      // 跟随系统：监听 prefers-color-scheme 变化
-      const darkThemeMediaQuery = window.matchMedia('(prefers-color-scheme: dark)');
+      // ─────────────────────────────────────────────────────
+      // AUTO 模式：跟随系统主题
+      // ─────────────────────────────────────────────────────
       
+      // 1. 解析已安装的自定义主题
+      const installedLight = parseInstalledTheme(installedCustomLightThemeJson);
+      const installedDark = parseInstalledTheme(installedCustomDarkThemeJson);
+
+      // 2. 确定亮色主题 CSS
+      // 优先级：自定义主题的 baseTheme → 默认 light
+      const lightColors =
+        (installedLight?.baseTheme && getBaseThemeColors(installedLight.baseTheme)) ||
+        themes['light'].colors;
+
+      // 3. 确定暗色主题 CSS
+      // 优先级：自定义主题的 baseTheme → 用户偏好的暗色主题（dark/midnight）
+      const darkColors =
+        (installedDark?.baseTheme && getBaseThemeColors(installedDark.baseTheme)) ||
+        themes[darkThemePreference].colors;
+
+      // 4. 创建媒体查询监听器
       function darkThemeMediaQueryListener(event: MediaQueryListEvent) {
         if (event.matches) {
-          setThemeColors(darkColors);
+          setThemeColors(darkColors);  // 系统切到暗色
         } else {
-          setThemeColors(lightColors);
+          setThemeColors(lightColors); // 系统切到亮色
         }
       }
       
+      const darkThemeMediaQuery = window.matchMedia('(prefers-color-scheme: dark)');
       darkThemeMediaQuery.addEventListener('change', darkThemeMediaQueryListener);
-      
-      // 初始设置
+
+      // 5. 初始设置：检查当前系统主题
       if (darkThemeMediaQuery.matches) {
         setThemeColors(darkColors);
       } else {
         setThemeColors(lightColors);
       }
-      
+
+      // 6. 清理：移除监听器避免内存泄漏
       return () => {
         darkThemeMediaQuery.removeEventListener('change', darkThemeMediaQueryListener);
       };
     } else {
-      // 固定主题
-      setThemeColors(themes[activeTheme as ThemeKey]?.colors);
+      // ─────────────────────────────────────────────────────
+      // 固定主题模式：light / dark / midnight
+      // ─────────────────────────────────────────────────────
+      
+      const installedTheme = parseInstalledTheme(installedCustomLightThemeJson);
+      
+      if (installedTheme?.baseTheme) {
+        // 如果自定义主题指定了基础主题，使用基础主题的颜色
+        setThemeColors(
+          getBaseThemeColors(installedTheme.baseTheme) ??
+            themes[activeTheme as ThemeKey]?.colors,
+        );
+      } else {
+        // 直接使用选中的主题
+        setThemeColors(themes[activeTheme as ThemeKey]?.colors);
+      }
     }
-  }, [activeTheme, darkThemePreference, ...]);
+  }, [activeTheme, darkThemePreference, installedCustomLightThemeJson, installedCustomDarkThemeJson]);
 
   if (!themeColors) return null;
 
@@ -246,36 +369,79 @@ export function ThemeStyle() {
 }
 ```
 
-**auto 模式工作原理：
-1. 使用 `window.matchMedia('(prefers-color-scheme: dark)')` 监听系统主题变化
-2. 系统切换时动态切换注入的 CSS 变量
-3. 清理时移除监听器避免内存泄漏
+**auto 模式工作原理详解**：
 
-### 4.3 CustomThemeStyle 组件
+1. **双主题准备**：auto 模式下会同时准备 `lightColors` 和 `darkColors` 两套 CSS
+2. **系统主题监听**：使用 `window.matchMedia('(prefers-color-scheme: dark)')` 创建媒体查询
+3. **动态切换**：系统主题变化时触发 `change` 事件，调用 `setThemeColors` 切换注入的 CSS
+4. **用户偏好参与**：暗色主题使用 `preferredDarkTheme`（用户可以选择 'dark' 或 'midnight'）
+5. **自定义主题集成**：如果安装了自定义主题，会优先使用自定义主题指定的 `baseTheme`
 
-`packages/desktop-client/src/style/theme.tsx:183-247
+### 4.4 CustomThemeStyle 组件：自定义主题 + 迁移逻辑
 
-支持自定义主题覆盖：
+`packages/desktop-client/src/style/theme.tsx:183-247`
+
+这个组件负责两件事：
+1. 注入自定义主题 CSS
+2. 执行一次性的 legacy override 迁移
 
 ```typescript
 export function CustomThemeStyle() {
+  // 1. 执行迁移（只在需要时运行）
+  useMigrateLegacyOverride();
+  
+  // 2. 读取状态
   const [activeTheme] = useTheme();
   const [installedCustomLightThemeJson] = useGlobalPref('installedCustomLightTheme');
   const [installedCustomDarkThemeJson] = useGlobalPref('installedCustomDarkTheme');
   const [customCssOverride] = useGlobalPref('customCssOverride');
 
+  // 3. 计算要注入的 CSS（useMemo 缓存）
   const validatedCss = useMemo(() => {
+    const safeValidate = (css: string | undefined, errorLabel: string) => {
+      if (!css?.trim()) return '';
+      try {
+        return validateThemeCss(css);  // 安全验证，防止恶意 CSS
+      } catch (error) {
+        console.error(errorLabel, { error });
+        return '';
+      }
+    };
+
+    let baseCss = '';
     if (activeTheme === 'auto') {
-      // auto 模式下，使用 @media 分别为亮色和暗色模式应用不同自定义主题
-      return `
-        @media (prefers-color-scheme: light) { ${lightCss} }
-        @media (prefers-color-scheme: dark) { ${darkCss} }
-      `;
+      // auto 模式：用 @media 包装，让浏览器根据系统主题选择
+      const lightCss = safeValidate(
+        parseInstalledTheme(installedCustomLightThemeJson)?.cssContent,
+        'Invalid custom light theme CSS',
+      );
+      if (lightCss) {
+        baseCss += `@media (prefers-color-scheme: light) { ${lightCss} }\n`;
+      }
+      const darkCss = safeValidate(
+        parseInstalledTheme(installedCustomDarkThemeJson)?.cssContent,
+        'Invalid custom dark theme CSS',
+      );
+      if (darkCss) {
+        baseCss += `@media (prefers-color-scheme: dark) { ${darkCss} }\n`;
+      }
     } else {
-      // 固定主题模式下，直接应用自定义主题
-      return lightCss;
+      // 固定主题：直接注入
+      baseCss = safeValidate(
+        parseInstalledTheme(installedCustomLightThemeJson)?.cssContent,
+        'Invalid custom theme CSS',
+      );
     }
-  }, [...]);
+
+    // 用户自定义 CSS 覆盖（优先级最高）
+    const overrideLayer = safeValidate(
+      customCssOverride,
+      'Invalid custom CSS override',
+    );
+
+    const combined = [baseCss, overrideLayer].filter(Boolean).join('\n');
+    return combined || null;
+  }, [activeTheme, installedCustomLightThemeJson, installedCustomDarkThemeJson, customCssOverride]);
 
   if (!validatedCss) return null;
 
@@ -283,16 +449,111 @@ export function CustomThemeStyle() {
 }
 ```
 
-### 4.4 应用入口注入
+**auto 模式下自定义主题的巧妙设计**：
+- 不使用 JavaScript 监听和切换，而是直接用 CSS `@media (prefers-color-scheme)` 查询
+- 浏览器会自动根据系统主题应用对应的 CSS 块
+- 这样即使 JavaScript 执行有延迟，主题切换也能立即响应
 
-`packages/desktop-client/src/components/App.tsx:227-228
+### 4.5 Legacy Override 迁移逻辑深入解析
+
+`packages/desktop-client/src/style/theme.tsx:53-89` 和 `customThemes.ts:738-772`
+
+**背景**：旧版本中，用户的自定义 CSS 覆盖（`overrideCss`）是存储在 `InstalledTheme` 对象内部的。新版本将其提取为独立的 `customCssOverride` 全局偏好，需要做一次性迁移。
+
+**迁移 Hook**：
+```typescript
+function useMigrateLegacyOverride() {
+  // 读取相关偏好
+  const [customCssOverride, setCustomCssOverride] = useGlobalPref('customCssOverride');
+  const [installedCustomLightThemeJson, setInstalledCustomLightThemeJson] = useGlobalPref('installedCustomLightTheme');
+  const [installedCustomDarkThemeJson, setInstalledCustomDarkThemeJson] = useGlobalPref('installedCustomDarkTheme');
+
+  useEffect(() => {
+    // 调用迁移函数
+    const result = migrateLegacyOverride({
+      existingOverride: customCssOverride,
+      lightJson: installedCustomLightThemeJson,
+      darkJson: installedCustomDarkThemeJson,
+    });
+
+    // 如果需要迁移
+    if (!result) return;
+
+    // 写入新的 customCssOverride
+    setCustomCssOverride(result.override);
+    
+    // 清理旧数据：从 InstalledTheme JSON 中移除 overrideCss 字段
+    if (result.newLightJson !== installedCustomLightThemeJson) {
+      setInstalledCustomLightThemeJson(result.newLightJson);
+    }
+    if (result.newDarkJson !== installedCustomDarkThemeJson) {
+      setInstalledCustomDarkThemeJson(result.newDarkJson);
+    }
+  }, [customCssOverride, installedCustomLightThemeJson, installedCustomDarkThemeJson, setCustomCssOverride, setInstalledCustomLightThemeJson, setInstalledCustomDarkThemeJson]);
+}
+```
+
+**迁移核心逻辑**（`customThemes.ts:738-772`）：
+```typescript
+export function migrateLegacyOverride(params: {
+  existingOverride: string | undefined;
+  lightJson: string | undefined;
+  darkJson: string | undefined;
+}): { override: string; newLightJson: string | undefined; newDarkJson: string | undefined } | null {
+  const { existingOverride, lightJson, darkJson } = params;
+
+  // 1. 如果已经有 customCssOverride 了，说明已经迁移过，直接返回
+  if (existingOverride?.trim()) {
+    return null;
+  }
+
+  // 2. 尝试从旧的 InstalledTheme JSON 中提取 overrideCss
+  const lightLegacy = extractLegacyOverride(lightJson);
+  const darkLegacy = extractLegacyOverride(darkJson);
+  
+  // 3. 冲突处理：如果两个主题都有 override，亮色优先（因为 UI 只显示一个）
+  const legacy = lightLegacy ?? darkLegacy;
+  if (!legacy) {
+    return null;  // 没有需要迁移的数据
+  }
+
+  // 4. 清理：重新序列化 InstalledTheme，自动丢弃 overrideCss 字段
+  // 原理：parseInstalledTheme 只会提取已知字段，未知字段（如 overrideCss）会被丢弃
+  const stripOverride = (json: string | undefined): string | undefined => {
+    const parsed = parseInstalledTheme(json);
+    return parsed ? serializeInstalledTheme(parsed) : json;
+  };
+
+  // 5. 返回迁移结果
+  return {
+    override: legacy,
+    newLightJson: lightLegacy ? stripOverride(lightJson) : lightJson,
+    newDarkJson: darkLegacy ? stripOverride(darkJson) : darkJson,
+  };
+}
+```
+
+**迁移的幂等性保证**：
+- 第一次运行：提取 override，写入 customCssOverride，清理旧数据
+- 第二次运行：existingOverride 已经有值，直接返回 null
+- 即使组件多次重渲染，也不会重复执行迁移
+
+**字段清理的巧妙设计**：
+`parseInstalledTheme` 函数只会提取明确声明的字段（id, name, repo, cssContent, baseTheme），任何额外字段（如旧的 `overrideCss`）都会被自动丢弃。这样重新序列化后，旧字段就被清理了。
+
+### 4.6 应用入口注入
+
+`packages/desktop-client/src/components/App.tsx:227-228`
 
 ```tsx
 <ThemeStyle />
 <CustomThemeStyle />
 ```
 
-这两个组件在应用根组件中渲染，确保 CSS 变量在整个应用中生效。
+**注入顺序很重要**：
+1. `ThemeStyle` 先注入基础主题 CSS 变量
+2. `CustomThemeStyle` 后注入自定义主题，可以覆盖基础主题的变量
+3. 后者的 CSS 选择器优先级相同，但由于顺序在后，会覆盖前者
 
 ---
 
@@ -300,7 +561,7 @@ export function CustomThemeStyle() {
 
 ### 5.1 theme 对象
 
-`packages/component-library/src/theme.ts:1-222
+`packages/component-library/src/theme.ts:1-222`
 
 将语义化颜色名映射到 CSS 变量：
 
@@ -344,31 +605,35 @@ Emotion CSS 在运行时将 `theme.pageBackground` 解析为 `var(--color-pageBa
 ### 6.1 主题切换完整流程
 
 ```
-用户点击设置主题
+用户点击设置主题（UI）
     ↓
 setTheme('dark') 调用 useGlobalPref 返回的 setter
     ↓
 dispatch(saveGlobalPrefs({ prefs: { theme: 'dark' } }))
     ↓
-┌─────────────────────────────────────────┐
-│ 1. 发送 'save-global-prefs 消息到后端 │
-│ 2. asyncStorage.setItem('theme', 'dark')    │
-│ 3. 写入 global-store.json               │
-└─────────────────────────────────────────┘
+┌──────────────────────────────────────────────────┐
+│ 1. 发送 'save-global-prefs' 消息到后端         │
+│ 2. asyncStorage.setItem('theme', 'dark')        │
+│ 3. 写入 global-store.json                       │
+└──────────────────────────────────────────────────┘
     ↓
 mergeGlobalPrefs({ theme: 'dark' }) 更新 Redux state
     ↓
-useTheme() 重新计算，返回新的 theme 值
+useSelector 触发所有订阅组件重新渲染
     ↓
-ThemeStyle 组件 useEffect 依赖 activeTheme 变化
+useTheme() 返回新的 theme 值
     ↓
-setThemeColors(themes.dark.colors)
+ThemeStyle 组件 useEffect 检测到 activeTheme 依赖变化
     ↓
-<style> 重新注入 dark.css 内容
+执行 effect 逻辑，计算新的 themeColors
+    ↓
+setThemeColors(themes.dark.colors) 更新本地 state
+    ↓
+组件重新渲染，<style> 注入新的 dark.css 内容
     ↓
 浏览器重新解析 --color-* 变量
     ↓
-所有使用 theme.* 的组件自动更新样式
+所有使用 theme.* 的组件样式自动更新
 ```
 
 ### 6.2 系统主题跟随（auto 模式）
@@ -386,7 +651,31 @@ setThemeColors(darkColors)
     ↓
 <style> 重新注入 dark.css 内容
     ↓
+浏览器重新解析 --color-* 变量
+    ↓
 所有组件样式自动更新
+```
+
+### 6.3 应用启动加载流程
+
+```
+应用启动
+    ↓
+App.tsx 执行 init() 函数
+    ↓
+await dispatch(loadGlobalPrefs())
+    ↓
+发送 'load-global-prefs' 消息到后端
+    ↓
+asyncStorage.multiGet() 读取 global-store.json
+    ↓
+setPrefs() 更新 Redux state
+    ↓
+ThemeStyle 和 CustomThemeStyle 首次渲染
+    ↓
+useEffect 执行，注入初始主题 CSS
+    ↓
+应用显示对应主题
 ```
 
 ---
@@ -395,22 +684,228 @@ setThemeColors(darkColors)
 
 | 文件路径 | 作用 |
 |---------|------|
-| `packages/loot-core/src/types/prefs.ts` | 定义 GlobalPrefs 类型 |
-| `packages/loot-core/src/server/preferences/app.ts` | 后端持久化逻辑 |
-| `packages/desktop-client/src/prefs/prefsSlice.ts` | Redux 状态管理 |
-| `packages/desktop-client/src/hooks/useGlobalPref.ts` | 全局偏好 Hook |
-| `packages/desktop-client/src/style/theme.tsx` | ThemeStyle + CustomThemeStyle |
-| `packages/component-library/src/theme.ts` | 组件库主题映射 |
-| `packages/component-library/src/themes/*.css` | CSS 变量定义 |
-| `packages/desktop-client/src/components/App.tsx` | 主题注入入口 |
+| `packages/loot-core/src/types/prefs.ts` | 定义 GlobalPrefs、Theme、DarkTheme 类型 |
+| `packages/loot-core/src/server/preferences/app.ts` | 后端持久化逻辑（load/save global prefs） |
+| `packages/desktop-client/src/prefs/prefsSlice.ts` | Redux 状态管理（load/save actions） |
+| `packages/desktop-client/src/hooks/useGlobalPref.ts` | 全局偏好 Hook（读 + 写） |
+| `packages/desktop-client/src/hooks/useMetadataPref.ts` | 预算元数据 Hook |
+| `packages/desktop-client/src/style/theme.tsx` | ThemeStyle + CustomThemeStyle + 迁移逻辑 |
+| `packages/desktop-client/src/style/customThemes.ts` | 自定义主题工具函数（验证、解析、迁移） |
+| `packages/component-library/src/theme.ts` | 组件库主题映射（theme 对象） |
+| `packages/component-library/src/themes/*.css` | CSS 变量定义（palette + 三套主题） |
+| `packages/desktop-client/src/components/App.tsx` | 应用入口，主题组件注入位置 |
 
 ---
 
-## 八、如何实现预算文件粒度的主题持久化（如果需要
+## 八、预算文件粒度主题持久化改造方案（可落地步骤）
 
-当前主题是应用级别的，如果需要实现预算文件粒度的主题，需要做以下修改：
+### 8.1 改造目标
 
-1. 将 `theme` 等字段从 `GlobalPrefs` 移动到 `MetadataPrefs`
-2. 修改 `loadPrefs`/`savePrefs` 支持主题字段
-3. 修改 `useTheme` 从 `useMetadataPref` 而非 `useGlobalPref`
-4. 在加载预算时触发主题重新应用
+将主题从**应用级别**改为**预算文件级别**，每个预算文件可以有独立的主题设置。切换预算文件时，主题自动切换。
+
+### 8.2 改造步骤
+
+#### 步骤 1：扩展 MetadataPrefs 类型
+
+**文件**：`packages/loot-core/src/types/prefs.ts`
+
+```typescript
+// 在 MetadataPrefs 中添加主题相关字段
+export type MetadataPrefs = Partial<{
+  budgetName: string;
+  id: string;
+  lastUploaded: string;
+  cloudFileId: string;
+  groupId: string;
+  encryptKeyId: string;
+  lastSyncedTimestamp: string;
+  resetClock: boolean;
+  lastScheduleRun: string;
+  userId: string;
+  
+  // 新增：预算文件级主题设置
+  theme: Theme;
+  preferredDarkTheme: DarkTheme;
+  installedCustomLightTheme?: string;
+  installedCustomDarkTheme?: string;
+  customCssOverride?: string;
+}>;
+```
+
+#### 步骤 2：修改后端 metadata 加载/保存逻辑
+
+**文件**：`packages/loot-core/src/server/prefs.ts`
+
+当前 `loadPrefs` 和 `savePrefs` 已经支持任意 `MetadataPrefs` 字段，不需要修改。但需要确保主题字段能正确序列化/反序列化。
+
+#### 步骤 3：创建预算级主题 Hook
+
+**文件**：新建 `packages/desktop-client/src/hooks/useBudgetTheme.ts`（或修改现有文件）
+
+```typescript
+import type { Theme, DarkTheme } from '@actual-app/core/types/prefs';
+
+import { useMetadataPref } from './useMetadataPref';
+
+export function useBudgetTheme() {
+  const [theme = 'auto', setThemePref] = useMetadataPref('theme');
+  return [theme, setThemePref] as const;
+}
+
+export function useBudgetPreferredDarkTheme() {
+  const [darkTheme = 'dark', setDarkTheme] = useMetadataPref('preferredDarkTheme');
+  return [darkTheme, setDarkTheme] as const;
+}
+
+export function useBudgetCustomTheme() {
+  const [installedCustomLightTheme, setInstalledCustomLightTheme] = 
+    useMetadataPref('installedCustomLightTheme');
+  const [installedCustomDarkTheme, setInstalledCustomDarkTheme] = 
+    useMetadataPref('installedCustomDarkTheme');
+  const [customCssOverride, setCustomCssOverride] = 
+    useMetadataPref('customCssOverride');
+  
+  return {
+    installedCustomLightTheme,
+    setInstalledCustomLightTheme,
+    installedCustomDarkTheme,
+    setInstalledCustomDarkTheme,
+    customCssOverride,
+    setCustomCssOverride,
+  };
+}
+```
+
+#### 步骤 4：修改 ThemeStyle 和 CustomThemeStyle
+
+**文件**：`packages/desktop-client/src/style/theme.tsx`
+
+将 `useGlobalPref` 替换为 `useMetadataPref`：
+
+```typescript
+export function useTheme() {
+  // 从 useGlobalPref 改为 useMetadataPref
+  const [theme = 'auto', setThemePref] = useMetadataPref('theme');
+  return [theme, setThemePref] as const;
+}
+
+export function usePreferredDarkTheme() {
+  // 从 useGlobalPref 改为 useMetadataPref
+  const [darkTheme = 'dark', setDarkTheme] = useMetadataPref('preferredDarkTheme');
+  return [darkTheme, setDarkTheme] as const;
+}
+
+export function ThemeStyle() {
+  const [activeTheme] = useTheme();
+  const [darkThemePreference] = usePreferredDarkTheme();
+  // 从 useGlobalPref 改为 useMetadataPref
+  const [installedCustomLightThemeJson] = useMetadataPref('installedCustomLightTheme');
+  const [installedCustomDarkThemeJson] = useMetadataPref('installedCustomDarkTheme');
+  // ... 其余逻辑不变
+}
+
+export function CustomThemeStyle() {
+  useMigrateLegacyOverride();
+  const [activeTheme] = useTheme();
+  // 从 useGlobalPref 改为 useMetadataPref
+  const [installedCustomLightThemeJson] = useMetadataPref('installedCustomLightTheme');
+  const [installedCustomDarkThemeJson] = useMetadataPref('installedCustomDarkTheme');
+  const [customCssOverride] = useMetadataPref('customCssOverride');
+  // ... 其余逻辑不变
+}
+```
+
+#### 步骤 5：修改迁移逻辑（可选）
+
+如果需要支持旧数据迁移，可以修改 `useMigrateLegacyOverride` 从 GlobalPrefs 读取旧值，写入 MetadataPrefs。
+
+#### 步骤 6：确保加载预算时触发主题更新
+
+**文件**：`packages/desktop-client/src/components/App.tsx`
+
+当前架构下，加载预算时 Redux state `prefs.local` 会更新，`useMetadataPref` 会自动返回新值，`ThemeStyle` 的 useEffect 会自动重新执行，主题会自动切换。不需要额外修改。
+
+**验证流程**：
+```
+加载预算文件 A
+    ↓
+loadPrefs() 读取 budget-A/metadata.json
+    ↓
+setPrefs() 更新 Redux state.prefs.local
+    ↓
+useMetadataPref('theme') 返回预算 A 的主题设置
+    ↓
+ThemeStyle useEffect 重新执行
+    ↓
+注入预算 A 的主题 CSS
+    ↓
+切换到预算文件 B
+    ↓
+loadPrefs() 读取 budget-B/metadata.json
+    ↓
+setPrefs() 更新 Redux state.prefs.local
+    ↓
+useMetadataPref('theme') 返回预算 B 的主题设置
+    ↓
+ThemeStyle useEffect 重新执行
+    ↓
+注入预算 B 的主题 CSS
+```
+
+#### 步骤 7：更新设置 UI
+
+修改主题设置页面，让用户知道主题是**当前预算文件**的设置，而非全局设置。可以添加一个选项："应用到所有预算文件"。
+
+#### 步骤 8：数据迁移（可选）
+
+如果需要将用户现有的全局主题设置迁移为默认预算主题，可以在应用启动时执行一次性迁移：
+
+```typescript
+// 在加载第一个预算时，如果 metadata.json 没有主题设置，
+// 从 global-store.json 复制过来
+async function migrateGlobalThemeToBudget(budgetId: string) {
+  const globalPrefs = await send('load-global-prefs');
+  const metadataPrefs = await send('load-prefs');
+  
+  if (!metadataPrefs.theme && globalPrefs.theme) {
+    await send('save-prefs', {
+      theme: globalPrefs.theme,
+      preferredDarkTheme: globalPrefs.preferredDarkTheme,
+      installedCustomLightTheme: globalPrefs.installedCustomLightTheme,
+      installedCustomDarkTheme: globalPrefs.installedCustomDarkTheme,
+      customCssOverride: globalPrefs.customCssOverride,
+    });
+  }
+}
+```
+
+### 8.3 改造注意事项
+
+1. **向后兼容**：旧的 `metadata.json` 没有主题字段，需要提供默认值（`'auto'`）
+2. **全局主题的取舍**：改造后，`GlobalPrefs` 中的主题字段可以保留作为默认值，也可以移除
+3. **设置 UI 提示**：需要明确告诉用户主题是"当前预算"的设置
+4. **性能**：每次切换预算都会重新注入主题 CSS，这是正常的，不会有性能问题
+5. **自定义主题文件大小**：如果用户安装了包含内嵌字体的自定义主题，`metadata.json` 会变大，但这是可接受的
+
+### 8.4 替代方案：混合模式
+
+如果不想完全去掉全局主题，可以实现混合模式：
+- 全局主题作为默认设置
+- 每个预算可以选择"继承全局主题"或"使用独立主题"
+- 在 `MetadataPrefs` 中添加 `useCustomTheme: boolean` 字段控制
+
+---
+
+## 九、常见问题解答
+
+### Q: 为什么不使用 React Context 传递主题？
+A: 因为主题是通过 CSS 变量实现的，一旦注入到 `<style>` 标签中就是全局的。组件只需要通过 `theme` 对象引用 CSS 变量名，不需要通过 Context 获取当前主题值。这种方式比 Context 更简单、性能更好。
+
+### Q: auto 模式下，JavaScript 监听和 CSS @media 有什么区别？
+A: `ThemeStyle` 使用 JavaScript 监听是因为需要切换基础主题 CSS（light.css / dark.css），而 `CustomThemeStyle` 使用 CSS @media 是因为自定义主题的 CSS 可以直接用媒体查询包装，让浏览器自动切换。两者配合使用。
+
+### Q: 为什么主题不存储在预算数据库里？
+A: 主题是 UI 层面的设置，不属于业务数据。存储在 `metadata.json` 中更合适，因为它是预算文件的元数据，不需要同步到其他设备（当然如果需要也可以同步）。
+
+### Q: 切换主题时所有组件都会重新渲染吗？
+A: 不会。只有 `ThemeStyle` 和 `CustomThemeStyle` 组件会重新渲染（因为它们订阅了主题状态）。其他组件只是引用 CSS 变量，浏览器会自动更新样式，不需要 React 重新渲染。这是 CSS 变量方案的一大优势。
