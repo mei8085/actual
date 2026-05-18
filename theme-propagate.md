@@ -908,4 +908,164 @@ A: `ThemeStyle` 使用 JavaScript 监听是因为需要切换基础主题 CSS（
 A: 主题是 UI 层面的设置，不属于业务数据。存储在 `metadata.json` 中更合适，因为它是预算文件的元数据，不需要同步到其他设备（当然如果需要也可以同步）。
 
 ### Q: 切换主题时所有组件都会重新渲染吗？
-A: 不会。只有 `ThemeStyle` 和 `CustomThemeStyle` 组件会重新渲染（因为它们订阅了主题状态）。其他组件只是引用 CSS 变量，浏览器会自动更新样式，不需要 React 重新渲染。这是 CSS 变量方案的一大优势。
+A: 不会全部重新渲染，但比之前认为的要多。**会重新渲染的组件和 Hook**（直接订阅主题状态的有 9 个：
+1. `ThemeStyle` - 核心主题注入组件
+2. `CustomThemeStyle` - 自定义主题注入组件
+3. `ThemeSettings` - 设置页面（预算内可见）
+4. `ThemeInstaller` - 自定义主题安装器
+5. `ThemeSelector` - 快速主题切换按钮
+6. `FormulaEditor` - 公式编辑器
+7. `App.tsx` - 根组件（设置 `data-theme` 属性）
+8. `useMetaThemeColor` hook - 更新浏览器主题色 meta 标签
+9. `useTagCSS` hook - 生成标签 CSS 样式
+
+**不会重新渲染但样式会自动更新**：
+- 所有使用 `theme` 对象引用 CSS 变量的组件（通过浏览器自动更新 CSS 变量值）
+- 这是 CSS 变量方案的一大优势，大部分组件不需要 React 重渲染
+
+---
+
+## 十、关键边界场景深入分析
+
+### 10.1 预算未打开时管理页主题来源与实际行为
+
+**问题：没有打开预算文件时，管理页（ManagementApp）的主题从哪里来？
+
+**代码证据链：
+
+1. **主题注入时机**（`App.tsx:227-228`）
+   ```tsx
+   <ThemeStyle />
+   <CustomThemeStyle />
+   ```
+   这两个组件在应用根组件中渲染，**无论是否打开预算都会渲染。
+
+2. **全局偏好加载时机**（`App.tsx:91`）
+   ```typescript
+   await dispatch(loadGlobalPrefs());
+   ```
+   全局偏好（包括主题）在应用启动时就加载了，在加载预算之前。
+
+3. **管理页也使用主题**（`ManagementApp.tsx:7, 45, 69`）
+   ```tsx
+   <View style={{ height: '100%', color: theme.pageText }}>
+   // 版本号颜色使用 theme.pageTextSubdued
+   useMetaThemeColor(isNarrowWidth ? theme.mobileConfigServerViewTheme : undefined);
+   ```
+   管理页也使用 `theme` 对象引用 CSS 变量。
+
+**实际行为结论：
+
+| 场景 | 主题来源 | 能否修改主题 |
+|--------|-----------|-------------|
+| 未打开预算（管理页） | `global-store.json` 中的全局主题设置 | ❌ 不能（设置页面只在预算内可见 |
+| 已打开预算（预算页） | `global-store.json` 中的全局主题设置 | ✅ 可以（通过设置页面） |
+
+**重要发现**：
+- 即使没有预算，主题 CSS 变量也会被注入并生效
+- 但用户无法在管理页修改主题（设置页面 `ThemeSettings` 只在 `FinancesApp` 内的 `Settings` 组件中渲染（`settings/index.tsx:240`）
+- `ThemeSelector` 快速切换按钮也只在预算内的标题栏中
+
+---
+
+### 10.2 预算文件粒度主题方案的补充改动点
+
+之前的 8 步方案遗漏了以下关键改动点：
+
+#### 补充步骤 9：处理管理页主题来源
+
+**问题**：如果主题是预算文件粒度，未打开预算时管理页的主题从哪里来？
+
+**方案 A（推荐）：保留全局主题作为默认值
+- 保留 `GlobalPrefs.theme` 作为默认主题
+- 预算文件的 `MetadataPrefs.theme` 优先级更高
+- 未打开预算时使用全局主题
+- 打开预算时，如果预算有主题设置则使用预算的，否则使用全局主题
+
+**方案 B：管理页使用固定主题
+- 未打开预算时固定使用亮色主题或系统默认
+- 打开预算后切换到预算的主题
+
+#### 补充步骤 10：调整主题设置页面的访问性
+
+当前 `ThemeSettings` 只在预算内可见（`settings/index.tsx:240`）。如果主题是预算粒度，需要考虑：
+
+1. **是否在管理页也提供主题设置**：
+   - 作为新预算的默认主题设置
+   - 或者管理页可以修改全局默认主题
+
+2. **在创建预算时的主题选择**：
+   - 新预算默认继承全局主题
+   - 或者提供主题选择器让用户选择
+
+#### 补充步骤 11：修改所有订阅主题的组件
+
+除了 `ThemeStyle` 和 `CustomThemeStyle`，还有 7 个组件/hook 也直接订阅主题状态，需要一并修改：
+
+| 组件/Hook | 当前使用 | 需要修改为 |
+|-----------|----------|-----------|
+| `ThemeSettings` | `useTheme()` | 预算级主题 Hook |
+| `ThemeInstaller` | `useGlobalPref('customCssOverride') | 预算级主题 Hook |
+| `ThemeSelector` | `useTheme()` | 预算级主题 Hook |
+| `FormulaEditor` | `useTheme()` | 预算级主题 Hook |
+| `App.tsx:195` | `useTheme()` | 预算级主题或全局默认 |
+| `useMetaThemeColor` | `useTheme()` | 预算级主题 Hook |
+| `useTagCSS` | `useTheme()` | 预算级主题 Hook |
+
+#### 补充步骤 12：处理关闭预算时的主题切换
+
+当前 `closeBudget` 会调用 `resetApp()`，但 `resetApp` 保留了 `global` 状态（`prefsSlice.ts:186-189`）：
+```typescript
+builder.addCase(resetApp, state => ({
+  ...initialState,
+  global: state.global || initialState.global,
+  server: state.server || initialState.server,
+}));
+```
+
+如果主题改为预算粒度，关闭预算后需要：
+- 切换回全局默认主题
+- 或者保留最后一个预算的主题（取决于产品决策）
+
+#### 补充步骤 13：数据迁移策略
+
+将现有用户的全局主题迁移到预算文件：
+- 首次打开预算时，如果预算没有主题设置，从全局主题复制到预算的 `metadata.json`
+- 或者只在用户修改主题时才写入预算文件
+
+---
+
+### 10.3 主题状态变更的实际影响范围（纠正之前的结论）
+
+**之前的错误结论**："只有 `ThemeStyle` 和 `CustomThemeStyle` 会重新渲染"
+
+**实际影响范围**：
+
+#### 直接订阅主题状态的组件/Hook（**会重新渲染**：
+
+| 组件/Hook | 文件位置 | 订阅内容 |
+|------------|----------|-----------|
+| `useTheme() | `theme.tsx:36-39 | `useGlobalPref('theme') |
+| `usePreferredDarkTheme() | `theme.tsx:41-45 | `useGlobalPref('preferredDarkTheme') |
+| `ThemeStyle` | `theme.tsx:95-174 | `useTheme() + `usePreferredDarkTheme() + 2个自定义主题 pref |
+| `CustomThemeStyle` | `theme.tsx:183-247 | `useTheme() + 3个自定义主题 pref |
+| `ThemeSettings` | `settings/Themes.tsx:42-200+ | `useTheme() + `usePreferredDarkTheme() + 3个自定义主题 pref |
+| `ThemeInstaller` | `settings/ThemeInstaller.tsx` | `useGlobalPref('customCssOverride') |
+| `ThemeSelector` | `ThemeSelector.tsx:22-75 | `useTheme()` |
+| `FormulaEditor` | `formula/FormulaEditor.tsx:37 | `useTheme()` |
+| `App.tsx` | `App.tsx:195 | `useTheme()` |
+| `useMetaThemeColor` | `hooks/useMetaThemeColor.ts:13-27 | `useTheme() + `usePreferredDarkTheme() |
+| `useTagCSS` | `hooks/useTagCSS.ts:11-44 | `useTheme()` |
+
+**总计**：11 个组件/Hook 直接订阅主题状态，主题变化时都会重新渲染。
+
+#### 不会重新渲染但样式会自动更新的组件：
+
+所有使用 `theme` 对象引用 CSS 变量的组件（数量很多，但浏览器自动更新 CSS 变量值，不需要 React 重渲染。这是 CSS 变量方案的一大优势。
+
+**主题变化的性能影响：
+- 11 个组件重渲染
+- 浏览器重新解析 CSS 变量
+- 大部分组件不需要重渲染
+
+这个影响很小，性能影响可以忽略不计
