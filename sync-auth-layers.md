@@ -1,12 +1,12 @@
 # Actual Budget 同步服务器授权机制层级分析
 
-> **修订说明**：本文档基于代码深度审计完成，所有结论均标注证据来源。明确区分「代码事实」与「风险推断」。本次修订重点核实了：sessions.auth_method 写入路径、user_name 为空账户的边界、多用户 session 接管声明的有效性。
+> **修订说明**：本文档基于代码深度审计完成，所有结论均标注证据来源。明确区分「代码事实」与「风险推断」。本次修订重点核实了：/admin/access 与 transfer-ownership 对授权的影响、sessions.auth_method 写入路径、场景8的条件化表述与前置条件。
 
 ---
 
 ## 证据链说明
 
-本文档中所有结论分为两类：
+本文档中所有结论分为三类：
 
 | 类别 | 标记 | 含义 |
 |-----|------|------|
@@ -135,8 +135,8 @@ export function getLoginMethod(req) {
 
 ### 1.2 三种登录方式对比
 
-| 登录方式 | 触发条件 | 处理模块 | auth_method 写入值 |
-|---------|---------|---------|-------------------|
+| 登录方式 | 触发条件 | 处理模块 | sessions.auth_method 写入值 |
+|---------|---------|---------|---------------------------|
 | **密码登录** | 默认方式，或 loginMethod='password' | `accounts/password.js` | `'password'` |
 | **OpenID Connect** | loginMethod='openid' | `accounts/openid.ts` | `'openid'` |
 | **Header 认证** | 配置 loginMethod='header' | `util/validate-user.ts` + `loginWithPassword()` | `'password'`（复用密码登录） |
@@ -145,21 +145,19 @@ export function getLoginMethod(req) {
 
 ### 1.3 sessions.auth_method 写入路径汇总
 
-**生产代码中所有写入 `sessions.auth_method` 的位置**：
+✅ **代码事实**：生产代码中所有写入 `sessions.auth_method` 的位置：
 
-| 代码位置 | 写入值 | 场景 |
-|---------|--------|------|
-| `accounts/password.js:98` | `'password'` | 密码登录新建 session |
-| `accounts/openid.ts:330` | `'openid'` | OpenID 登录新建 session |
-| `migrations/1719409568000-multiuser.js:48` | `'password'` | 数据库迁移，更新旧数据（auth_method IS NULL） |
+| 代码位置 | 写入值 | 场景 | SQL 操作 |
+|---------|--------|------|----------|
+| `accounts/password.js:98` | `'password'` | 密码登录新建 session | INSERT |
+| `accounts/openid.ts:330` | `'openid'` | OpenID 登录新建 session | INSERT |
+| `migrations/1719409568000-multiuser.js:48` | `'password'` | 数据库迁移，更新旧数据（auth_method IS NULL） | UPDATE |
 
 ✅ **代码事实**：`password.js:103` 更新 session 时的 SQL 为：
 ```sql
 UPDATE sessions SET user_id = ?, expires_at = ? WHERE token = ?
 ```
 **不更新 `auth_method` 字段**，只更新 `user_id` 和 `expires_at`。
-
----
 
 ### 1.4 密码登录流程的 Session 复用机制
 
@@ -239,8 +237,6 @@ export function loginWithPassword(password) {
 | 非首次登录，不存在 user_name='' 的用户 | 返回 'user-not-found' 错误 |
 | 管理员创建的 user_name≠'' 的用户 | 无法通过密码登录 |
 
----
-
 ### 1.5 Token 过期配置语义与单位口径
 
 #### 配置定义
@@ -301,8 +297,6 @@ if (config.get('token_expiration') === 'openid-provider') {
 | OpenID 登录 | `config`（无乘法） | ✅ 一致 | Token 在 1 小时后过期（3600 秒） |
 
 ⚠️ **风险推断**：这是一个 Bug。密码登录实现错误地将秒当成了分钟处理。
-
----
 
 ### 1.6 Header 认证
 
@@ -588,84 +582,183 @@ if (!path.startsWith(resolve(config.get('userFiles')))) {
 
 ---
 
-## /admin/access 对授权的影响
+## /admin/access 与 transfer-ownership 对授权的影响
 
-### 5.1 授予访问权限 (`POST /admin/access`)
+### 5.1 授予访问权限：`POST /admin/access`
 
 ✅ **代码事实**：`app-admin.js:218-271`
 
 ```javascript
 app.post('/access', (req, res) => {
+  const userAccess = req.body || {};
   const session = validateSession(req, res);
   if (!session) return;
 
   // ⚠️ 使用 checkFilePermission：仅 owner 或 admin 可以授予权限
   // 被共享的用户不能再共享给其他人！
   const { granted } = UserService.checkFilePermission(
-    userAccess.fileId, session.user_id,
+    userAccess.fileId,
+    session.user_id,
   ) || { granted: 0 };
 
   if (granted === 0 && !isAdmin(session.user_id)) {
-    res.status(400).send({ status: 'error', reason: 'file-denied' });
+    res.status(400).send({
+      status: 'error',
+      reason: 'file-denied',
+      details: "You don't have permissions over this file",
+    });
     return;
   }
 
+  // 检查文件存在
+  const fileIdInDb = UserService.getFileById(userAccess.fileId);
+  if (!fileIdInDb) { /* 返回 404 */ return; }
+
+  // 检查目标用户 ID 不为空
+  if (!userAccess.userId) { /* 返回 400 */ return; }
+
   // 检查目标用户是否已有权限（通过 owner 或 user_access）
   if (UserService.countUserAccess(userAccess.fileId, userAccess.userId) > 0) {
-    res.status(400).send({ status: 'error', reason: 'user-already-have-access' });
+    res.status(400).send({
+      status: 'error',
+      reason: 'user-already-have-access',
+    });
     return;
   }
 
   // 插入 user_access 记录
   UserService.addUserAccess(userAccess.userId, userAccess.fileId);
-  res.status(200).send({ status: 'ok' });
+  res.status(200).send({ status: 'ok', data: {} });
 });
 ```
 
-**授权变化**：
-- 目标用户获得该文件的访问权限
-- 目标用户可以：同步、下载、查看文件信息
-- 目标用户不能：共享给他人、转移所有权、删除文件
+**对最终访问授权的改变**：
 
-### 5.2 撤销访问权限 (`DELETE /admin/access`)
+| 操作 | 数据库变化 | 对 targetUser 权限的影响 |
+|-----|-----------|------------------------|
+| POST `/admin/access` | 向 `user_access` 表插入记录 `(targetUserId, fileId)` | targetUser 获得该文件的访问权限<br>✅ 可以：同步、下载、查看文件信息<br>❌ 不能：共享给他人、转移所有权、删除文件 |
+
+**前置条件**：
+1. 操作者必须是文件所有者 **或** 服务器管理员
+2. 文件必须存在
+3. 目标用户 ID 不为空
+4. 目标用户尚未拥有该文件的访问权限（既不是 owner，也不在 user_access 表中）
+
+### 5.2 撤销访问权限：`DELETE /admin/access`
 
 ✅ **代码事实**：`app-admin.js:273-318`
 
-- 同样需要 owner 或 admin 权限
-- 从 `user_access` 表删除记录
-- 被撤销的用户立即失去访问权限（下次请求时被 `requireFileAccess` 阻断）
+```javascript
+app.delete('/access', (req, res) => {
+  const fileId = req.query.fileId;
+  const session = validateSession(req, res);
+  if (!session) return;
 
-### 5.3 转移所有权 (`POST /admin/access/transfer-ownership`)
+  // 同样需要 owner 或 admin 权限
+  const { granted } = UserService.checkFilePermission(
+    fileId, session.user_id,
+  ) || { granted: 0 };
+  if (granted === 0 && !isAdmin(session.user_id)) { /* 返回 400 */ return; }
+
+  // 检查文件存在
+  const fileIdInDb = UserService.getFileById(fileId);
+  if (!fileIdInDb) { /* 返回 404 */ return; }
+
+  // 批量删除 user_access 记录
+  const { ids } = req.body || {};  // 要撤销的用户 ID 数组
+  const totalDeleted = UserService.deleteUserAccessByFileId(ids, fileId);
+
+  if (ids.length === totalDeleted) {
+    res.status(200).send({ status: 'ok', data: { someDeletionsFailed: false } });
+  } else {
+    res.status(400).send({ status: 'error', reason: 'not-all-deleted' });
+  }
+});
+```
+
+**对最终访问授权的改变**：
+
+| 操作 | 数据库变化 | 对 targetUser 权限的影响 |
+|-----|-----------|------------------------|
+| DELETE `/admin/access` | 从 `user_access` 表删除记录 `(targetUserId, fileId)` | targetUser 立即失去访问权限<br>下次请求时被 `requireFileAccess` 阻断 |
+
+**前置条件**：
+1. 操作者必须是文件所有者 **或** 服务器管理员
+2. 文件必须存在
+3. 要撤销的用户 ID 数组不能为空
+
+### 5.3 转移所有权：`POST /admin/access/transfer-ownership`
 
 ✅ **代码事实**：`app-admin.js:353-408`
 
 ```javascript
-app.post('/access/transfer-ownership/', validateSessionMiddleware, (req, res) => {
-  // ⚠️ 同样使用 checkFilePermission：仅 owner 或 admin 可以转移
-  const { granted } = UserService.checkFilePermission(
-    newUserOwner.fileId, res.locals.user_id,
-  ) || { granted: 0 };
+app.post(
+  '/access/transfer-ownership/',
+  validateSessionMiddleware,
+  (req, res) => {
+    const newUserOwner = req.body || {};
 
-  if (granted === 0 && !isAdmin(res.locals.user_id)) {
-    res.status(400).send({ status: 'error', reason: 'file-denied' });
-    return;
-  }
+    // 同样使用 checkFilePermission：仅 owner 或 admin 可以转移
+    const { granted } = UserService.checkFilePermission(
+      newUserOwner.fileId,
+      res.locals.user_id,
+    ) || { granted: 0 };
 
-  // 更新 files.owner 字段
-  UserService.updateFileOwner(newUserOwner.newUserId, newUserOwner.fileId);
-  res.status(200).send({ status: 'ok' });
-});
+    if (granted === 0 && !isAdmin(res.locals.user_id)) {
+      res.status(400).send({
+        status: 'error',
+        reason: 'file-denied',
+        details: "You don't have permissions over this file",
+      });
+      return;
+    }
+
+    // 检查文件存在
+    const fileIdInDb = UserService.getFileById(newUserOwner.fileId);
+    if (!fileIdInDb) { /* 返回 404 */ return; }
+
+    // 检查新所有者 ID 不为空
+    if (!newUserOwner.newUserId) { /* 返回 400 */ return; }
+
+    // 检查新用户存在
+    const newUserIdFromDb = UserService.getUserById(newUserOwner.newUserId);
+    if (newUserIdFromDb === 0) { /* 返回 400 */ return; }
+
+    // ⚠️ 更新 files.owner 字段
+    UserService.updateFileOwner(newUserOwner.newUserId, newUserOwner.fileId);
+
+    res.status(200).send({ status: 'ok', data: {} });
+  },
+);
 ```
 
-**所有权转移后的权限变化**：
+✅ **代码事实**：`user-service.ts:141-149`
+```typescript
+export function updateFileOwner(ownerId, fileId) {
+  const result = getAccountDb().mutate(
+    'UPDATE files set owner = ? WHERE id = ?',
+    [ownerId, fileId],
+  );
+}
+```
 
-| 用户 | 转移前权限 | 转移后权限 |
-|-----|-----------|-----------|
-| 旧所有者 | Owner（完整权限） | 失去 Owner 权限<br>⚠️ 如果旧所有者在 user_access 表中仍有记录，则保留访问权限<br>否则完全失去访问 |
-| 新所有者 | 可能无权限 / 可能有 user_access | 获得 Owner 权限<br>可以共享、转移、删除文件 |
-| 其他共享用户 | user_access 权限 | 不变 |
+**⚠️ 关键发现**：`updateFileOwner` **只更新 `files.owner` 字段，不修改 `user_access` 表**。
 
-⚠️ **风险推断**：转移所有权后，系统不会自动清理 user_access 表中旧所有者的记录。如果旧所有者之前在 user_access 表中（通常不会，但理论可能），则仍然保留访问权限。
+**对最终访问授权的改变**：
+
+| 用户 | 转移前权限 | 转移后权限 | 说明 |
+|-----|-----------|-----------|------|
+| 旧所有者 | Owner（完整权限） | 失去 Owner 权限<br>⚠️ 如果在 `user_access` 表中有记录，则保留访问权限<br>否则完全失去访问 | `requireFileAccess` 检查逻辑决定 |
+| 新所有者 | 可能无权限 / 可能有 user_access | 获得 Owner 权限<br>可以：共享、转移、删除文件 | `files.owner` 字段更新为 newUserId |
+| 其他共享用户 | user_access 权限 | 不变 | `user_access` 表未被修改 |
+
+**前置条件**：
+1. 操作者必须是文件所有者 **或** 服务器管理员
+2. 文件必须存在
+3. 新所有者 ID 不为空
+4. 新用户必须存在于数据库中
+
+⚠️ **风险推断**：转移所有权后，系统不会自动清理 `user_access` 表中旧所有者的记录。如果旧所有者之前在 `user_access` 表中（通常不会，但理论可能），则仍然保留访问权限。
 
 ---
 
@@ -801,20 +894,39 @@ getPathForUserFile(fileId) → 构造路径
 
 ### 场景 8：管理员创建的用户尝试密码登录
 
+**前置条件**：
+1. 系统已完成首次密码登录，存在 `user_name = ''` 的用户
+2. 管理员通过 `POST /admin/users` 创建了一个 `user_name = 'alice'` 的新用户
+3. Alice 尝试使用密码登录接口
+
 **攻击路径**：
-1. 管理员创建了一个 user_name = 'alice' 的用户
-2. Alice 尝试使用密码登录
+1. Alice 调用 `POST /login`，参数 `{ password: '正确密码', loginMethod: 'password' }`
+2. 系统执行密码登录流程
 
 **阻断路径**：
 ```
 /login 接口
         ↓
 loginWithPassword(password)
+        ├─→ 密码验证 → ✅ 通过
+        └─→ 查询 users 表计数 → ✅ totalOfUsers > 0
         ↓
-查询 user_name = '' 的用户 → ❌ Alice 的 user_name 不是空字符串
+查询 user_name = '' 的用户
+        └─→ Alice 的 user_name 不是空字符串 → ❌ 不匹配
         ↓
-返回 user-not-found
+userId = undefined
+        ↓
+返回 { error: 'user-not-found' }
 ```
+
+**条件化表述**：
+> 当且仅当系统中存在 `user_name <> ''` 的用户（即管理员创建的用户），且该用户尝试通过密码登录时，系统会返回 `user-not-found` 错误。
+
+**发生此阻断的必备条件**：
+- ✅ 系统已初始化，存在至少一个用户
+- ✅ 管理员创建了 `user_name` 不为空的用户
+- ✅ 该用户使用密码登录方式
+- ✅ 数据库中不存在 `user_name = ''` 的用户（被删除或未创建）
 
 ---
 
@@ -862,6 +974,7 @@ loginWithPassword(password)
 | 被共享用户可以再共享 | ❌ 被共享用户不能再共享或转移所有权 | `app-admin.js:224-238` |
 | 转移所有权后旧所有者完全失去访问 | ❌ 如果旧所有者在 user_access 表中，仍保留访问权限 | `requireFileAccess` 逻辑 |
 | Header 认证是独立的登录方式 | ❌ Header 认证只是密码登录的信任代理，复用密码 session | `app-account.js:89` |
+| transfer-ownership 会清理 user_access | ❌ 只更新 files.owner 字段，不修改 user_access 表 | `user-service.ts:147` |
 
 ---
 
@@ -878,7 +991,7 @@ loginWithPassword(password)
 | 管理接口权限 | `user-service.ts:184-193` | `checkFilePermission` |
 | 共享权限计数 | `user-service.ts:169-182` | `countUserAccess` |
 | 文件服务 | `app-sync/services/files-service.ts` | `FilesService`, `File`, `FileUpdate` |
-| 用户权限服务 | `services/user-service.ts` | `addUserAccess`, `updateFileOwner`, `getUserByUsername` |
+| 用户权限服务 | `services/user-service.ts` | `addUserAccess`, `updateFileOwner`, `deleteUserAccessByFileId`, `getUserByUsername` |
 | 账户数据库操作 | `account-db.js` | `getSession`, `isAdmin`, `hasPermission` |
 
 ---
@@ -896,6 +1009,8 @@ Actual Budget 的授权机制采用**纵深防御**策略，以下是经过代�
 5. **共享权限不可传递**：被共享用户不能再共享或转移所有权
 6. **Header 认证本质**：只是密码登录的信任代理，auth_method 仍为 'password'
 7. **管理员创建的用户无法密码登录**：因为密码登录只认 `user_name=''` 的用户
+8. **transfer-ownership 只更新 owner**：不修改 user_access 表，旧所有者可能保留访问权限
+9. **sessions.auth_method 只有 3 个写入点**：更新 session 时不修改该字段
 
 ### ⚠️ 风险推断总结
 
