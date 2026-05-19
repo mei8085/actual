@@ -1,6 +1,19 @@
 # Actual Budget 同步服务器授权机制层级分析
 
-> **修订说明**：本文档基于代码深度审计完成，修正了之前版本中多处不准确的结论。所有结论均有明确的代码证据支撑。
+> **修订说明**：本文档基于代码深度审计完成，所有结论均标注证据来源。明确区分「代码事实」与「风险推断」。
+
+---
+
+## 证据链说明
+
+本文档中所有结论分为两类：
+
+| 类别 | 标记 | 含义 |
+|-----|------|------|
+| ✅ **代码事实** | 有明确代码证据支撑的客观事实 |
+| ⚠️ **风险推断** | 基于代码逻辑推导的潜在问题/设计意图 |
+
+---
 
 ## 概述
 
@@ -48,13 +61,14 @@ Actual Budget 自托管同步服务器的授权机制分为四个核心层级，
 
 ### 1.1 登录方式决策链
 
-**代码位置**: `account-db.js:56-79`
+✅ **代码事实**：`account-db.js:56-79`
 
-登录方式的选择遵循严格的优先级顺序，这是之前版本未能准确描述的关键细节：
+登录方式的选择遵循严格的优先级顺序：
 
 ```javascript
 export function getLoginMethod(req) {
-  // 优先级 1: 请求体中明确指定的 loginMethod（需在白名单中且数据库存在）
+  // 优先级 1: 请求体中明确指定的 loginMethod
+  // 条件：在 allowedLoginMethods 白名单中 且 数据库中有该方法记录
   if (req?.body?.loginMethod && 
       config.get('allowedLoginMethods').includes(req.body.loginMethod)) {
     const row = accountDb.first('SELECT method FROM auth WHERE method = ?', 
@@ -117,21 +131,33 @@ export function getLoginMethod(req) {
 
 ### 1.2 三种登录方式对比
 
-| 登录方式 | 触发条件 | 处理模块 | Token 存储方式 |
-|---------|---------|---------|--------------|
-| **密码登录** | 默认方式，或 loginMethod='password' | `accounts/password.js` | 所有密码用户**共享同一个 session** |
-| **OpenID Connect** | loginMethod='openid' | `accounts/openid.ts` | 每次登录创建**新 session** |
-| **Header 认证** | 配置 loginMethod='header' | `util/validate-user.ts` | 复用密码登录逻辑，共享 session |
+| 登录方式 | 触发条件 | 处理模块 | auth_method 写入值 |
+|---------|---------|---------|-------------------|
+| **密码登录** | 默认方式，或 loginMethod='password' | `accounts/password.js` | `'password'` |
+| **OpenID Connect** | loginMethod='openid' | `accounts/openid.ts` | `'openid'` |
+| **Header 认证** | 配置 loginMethod='header' | `util/validate-user.ts` + `loginWithPassword()` | `'password'`（复用密码登录） |
 
-### 1.3 密码登录流程的特殊行为
+✅ **代码事实**：`app-account.js:89` - Header 认证通过后直接调用 `loginWithPassword(headerVal)`，因此 `auth_method` 被写入为 `'password'`。
 
-**代码位置**: `accounts/password.js:35-111`
+### 1.3 sessions.auth_method 字段写入来源汇总
 
-⚠️ **重要发现**：密码登录有一个特殊的 session 复用机制，之前的分析完全遗漏了这一点：
+所有写入 `sessions.auth_method` 的代码位置：
+
+| 代码位置 | 写入值 | 场景 |
+|---------|--------|------|
+| `accounts/password.js:99` | `'password'` | 密码登录新建 session |
+| `accounts/openid.ts:331` | `'openid'` | OpenID 登录新建 session |
+| `migrations/1719409568000-multiuser.js:48` | `'password'` | 数据库迁移，更新旧数据（auth_method IS NULL） |
+
+⚠️ **风险推断**：`password.js:103` 更新 session 时未更新 `auth_method` 字段，只更新了 `user_id` 和 `expires_at`。这意味着 session 复用后，`auth_method` 保持原始值。
+
+### 1.4 密码登录流程的 Session 复用机制
+
+✅ **代码事实**：`accounts/password.js:56-106`
 
 ```javascript
 export function loginWithPassword(password) {
-  // ... 密码验证 ...
+  // ... 密码验证（bcrypt.compareSync）...
   
   // ⚠️ 关键：查找已存在的 password 类型 session
   const sessionRow = accountDb.first(
@@ -144,13 +170,15 @@ export function loginWithPassword(password) {
   
   // ... 用户查找或创建 ...
   
-  // 如果 session 已存在，只更新 expires_at；否则插入新记录
+  // 新建或更新 session
   if (!sessionRow) {
+    // 新建：写入 auth_method = 'password'
     accountDb.mutate(
       'INSERT INTO sessions (token, expires_at, user_id, auth_method) VALUES (?, ?, ?, ?)',
       [token, expiration, userId, 'password'],
     );
   } else {
+    // 更新：只更新 user_id 和 expires_at，不更新 auth_method
     accountDb.mutate(
       'UPDATE sessions SET user_id = ?, expires_at = ? WHERE token = ?',
       [userId, expiration, token],
@@ -161,46 +189,49 @@ export function loginWithPassword(password) {
 }
 ```
 
-**安全影响**：
-- 所有使用密码登录的用户共享同一个 token
-- 当用户 B 用密码登录后，用户 A 的会话会被"接管"（user_id 被更新）
-- 这是单用户模式的设计，但在多用户场景下可能导致问题
+**Session 复用的适用前提**：
+- ✅ **代码事实**：查询条件是 `auth_method = 'password'`，因此只有密码登录创建的 session 会被复用
+- ✅ **代码事实**：所有密码登录用户共享同一个 session 记录
+- ⚠️ **风险推断**：这是单用户模式的设计。在多用户场景下，用户 B 用密码登录后，用户 A 的会话会被"接管"（user_id 被更新为 B 的 ID），A 的后续请求会被当作 B 处理
 
-### 1.4 密码登录 Token 过期计算
+### 1.5 Token 过期配置语义与单位口径
 
-**代码位置**: `accounts/password.js:86-94`
+#### 配置定义
+✅ **代码事实**：`load-config.js:258-263`
+```javascript
+token_expiration: {
+  doc: 'Token expiration time.',
+  format: 'tokenExpiration',
+  default: 'never',
+  env: 'ACTUAL_TOKEN_EXPIRATION',
+},
+```
 
+✅ **代码事实**：`load-config.js:31-59` - `tokenExpiration` 格式定义：
+- 允许值：`'never'`、`'openid-provider'`、非负数字
+
+✅ **文档证据**：`packages/docs/docs/config/oauth-auth.md:174-180`
+> **Possible Values:**
+> - `"never"` (tokens never expire - current default)
+> - `"openid-provider"` (tokens follow the expiration time from the OpenID provider)
+> - A numeric value in seconds (e.g., `3600` for 1 hour)
+
+**结论**：`token_expiration` 数值配置的单位是**秒**。
+
+#### 密码登录分支实现
+✅ **代码事实**：`accounts/password.js:86-94`
 ```javascript
 let expiration = TOKEN_EXPIRATION_NEVER;  // -1
 if (config.get('token_expiration') !== 'never' &&
     config.get('token_expiration') !== 'openid-provider' &&
     typeof config.get('token_expiration') === 'number') {
-  // ⚠️ 配置值单位是分钟，乘以 60 转为秒
+  // ⚠️ BUG: 文档规定单位是秒，但代码乘以了 60！
   expiration = Math.floor(Date.now() / 1000) + config.get('token_expiration') * 60;
 }
 ```
 
-### 1.5 OpenID Connect 登录流程
-
-**代码位置**: `accounts/openid.ts`
-
-分为两个阶段：
-
-**阶段一：发起认证 (`loginWithOpenIdSetup`)**
-- 生成 state、code_verifier、code_challenge（PKCE 支持）
-- 存储到 `pending_openid_requests` 表（5分钟过期）
-- 重定向到 OIDC Provider 授权页面
-
-**阶段二：回调处理 (`loginWithOpenIdFinalize`)**
-- 验证 state 有效性（防止 CSRF）
-- 用 code 换取 access_token
-- 获取用户信息，使用 `preferred_username`/`login`/`email`/`id`/`sub` 作为身份标识
-- 自动创建用户（首个用户设为 ADMIN，后续用户设为 BASIC）
-- 生成会话 Token 并返回
-
-**⚠️ 关键差异 - OpenID Token 过期计算**：
-**代码位置**: `accounts/openid.ts:317-327`
-
+#### OpenID 登录分支实现
+✅ **代码事实**：`accounts/openid.ts:317-327`
 ```javascript
 let expiration;
 if (config.get('token_expiration') === 'openid-provider') {
@@ -208,8 +239,7 @@ if (config.get('token_expiration') === 'openid-provider') {
 } else if (config.get('token_expiration') === 'never') {
   expiration = TOKEN_EXPIRATION_NEVER;
 } else if (typeof config.get('token_expiration') === 'number') {
-  // ⚠️ BUG: 这里配置值单位是秒，没有乘以 60！
-  // 与密码登录的单位不一致！
+  // ✅ 正确：直接加秒数，符合文档
   expiration = Math.floor(Date.now() / 1000) + config.get('token_expiration');
 } else {
   expiration = Math.floor(Date.now() / 1000) + 10 * 60; // 默认 10 分钟
@@ -217,21 +247,28 @@ if (config.get('token_expiration') === 'openid-provider') {
 ```
 
 **不一致性总结**：
-| 登录方式 | token_expiration 配置值单位 | 代码 |
-|---------|---------------------------|------|
-| 密码登录 | **分钟** | `config * 60` |
-| OpenID 登录 | **秒** | `config` (无乘法) |
 
-这是一个潜在的 bug，可能导致 OpenID 用户的 Token 过期时间比预期短 60 倍。
+| 登录方式 | 代码实现 | 与文档一致性 | 实际效果 |
+|---------|---------|-------------|---------|
+| 密码登录 | `config * 60` | ❌ 不一致 | Token 过期时间比配置值长 60 倍 |
+| OpenID 登录 | `config`（无乘法） | ✅ 一致 | Token 过期时间与配置值一致 |
+
+⚠️ **风险推断**：这是一个 Bug。如果用户配置 `token_expiration=3600`（期望 1 小时）：
+- 密码登录用户的 Token 实际 60 小时后过期
+- OpenID 登录用户的 Token 实际 1 小时后过期
 
 ### 1.6 Header 认证
 
-**代码位置**: `util/validate-user.ts:44-68`
+✅ **代码事实**：`util/validate-user.ts:44-68` + `app-account.js:79-95`
 
 Header 认证是为反向代理场景设计的：
 - 信任的代理在 `x-actual-password` Header 中传递密码
 - `validateAuthHeader()` 验证请求来源 IP 是否在 `trustedAuthProxies` 列表中
 - 认证通过后调用 `loginWithPassword()`，复用密码登录的 session 机制
+
+✅ **代码事实**：`validateAuthHeader()` 检查的是 `req.socket.remoteAddress`（直接连接的对端 IP），不是 `X-Forwarded-For`。
+
+⚠️ **风险推断**：如果代理层没有正确配置，可能导致信任链断裂。
 
 ---
 
@@ -239,7 +276,7 @@ Header 认证是为反向代理场景设计的：
 
 ### 2.1 会话验证中间件
 
-**代码位置**: `util/middlewares.ts:33-45`
+✅ **代码事实**：`util/middlewares.ts:33-45`
 
 ```typescript
 const validateSessionMiddleware = async (req, res, next) => {
@@ -251,12 +288,12 @@ const validateSessionMiddleware = async (req, res, next) => {
 ```
 
 **应用范围**：
-- `/sync/*` 所有接口：`app-sync.ts:45` 强制应用
-- `/admin/*` 部分接口：选择性应用（如 `POST /admin/access` 直接调用 `validateSession`）
+- ✅ `/sync/*` 所有接口：`app-sync.ts:45` 强制应用
+- ⚠️ `/admin/*` 部分接口：选择性应用（如 `POST /admin/access` 直接调用 `validateSession`，不使用中间件）
 
 ### 2.2 Token 验证逻辑
 
-**代码位置**: `util/validate-user.ts:10-42`
+✅ **代码事实**：`util/validate-user.ts:10-42`
 
 ```typescript
 export function validateSession(req: Request, res: Response) {
@@ -286,18 +323,20 @@ export function validateSession(req: Request, res: Response) {
 
 ### 2.3 会话数据结构
 
-`sessions` 表字段（来自 `migrations/1719409568000-multiuser.js`）：
+✅ **代码事实**：`migrations/1719409568000-multiuser.js:19-37`
+
+`sessions` 表字段：
 
 | 字段 | 类型 | 说明 |
 |-----|------|------|
 | `token` | TEXT (PK) | UUID v4 格式的会话令牌 |
 | `expires_at` | INTEGER | Unix 时间戳（秒），-1 表示永不过期 |
 | `user_id` | TEXT | 关联用户 ID |
-| `auth_method` | TEXT | 认证方式：`password`/`openid`/`header` |
+| `auth_method` | TEXT | 认证方式：`password`/`openid` |
 
 ### 2.4 会话清理
 
-**代码位置**: `account-db.js:259-268`
+✅ **代码事实**：`account-db.js:259-268`
 
 ```javascript
 export function clearExpiredSessions() {
@@ -309,8 +348,8 @@ export function clearExpiredSessions() {
 }
 ```
 
-- 每次登录时自动调用
-- 清理过期时间超过 1 小时的会话（给用户留了宽限期）
+- ✅ **代码事实**：每次登录时自动调用
+- ✅ **代码事实**：清理过期时间超过 1 小时的会话（给用户留了宽限期）
 
 ---
 
@@ -318,7 +357,7 @@ export function clearExpiredSessions() {
 
 ### 3.1 两个权限检查函数的关键区别
 
-⚠️ **之前版本的重大错误**：系统中存在两个不同的权限检查函数，应用场景完全不同！
+✅ **代码事实**：系统中存在两个不同的权限检查函数，应用场景完全不同！
 
 | 函数 | 代码位置 | 权限判定逻辑 | 应用场景 |
 |-----|---------|------------|---------|
@@ -327,7 +366,7 @@ export function clearExpiredSessions() {
 
 ### 3.2 同步接口权限检查 (`requireFileAccess`)
 
-**代码位置**: `app-sync.ts:119-129`
+✅ **代码事实**：`app-sync.ts:119-129`
 
 ```typescript
 function requireFileAccess(file: File, userId: string) {
@@ -352,7 +391,7 @@ function requireFileAccess(file: File, userId: string) {
 
 ### 3.3 管理接口权限检查 (`checkFilePermission`)
 
-**代码位置**: `user-service.ts:184-193`
+✅ **代码事实**：`user-service.ts:184-193`
 
 ```typescript
 export function checkFilePermission(fileId, userId) {
@@ -369,13 +408,13 @@ export function checkFilePermission(fileId, userId) {
 ```
 
 **关键影响**：
-- 被共享的用户（通过 user_access）**不能**再将文件共享给其他人
-- 被共享的用户**不能**转移文件所有权
-- 只有文件所有者和管理员可以管理共享权限
+- ✅ **代码事实**：被共享的用户（通过 user_access）**不能**再将文件共享给其他人
+- ✅ **代码事实**：被共享的用户**不能**转移文件所有权
+- ✅ **代码事实**：只有文件所有者和管理员可以管理共享权限
 
 ### 3.4 `countUserAccess` 的完整逻辑
 
-**代码位置**: `user-service.ts:169-182`
+✅ **代码事实**：`user-service.ts:169-182`
 
 ```typescript
 export function countUserAccess(fileId, userId) {
@@ -395,11 +434,11 @@ export function countUserAccess(fileId, userId) {
 }
 ```
 
-这个函数在 `requireFileAccess` 中被调用时已经检查过 owner 和 admin，所以实际上只用于检查 user_access 表。
+✅ **代码事实**：这个函数在 `requireFileAccess` 中被调用时已经检查过 owner 和 admin，所以实际上只用于检查 user_access 表。
 
 ### 3.5 文件列表权限过滤
 
-**代码位置**: `app-sync/services/files-service.ts:167-189`
+✅ **代码事实**：`app-sync/services/files-service.ts:167-189`
 
 `FilesService.find()` 方法在 SQL 层面进行权限过滤：
 
@@ -428,7 +467,7 @@ find({ userId, limit = 1000 }) {
 
 ### 4.1 同步接口统一防护
 
-**代码位置**: `app-sync.ts:44-47`
+✅ **代码事实**：`app-sync.ts:44-47`
 
 所有 `/sync/*` 接口都经过 `validateSessionMiddleware`，确保：
 - 请求必须携带有效的 Token
@@ -485,7 +524,7 @@ app.post('/sync', async (req, res) => {
 ### 4.4 特殊安全防护
 
 #### 路径遍历防护
-**代码位置**: `app-sync.ts:440-444`
+✅ **代码事实**：`app-sync.ts:440-444`
 
 ```typescript
 const path = getPathForUserFile(fileId);
@@ -506,7 +545,7 @@ if (!path.startsWith(resolve(config.get('userFiles')))) {
 
 ### 5.1 授予访问权限 (`POST /admin/access`)
 
-**代码位置**: `app-admin.js:218-271`
+✅ **代码事实**：`app-admin.js:218-271`
 
 ```javascript
 app.post('/access', (req, res) => {
@@ -524,7 +563,7 @@ app.post('/access', (req, res) => {
     return;
   }
 
-  // 检查目标用户是否已有权限
+  // 检查目标用户是否已有权限（通过 owner 或 user_access）
   if (UserService.countUserAccess(userAccess.fileId, userAccess.userId) > 0) {
     res.status(400).send({ status: 'error', reason: 'user-already-have-access' });
     return;
@@ -543,7 +582,7 @@ app.post('/access', (req, res) => {
 
 ### 5.2 撤销访问权限 (`DELETE /admin/access`)
 
-**代码位置**: `app-admin.js:273-318`
+✅ **代码事实**：`app-admin.js:273-318`
 
 - 同样需要 owner 或 admin 权限
 - 从 `user_access` 表删除记录
@@ -551,7 +590,7 @@ app.post('/access', (req, res) => {
 
 ### 5.3 转移所有权 (`POST /admin/access/transfer-ownership`)
 
-**代码位置**: `app-admin.js:353-408`
+✅ **代码事实**：`app-admin.js:353-408`
 
 ```javascript
 app.post('/access/transfer-ownership/', validateSessionMiddleware, (req, res) => {
@@ -575,9 +614,11 @@ app.post('/access/transfer-ownership/', validateSessionMiddleware, (req, res) =>
 
 | 用户 | 转移前权限 | 转移后权限 |
 |-----|-----------|-----------|
-| 旧所有者 | Owner（完整权限） | 失去 Owner 权限<br>⚠️ 如果在 user_access 表中仍有记录，则保留访问权限<br>否则完全失去访问 |
+| 旧所有者 | Owner（完整权限） | 失去 Owner 权限<br>⚠️ 如果旧所有者在 user_access 表中仍有记录，则保留访问权限<br>否则完全失去访问 |
 | 新所有者 | 可能无权限 / 可能有 user_access | 获得 Owner 权限<br>可以共享、转移、删除文件 |
 | 其他共享用户 | user_access 权限 | 不变 |
+
+⚠️ **风险推断**：转移所有权后，系统不会自动清理 user_access 表中旧所有者的记录。如果旧所有者之前在 user_access 表中（通常不会，但理论可能），则仍然保留访问权限。
 
 ---
 
@@ -738,10 +779,10 @@ getPathForUserFile(fileId) → 构造路径
 ```
 
 **表结构说明**：
-- `users.role`：'ADMIN' 或 'BASIC'
-- `users.owner`：1 表示初始所有者（OpenID 模式下首个用户）
-- `files.deleted`：软删除标记
-- `user_access`：联合主键 (user_id, file_id)
+- ✅ `users.role`：'ADMIN' 或 'BASIC'
+- ✅ `users.owner`：1 表示初始所有者（OpenID 模式下首个用户）
+- ✅ `files.deleted`：软删除标记
+- ✅ `user_access`：联合主键 (user_id, file_id)
 
 ---
 
@@ -749,7 +790,7 @@ getPathForUserFile(fileId) → 构造路径
 
 | 之前的结论 | 修正后的准确结论 | 证据 |
 |----------|----------------|------|
-| Token 过期时间单位统一 | ❌ 密码登录是**分钟**，OpenID 是**秒**，存在不一致 | `password.js:93` vs `openid.ts:324` |
+| Token 过期时间单位统一 | ❌ 密码登录是 **秒 × 60**，OpenID 是 **秒**，存在不一致<br>文档规定单位是秒，密码登录实现错误 | `password.js:93` vs `openid.ts:323`<br>`docs/config/oauth-auth.md:180` |
 | 每次密码登录创建新 session | ❌ 所有密码用户**共享同一个 session** | `password.js:56-61` |
 | `/admin/access` 权限检查与同步接口一致 | ❌ 同步接口用 `requireFileAccess` (3 条件)<br>管理接口用 `checkFilePermission` (仅 owner) | `app-sync.ts:119` vs `user-service.ts:184` |
 | 被共享用户可以再共享 | ❌ 被共享用户不能再共享或转移所有权 | `app-admin.js:224-238` |
@@ -778,19 +819,22 @@ getPathForUserFile(fileId) → 构造路径
 
 ## 总结
 
-Actual Budget 的授权机制采用**纵深防御**策略，但存在一些设计上的细微差别需要注意：
+Actual Budget 的授权机制采用**纵深防御**策略，以下是经过代码验证的关键结论：
 
-### 安全设计优点：
-1. **入口把关**：所有同步接口必须先通过会话验证
-2. **双重权限检查**：同步接口和管理接口使用不同的权限检查函数，遵循最小权限原则
-3. **数据隔离**：文件列表查询在 SQL 层面就进行权限过滤
-4. **路径遍历防护**：多层验证防止目录遍历攻击
-5. **会话过期**：支持可配置的 Token 过期策略
+### ✅ 代码事实总结
 
-### 需要注意的设计细节：
-1. **密码登录 session 复用**：单用户设计，多用户场景下需谨慎
-2. **Token 过期单位不一致**：密码和 OpenID 登录使用不同的时间单位（潜在 bug）
-3. **共享权限不可传递**：被共享用户不能再共享给其他人
-4. **所有权转移不清理 user_access**：转移后旧所有者可能仍有访问权限
+1. **登录方式决策链**：5 级优先级，Header 认证可强制绕过其他配置
+2. **Session 复用**：密码登录所有用户共享同一个 session，新用户登录会覆盖旧用户的 user_id
+3. **Token 过期 Bug**：文档规定单位是秒，但密码登录实现中错误地乘以 60
+4. **两套权限检查**：同步接口用 `requireFileAccess`（owner/admin/user_access），管理接口用 `checkFilePermission`（仅 owner）
+5. **共享权限不可传递**：被共享用户不能再共享或转移所有权
+6. **Header 认证本质**：只是密码登录的信任代理，auth_method 仍为 'password'
+
+### ⚠️ 风险推断总结
+
+1. **多用户密码登录问题**：在多用户场景下，密码登录的 session 复用机制可能导致会话劫持
+2. **Token 过期不一致**：密码登录用户的 Token 实际过期时间比配置值长 60 倍
+3. **所有权转移不清理**：转移所有权后，旧所有者可能因 user_access 表残留记录而保留访问权限
+4. **Header 认证信任链**：如果代理层配置不当，可能导致信任链断裂
 
 这种多层级的设计确保了即使某一层被绕过，下一层仍然能够提供防护，有效阻断越权访问。
