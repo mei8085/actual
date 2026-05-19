@@ -1,6 +1,6 @@
 # Actual Budget 同步服务器授权机制层级分析
 
-> **修订说明**：本文档基于代码深度审计完成，所有结论均标注证据来源。明确区分「代码事实」与「风险推断」。
+> **修订说明**：本文档基于代码深度审计完成，所有结论均标注证据来源。明确区分「代码事实」与「风险推断」。本次修订重点核实了：sessions.auth_method 写入路径、user_name 为空账户的边界、多用户 session 接管声明的有效性。
 
 ---
 
@@ -12,6 +12,7 @@
 |-----|------|------|
 | ✅ **代码事实** | 有明确代码证据支撑的客观事实 |
 | ⚠️ **风险推断** | 基于代码逻辑推导的潜在问题/设计意图 |
+| ❌ **已修正结论** | 之前版本中不准确的结论 |
 
 ---
 
@@ -69,17 +70,20 @@ Actual Budget 自托管同步服务器的授权机制分为四个核心层级，
 export function getLoginMethod(req) {
   // 优先级 1: 请求体中明确指定的 loginMethod
   // 条件：在 allowedLoginMethods 白名单中 且 数据库中有该方法记录
-  if (req?.body?.loginMethod && 
+  if (typeof req !== 'undefined' &&
+      (req.body || { loginMethod: null }).loginMethod &&
       config.get('allowedLoginMethods').includes(req.body.loginMethod)) {
+    const accountDb = getAccountDb();
     const row = accountDb.first('SELECT method FROM auth WHERE method = ?', 
                                 [req.body.loginMethod]);
     if (row) return req.body.loginMethod;
   }
 
   // 优先级 2: Header 认证（如果配置则强制使用，绕过其他所有配置）
-  if (config.get('loginMethod') === 'header' && 
+  // BY-PASS ANY OTHER CONFIGURATION TO ENSURE HEADER AUTH
+  if (config.get('loginMethod') === 'header' &&
       config.get('allowedLoginMethods').includes('header')) {
-    return 'header';
+    return config.get('loginMethod');
   }
 
   // 优先级 3: 数据库中标记为 active 的登录方式
@@ -96,37 +100,37 @@ export function getLoginMethod(req) {
 请求到达
     │
     ▼
-┌─────────────────────────────────┐
-│ 请求体有 loginMethod？           │
-│  且在 allowedLoginMethods 中？   │
-│  且数据库中有该方法记录？        │
-└───────────┬─────────────────────┘
-            │是
-            ▼
-      使用该方法 ←─── 优先级最高
-            │否
-            ▼
-┌─────────────────────────────────┐
-│ 配置 loginMethod === 'header'   │
-│ 且在 allowedLoginMethods 中？    │
-└───────────┬─────────────────────┘
-            │是
-            ▼
-      使用 header 认证 ←─── 强制绕过
-            │否
-            ▼
-┌─────────────────────────────────┐
-│ 数据库有 active=1 的 auth 记录？ │
-└───────────┬─────────────────────┘
-            │是
-            ▼
-      使用 active 方法
-            │否
-            ▼
-┌─────────────────────────────────┐
-│ 使用 config.loginMethod         │
-│ （默认: password）               │
-└─────────────────────────────────┘
+┌────────────────────────────────────────────┐
+│ 请求体有 loginMethod？                      │
+│  且在 allowedLoginMethods 中？              │
+│  且数据库 auth 表中有该方法记录？           │
+└─────────────────┬──────────────────────────┘
+                  │是
+                  ▼
+            使用该方法 ←─── 优先级最高
+                  │否
+                  ▼
+┌────────────────────────────────────────────┐
+│ 配置 loginMethod === 'header'              │
+│ 且在 allowedLoginMethods 中？               │
+└─────────────────┬──────────────────────────┘
+                  │是
+                  ▼
+            使用 header 认证 ←─── 强制绕过
+                  │否
+                  ▼
+┌────────────────────────────────────────────┐
+│ 数据库有 active=1 的 auth 记录？           │
+└─────────────────┬──────────────────────────┘
+                  │是
+                  ▼
+            使用 active 方法
+                  │否
+                  ▼
+┌────────────────────────────────────────────┐
+│ 使用 config.loginMethod                    │
+│ （默认: password）                          │
+└────────────────────────────────────────────┘
 ```
 
 ### 1.2 三种登录方式对比
@@ -139,21 +143,27 @@ export function getLoginMethod(req) {
 
 ✅ **代码事实**：`app-account.js:89` - Header 认证通过后直接调用 `loginWithPassword(headerVal)`，因此 `auth_method` 被写入为 `'password'`。
 
-### 1.3 sessions.auth_method 字段写入来源汇总
+### 1.3 sessions.auth_method 写入路径汇总
 
-所有写入 `sessions.auth_method` 的代码位置：
+**生产代码中所有写入 `sessions.auth_method` 的位置**：
 
 | 代码位置 | 写入值 | 场景 |
 |---------|--------|------|
-| `accounts/password.js:99` | `'password'` | 密码登录新建 session |
-| `accounts/openid.ts:331` | `'openid'` | OpenID 登录新建 session |
+| `accounts/password.js:98` | `'password'` | 密码登录新建 session |
+| `accounts/openid.ts:330` | `'openid'` | OpenID 登录新建 session |
 | `migrations/1719409568000-multiuser.js:48` | `'password'` | 数据库迁移，更新旧数据（auth_method IS NULL） |
 
-⚠️ **风险推断**：`password.js:103` 更新 session 时未更新 `auth_method` 字段，只更新了 `user_id` 和 `expires_at`。这意味着 session 复用后，`auth_method` 保持原始值。
+✅ **代码事实**：`password.js:103` 更新 session 时的 SQL 为：
+```sql
+UPDATE sessions SET user_id = ?, expires_at = ? WHERE token = ?
+```
+**不更新 `auth_method` 字段**，只更新 `user_id` 和 `expires_at`。
+
+---
 
 ### 1.4 密码登录流程的 Session 复用机制
 
-✅ **代码事实**：`accounts/password.js:56-106`
+✅ **代码事实**：`accounts/password.js:35-111`
 
 ```javascript
 export function loginWithPassword(password) {
@@ -168,17 +178,38 @@ export function loginWithPassword(password) {
   // 如果已存在，复用同一个 token！
   const token = sessionRow ? sessionRow.token : uuidv4();
   
-  // ... 用户查找或创建 ...
+  // ⚠️ 关键：用户查找逻辑
+  const { totalOfUsers } = accountDb.first(
+    'SELECT count(*) as totalOfUsers FROM users',
+  );
+  let userId = null;
+  if (totalOfUsers === 0) {
+    // 首次登录：创建 user_name 为空的用户
+    userId = uuidv4();
+    accountDb.mutate(
+      'INSERT INTO users (id, user_name, display_name, enabled, owner, role) VALUES (?, ?, ?, 1, 1, ?)',
+      [userId, '', '', 'ADMIN'],
+    );
+  } else {
+    // ⚠️ 非首次登录：总是查询 user_name = '' 的用户！
+    const { id: userIdFromDb } = accountDb.first(
+      'SELECT id FROM users WHERE user_name = ?',
+      [''],
+    );
+    userId = userIdFromDb;
+    if (!userId) {
+      return { error: 'user-not-found' };
+    }
+  }
+  // ... 计算过期时间 ...
   
   // 新建或更新 session
   if (!sessionRow) {
-    // 新建：写入 auth_method = 'password'
     accountDb.mutate(
       'INSERT INTO sessions (token, expires_at, user_id, auth_method) VALUES (?, ?, ?, ?)',
       [token, expiration, userId, 'password'],
     );
   } else {
-    // 更新：只更新 user_id 和 expires_at，不更新 auth_method
     accountDb.mutate(
       'UPDATE sessions SET user_id = ?, expires_at = ? WHERE token = ?',
       [userId, expiration, token],
@@ -189,10 +220,26 @@ export function loginWithPassword(password) {
 }
 ```
 
-**Session 复用的适用前提**：
-- ✅ **代码事实**：查询条件是 `auth_method = 'password'`，因此只有密码登录创建的 session 会被复用
-- ✅ **代码事实**：所有密码登录用户共享同一个 session 记录
-- ⚠️ **风险推断**：这是单用户模式的设计。在多用户场景下，用户 B 用密码登录后，用户 A 的会话会被"接管"（user_id 被更新为 B 的 ID），A 的后续请求会被当作 B 处理
+#### ❌ 已修正结论：密码登录的多用户 session 接管
+
+**之前的结论**：在多用户场景下，用户 B 用密码登录后，用户 A 的会话会被"接管"。
+
+**修正后的准确结论**：
+- ✅ **代码事实**：密码登录时总是查询 `user_name = ''` 的用户（`password.js:74-77`）
+- ✅ **代码事实**：管理员通过 `/admin/users` 创建的用户 `userName` 不能为空（`app-admin.js:52`）
+- ✅ **代码事实**：`getUserByUsername('')` 返回 null（`user-service.ts:5-6`：`if (!userName) return null`）
+- **结论**：密码登录模式下系统设计为**单用户模式**，只有 `user_name = ''` 的用户可以通过密码登录。管理员创建的其他用户无法通过密码登录，因此不存在"多用户 session 接管"的场景。
+
+#### Password Session 复用的边界条件
+
+| 条件 | 结果 |
+|-----|------|
+| 首次登录（users 表为空） | 创建 user_name='' 的 ADMIN 用户，新建 session |
+| 非首次登录，存在 user_name='' 的用户 | 复用该用户的 session，更新 expires_at |
+| 非首次登录，不存在 user_name='' 的用户 | 返回 'user-not-found' 错误 |
+| 管理员创建的 user_name≠'' 的用户 | 无法通过密码登录 |
+
+---
 
 ### 1.5 Token 过期配置语义与单位口径
 
@@ -248,14 +295,14 @@ if (config.get('token_expiration') === 'openid-provider') {
 
 **不一致性总结**：
 
-| 登录方式 | 代码实现 | 与文档一致性 | 实际效果 |
-|---------|---------|-------------|---------|
-| 密码登录 | `config * 60` | ❌ 不一致 | Token 过期时间比配置值长 60 倍 |
-| OpenID 登录 | `config`（无乘法） | ✅ 一致 | Token 过期时间与配置值一致 |
+| 登录方式 | 代码实现 | 与文档一致性 | 实际效果（配置 3600 秒） |
+|---------|---------|-------------|------------------------|
+| 密码登录 | `config * 60` | ❌ 不一致 | Token 在 60 小时后过期（216000 秒） |
+| OpenID 登录 | `config`（无乘法） | ✅ 一致 | Token 在 1 小时后过期（3600 秒） |
 
-⚠️ **风险推断**：这是一个 Bug。如果用户配置 `token_expiration=3600`（期望 1 小时）：
-- 密码登录用户的 Token 实际 60 小时后过期
-- OpenID 登录用户的 Token 实际 1 小时后过期
+⚠️ **风险推断**：这是一个 Bug。密码登录实现错误地将秒当成了分钟处理。
+
+---
 
 ### 1.6 Header 认证
 
@@ -752,6 +799,23 @@ getPathForUserFile(fileId) → 构造路径
 返回 403: Access denied
 ```
 
+### 场景 8：管理员创建的用户尝试密码登录
+
+**攻击路径**：
+1. 管理员创建了一个 user_name = 'alice' 的用户
+2. Alice 尝试使用密码登录
+
+**阻断路径**：
+```
+/login 接口
+        ↓
+loginWithPassword(password)
+        ↓
+查询 user_name = '' 的用户 → ❌ Alice 的 user_name 不是空字符串
+        ↓
+返回 user-not-found
+```
+
 ---
 
 ## 数据库表结构关系
@@ -781,17 +845,19 @@ getPathForUserFile(fileId) → 构造路径
 **表结构说明**：
 - ✅ `users.role`：'ADMIN' 或 'BASIC'
 - ✅ `users.owner`：1 表示初始所有者（OpenID 模式下首个用户）
+- ✅ `users.user_name`：密码登录模式下有一个特殊用户 `user_name = ''`
 - ✅ `files.deleted`：软删除标记
 - ✅ `user_access`：联合主键 (user_id, file_id)
 
 ---
 
-## 之前版本的不准确结论修正
+## 不准确结论修正汇总
 
 | 之前的结论 | 修正后的准确结论 | 证据 |
 |----------|----------------|------|
 | Token 过期时间单位统一 | ❌ 密码登录是 **秒 × 60**，OpenID 是 **秒**，存在不一致<br>文档规定单位是秒，密码登录实现错误 | `password.js:93` vs `openid.ts:323`<br>`docs/config/oauth-auth.md:180` |
 | 每次密码登录创建新 session | ❌ 所有密码用户**共享同一个 session** | `password.js:56-61` |
+| 多用户场景下 session 会被接管 | ❌ 密码登录设计为单用户模式，只有 `user_name=''` 的用户可以登录<br>管理员创建的其他用户无法通过密码登录，不存在接管场景 | `password.js:74-77`<br>`app-admin.js:52` |
 | `/admin/access` 权限检查与同步接口一致 | ❌ 同步接口用 `requireFileAccess` (3 条件)<br>管理接口用 `checkFilePermission` (仅 owner) | `app-sync.ts:119` vs `user-service.ts:184` |
 | 被共享用户可以再共享 | ❌ 被共享用户不能再共享或转移所有权 | `app-admin.js:224-238` |
 | 转移所有权后旧所有者完全失去访问 | ❌ 如果旧所有者在 user_access 表中，仍保留访问权限 | `requireFileAccess` 逻辑 |
@@ -812,7 +878,7 @@ getPathForUserFile(fileId) → 构造路径
 | 管理接口权限 | `user-service.ts:184-193` | `checkFilePermission` |
 | 共享权限计数 | `user-service.ts:169-182` | `countUserAccess` |
 | 文件服务 | `app-sync/services/files-service.ts` | `FilesService`, `File`, `FileUpdate` |
-| 用户权限服务 | `services/user-service.ts` | `addUserAccess`, `updateFileOwner` |
+| 用户权限服务 | `services/user-service.ts` | `addUserAccess`, `updateFileOwner`, `getUserByUsername` |
 | 账户数据库操作 | `account-db.js` | `getSession`, `isAdmin`, `hasPermission` |
 
 ---
@@ -824,17 +890,18 @@ Actual Budget 的授权机制采用**纵深防御**策略，以下是经过代�
 ### ✅ 代码事实总结
 
 1. **登录方式决策链**：5 级优先级，Header 认证可强制绕过其他配置
-2. **Session 复用**：密码登录所有用户共享同一个 session，新用户登录会覆盖旧用户的 user_id
+2. **Session 复用**：密码登录所有用户共享同一个 session，但密码登录设计为单用户模式（只有 `user_name=''` 的用户可以登录）
 3. **Token 过期 Bug**：文档规定单位是秒，但密码登录实现中错误地乘以 60
 4. **两套权限检查**：同步接口用 `requireFileAccess`（owner/admin/user_access），管理接口用 `checkFilePermission`（仅 owner）
 5. **共享权限不可传递**：被共享用户不能再共享或转移所有权
 6. **Header 认证本质**：只是密码登录的信任代理，auth_method 仍为 'password'
+7. **管理员创建的用户无法密码登录**：因为密码登录只认 `user_name=''` 的用户
 
 ### ⚠️ 风险推断总结
 
-1. **多用户密码登录问题**：在多用户场景下，密码登录的 session 复用机制可能导致会话劫持
-2. **Token 过期不一致**：密码登录用户的 Token 实际过期时间比配置值长 60 倍
-3. **所有权转移不清理**：转移所有权后，旧所有者可能因 user_access 表残留记录而保留访问权限
-4. **Header 认证信任链**：如果代理层配置不当，可能导致信任链断裂
+1. **Token 过期不一致**：密码登录用户的 Token 实际过期时间比配置值长 60 倍
+2. **所有权转移不清理**：转移所有权后，旧所有者可能因 user_access 表残留记录而保留访问权限
+3. **Header 认证信任链**：如果代理层配置不当，可能导致信任链断裂
+4. **单用户密码模式限制**：密码登录模式下无法真正支持多用户登录
 
 这种多层级的设计确保了即使某一层被绕过，下一层仍然能够提供防护，有效阻断越权访问。
