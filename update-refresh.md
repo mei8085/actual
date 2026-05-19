@@ -197,34 +197,55 @@ app.exit()       // 立即退出
 
 ### 2.1 检测时机与错误来源
 
-**代码位置**：`packages/desktop-client/src/sync-events.ts:249-283`
+**代码位置**：
+- 服务端验证：`packages/sync-server/src/app-sync/validation.js:7-47`
+- 服务端响应：`packages/sync-server/src/app-sync.ts:177-182`
+- 客户端错误转发：`packages/loot-core/src/server/sync/index.ts:642-653`
+- 前端监听：`packages/desktop-client/src/sync-events.ts:249-283`
+
+**重要事实澄清**：
+> ⚠️ `file-has-reset` 和 `file-has-new-key` 错误**完全由服务端 `/sync` 接口验证并返回**，不是客户端本地 `_fullSync` 函数判定的。客户端仅负责转发错误事件。
 
 **完整检测链路**：
 
 ```
-同步过程中（sync() 被调用）
+客户端 sync() 被调用
     ↓
-fullSync() 执行 → 与服务器比较 groupId 和 encryptKeyId
+_fullSync() 执行 → 向服务端 POST /sync
     ↓
-如果服务器 groupId 与本地不匹配 → 抛出 SyncError('file-has-reset')
-如果服务器 encryptKeyId 与本地不匹配 → 抛出 SyncError('file-has-new-key')
+服务端 app-sync.ts:177 调用 validateSyncedFile(groupId, keyId, currentFile)
     ↓
-app.events.emit('sync', { type: 'error', subtype: 'file-has-reset' })
+服务端 validation.js:34-36:
+    if (groupId !== currentFile.groupId) → return 'file-has-reset'
+服务端 validation.js:42-44:
+    if (keyId !== currentFile.encryptKeyId) → return 'file-has-new-key'
     ↓
-listenForSyncEvent() 监听到 sync-event
+服务端响应 HTTP 400，body 为纯文本字符串："file-has-reset" 或 "file-has-new-key"
     ↓
-event.type === 'error' && event.subtype === 'file-has-reset' / 'file-has-new-key'
+客户端 postBinary() → throwIfNot200() 检测到 400 状态码
     ↓
-检查 store.getState().prefs.local.cloudFileId 是否存在
+throw new PostError('file-has-reset')  // 错误原因直接来自响应文本
+    ↓
+客户端 sync/index.ts:642-653 捕获 PostError:
+    app.events.emit('sync', { type: 'error', subtype: e.reason })
+    ↓
+前端 sync-events.ts 监听到 sync-event:
+    event.type === 'error' && event.subtype === 'file-has-reset'
     ↓
 构造 notification 并 dispatch(addNotification({ id: 'needs-revert' }))
     ↓
 UI 显示："Syncing has been reset on this cloud file"
 ```
 
-**关键错误触发点**（后端）：
-- `packages/loot-core/src/server/sync/index.ts` 的 `_fullSync()` 函数中进行 groupId 和 keyId 校验
-- 校验失败时抛出 `SyncError`，并通过事件系统传递到前端
+**服务端 validateSyncedFile 完整验证逻辑**（`validation.js:7-47`）：
+
+| 检查项 | 错误返回 | 说明 |
+|-------|---------|------|
+| syncVersion 过期 | `file-old-version` | 同步格式版本不兼容 |
+| groupId 为 null | `file-needs-upload` | 重置后等待上传新文件 |
+| encryptMeta.keyId ≠ encryptKeyId | `file-key-mismatch` | 加密密钥不一致 |
+| groupId ≠ currentFile.groupId | `file-has-reset` | **同步组已重置** |
+| keyId ≠ currentFile.encryptKeyId | `file-has-new-key` | **加密密钥已变更** |
 
 ---
 
@@ -402,7 +423,10 @@ export const resetSync = createAppAsyncThunk(
 
 #### Upload 后端完整执行流程
 
-**代码位置**：`packages/loot-core/src/server/sync/reset.ts:10-91`
+**代码位置**：
+- 前端入口：`packages/desktop-client/src/app/appSlice.ts:47-86`
+- 后端入口：`packages/loot-core/src/server/sync/reset.ts:10-91`
+- resetSyncState 请求：`packages/loot-core/src/server/cloud-storage.ts:99-138`
 
 ```
 send('sync-reset')
@@ -413,9 +437,14 @@ send('sync-reset')
     │   └─ 验证本地密钥与服务器密钥是否匹配
     │   └─ 不匹配 → 返回 { error: { reason: 'file-has-new-key' } }
     │
-    ├─ cloudStorage.resetSyncState(keyState)
-    │   └─ 向服务器 POST /reset-sync-state
-    │   └─ 服务器创建新的 groupId
+    ├─ cloudStorage.resetSyncState(keyState)  [关键：调用 /reset-user-file]
+    │   │
+    │   └─ POST SYNC_SERVER + '/reset-user-file'  [云存储 API: cloud-storage.ts:105]
+    │       └─ 请求体：{ token: userToken, fileId: cloudFileId }
+    │       └─ 服务端 app-sync.ts:254-289 /reset-user-file 处理：
+    │           ├─ 验证文件访问权限
+    │           ├─ filesService.update(file.id, { groupId: null })
+    │           └─ 删除旧 groupId 对应的同步数据文件
     │
     ├─ runMutator()  [关键：数据库操作]
     │   │
@@ -456,8 +485,8 @@ send('sync-reset')
 
 **关键设计**：
 - `resetSync` 是**破坏性操作**：清除所有 CRDT 历史，压缩数据库
-- 服务器创建新的 `groupId`，旧 groupId 失效
-- 其他设备下次同步时会检测到 `file-has-reset` 错误，被迫执行 Revert
+- `/reset-user-file` 将服务端文件的 `groupId` 置为 `null`，旧 groupId 对应的同步数据被删除
+- 其他设备下次同步时会触发服务端 `validateSyncedFile` 检测，返回 `file-has-reset` 错误，被迫执行 Revert
 - 本地未同步的修改**不会丢失**，因为它们已经存在于本地数据库中
 
 ---
@@ -513,12 +542,18 @@ send('sync-reset')
 | **更新完成提示组件** | `packages/desktop-client/src/components/UpdateNotification.tsx` | 全部 |
 | **同步事件监听** | `packages/desktop-client/src/sync-events.ts` | 全部 |
 | **远端覆盖检测与通知** | `packages/desktop-client/src/sync-events.ts` | 249-283 |
+| **服务端同步验证逻辑** | `packages/sync-server/src/app-sync/validation.js` | 7-47 |
+| **服务端 /sync 接口** | `packages/sync-server/src/app-sync.ts` | 131-194 |
+| **服务端 /reset-user-file 接口** | `packages/sync-server/src/app-sync.ts` | 254-289 |
+| **客户端错误转发** | `packages/loot-core/src/server/sync/index.ts` | 642-653 |
+| **客户端 PostError 抛出** | `packages/loot-core/src/server/post.ts` | 8-34, 213-239 |
 | **关闭预算** | `packages/desktop-client/src/budgetfiles/budgetfilesSlice.ts` | 98-113 |
 | **下载预算** | `packages/desktop-client/src/budgetfiles/budgetfilesSlice.ts` | 302-378 |
 | **关闭并重新下载** | `packages/desktop-client/src/budgetfiles/budgetfilesSlice.ts` | 289-294 |
 | **重置同步** | `packages/desktop-client/src/app/appSlice.ts` | 47-86 |
 | **应用状态重置定义** | `packages/desktop-client/src/app/appSlice.ts` | 142-147 |
 | **后端 resetSync 实现** | `packages/loot-core/src/server/sync/reset.ts` | 10-91 |
+| **后端 resetSyncState 请求** | `packages/loot-core/src/server/cloud-storage.ts` | 99-138 |
 | **后端 download 实现** | `packages/loot-core/src/server/budgetfiles/app.ts` | 182-216 |
 | **云存储 download** | `packages/loot-core/src/server/cloud-storage.ts` | 405-466 |
 | **云存储 importBuffer** | `packages/loot-core/src/server/cloud-storage.ts` | 193-249 |
@@ -576,11 +611,18 @@ dispatch(addNotification({ id: 'update-reload-notification' }))
 │                     同步检测阶段                              │
 └─────────────────────────────────────────────────────────────┘
                               ↓
-          sync() → fullSync() → 比较 groupId
+          sync() → _fullSync() → POST /sync 到服务端
                               ↓
-          不匹配 → SyncError('file-has-reset')
+          服务端 validateSyncedFile(groupId, keyId, currentFile)
                               ↓
-          sync-event 事件触发
+          groupId 不匹配 → 返回 "file-has-reset"
+          keyId 不匹配 → 返回 "file-has-new-key"
+                              ↓
+          服务端响应 HTTP 400
+                              ↓
+          客户端 postBinary 抛出 PostError('file-has-reset')
+                              ↓
+          sync/index.ts 捕获 → emit('sync', { type: 'error', subtype: 'file-has-reset' })
                               ↓
 ┌─────────────────────────────────────────────────────────────┐
 │                     UI 通知阶段                              │
@@ -630,19 +672,21 @@ dispatch(addNotification({ id: 'needs-revert' }))
                               ↓
           resetSync() → send('sync-reset')
                               ↓
-          ┌──────────────────────────────────────────────┐
-          │ 后端 resetSync() 执行                        │
-          ├──────────────────────────────────────────────┤
-          │ 1. checkKey() 验证密钥                       │
-          │ 2. resetSyncState() → 服务器创建新 groupId   │
-          │ 3. 执行 SQL 清理：                           │
-          │    DELETE messages_crdt, messages_clock      │
-          │    DELETE tombstone = 1 的记录               │
-          │    ANALYZE + VACUUM                          │
-          │ 4. 保存 prefs: 清空 groupId, 同步时间戳      │
-          │ 5. upload() → 本地文件上传到服务器           │
-          │    → 服务器接受为最新版本                    │
-          └──────────────────────────────────────────────┘
+          ┌──────────────────────────────────────────────────┐
+          │ 后端 resetSync() 执行                             │
+          ├──────────────────────────────────────────────────┤
+          │ 1. checkKey() 验证密钥                           │
+          │ 2. resetSyncState() → POST /reset-user-file      │
+          │    → 服务端 groupId = null                       │
+          │    → 删除旧 groupId 同步数据文件                  │
+          │ 3. 执行 SQL 清理：                                │
+          │    DELETE messages_crdt, messages_clock          │
+          │    DELETE tombstone = 1 的记录                   │
+          │    ANALYZE + VACUUM                              │
+          │ 4. 保存 prefs: 清空 groupId, 同步时间戳          │
+          │ 5. upload() → 本地文件上传到服务器               │
+          │    → 服务器接受为最新版本                        │
+          └──────────────────────────────────────────────────┘
                               ↓
           sync() → 与服务器同步新状态
                               ↓
@@ -659,9 +703,11 @@ dispatch(addNotification({ id: 'needs-revert' }))
 
 2. **prefsSlice 特殊处理**：重置时保留 `global` 和 `server` 偏好，确保用户登录状态、服务器配置等不丢失
 
-3. **Revert 时的双重 closeBudget**：前端 closeBudget 后，后端 downloadBudget 内部再次调用 closeBudget，确保状态干净
+3. **groupId 重置机制**：`/reset-user-file` 不会创建新 groupId，而是将服务端文件的 `groupId` 置为 `null`，等待后续 `upload()` 时由客户端生成新 groupId 并上传
 
-4. **Upload 时的 CRDT 历史清除**：这是一个重要的优化点——重置同步时清除所有历史消息，显著减小数据库体积
+4. **Revert 时的双重 closeBudget**：前端 closeBudget 后，后端 downloadBudget 内部再次调用 closeBudget，确保状态干净
+
+5. **Upload 时的 CRDT 历史清除**：这是一个重要的优化点——重置同步时清除所有历史消息，显著减小数据库体积
 
 ### 6.2 潜在风险点
 
