@@ -204,7 +204,9 @@ app.exit()       // 立即退出
 - 前端监听：`packages/desktop-client/src/sync-events.ts:249-283`
 
 **重要事实澄清**：
-> ⚠️ `file-has-reset` 和 `file-has-new-key` 错误**完全由服务端 `/sync` 接口验证并返回**，不是客户端本地 `_fullSync` 函数判定的。客户端仅负责转发错误事件。
+> ⚠️ `file-has-reset` 和 `file-has-new-key` 错误**完全由服务端验证并返回**，不是客户端本地 `_fullSync` 函数判定的。客户端仅负责转发错误事件。
+
+> ⚠️ 新 `groupId` 由**服务端 `/upload-user-file` 接口内部生成并通过响应返回**，不是客户端本地生成的。客户端仅在请求头中传递当前 groupId（如果有）。
 
 **完整检测链路**：
 
@@ -246,6 +248,81 @@ UI 显示："Syncing has been reset on this cloud file"
 | encryptMeta.keyId ≠ encryptKeyId | `file-key-mismatch` | 加密密钥不一致 |
 | groupId ≠ currentFile.groupId | `file-has-reset` | **同步组已重置** |
 | keyId ≠ currentFile.encryptKeyId | `file-has-new-key` | **加密密钥已变更** |
+
+---
+
+### 2.1.1 file-has-new-key 的两条入口路径
+
+`file-has-new-key` 错误有两条完全独立的触发路径，传播到前端的方式也不同：
+
+#### 路径一：/sync 同步请求路径（日常同步触发）
+
+**完整调用链**：
+```
+客户端 sync() → POST /sync
+    ↓
+服务端 validateSyncedFile(groupId, keyId, currentFile)
+    ↓
+keyId ≠ currentFile.encryptKeyId → return 'file-has-new-key'
+    ↓
+服务端响应 HTTP 400, body: "file-has-new-key"
+    ↓
+客户端 postBinary() 抛出 PostError('file-has-new-key')
+    ↓
+sync/index.ts:652 捕获 → emit('sync', { type: 'error', subtype: 'file-has-new-key' })
+    ↓
+前端 sync-events.ts → 显示 "Syncing has been reset" 通知
+```
+
+**代码位置**：
+- 服务端验证：`packages/sync-server/src/app-sync/validation.js:42-44`
+- 服务端响应：`packages/sync-server/src/app-sync.ts:177-182`
+- 客户端转发：`packages/loot-core/src/server/sync/index.ts:642-653`
+
+---
+
+#### 路径二：resetSync 的 checkKey 路径（用户点击 Upload 时触发）
+
+**完整调用链**：
+```
+用户点击 "upload this file" → dispatch(resetSync())
+    ↓
+前端 appSlice.ts:50 → send('sync-reset')
+    ↓
+后端 reset.ts:13-22 → if (!keyState) { const { valid } = await cloudStorage.checkKey() }
+    ↓
+checkKey() → POST /user-get-key 获取服务端当前 keyId
+    ↓
+cloud-storage.ts:91-95 → res.id == encryptKeyId?
+    ↓
+不匹配 → return { valid: false }
+    ↓
+reset.ts:21 → return { error: { reason: 'file-has-new-key' } }
+    ↓
+前端 appSlice.ts:58 → if (error.reason === 'file-has-new-key')
+    ↓
+dispatch(pushModal({ modal: { name: 'fix-encryption-key' } }))
+    ↓
+UI 显示：弹出修复加密密钥模态框（不是通知条）
+```
+
+**代码位置**：
+- checkKey 实现：`packages/loot-core/src/server/cloud-storage.ts:71-97`
+- checkKey 调用：`packages/loot-core/src/server/sync/reset.ts:13-22`
+- 前端模态框：`packages/desktop-client/src/app/appSlice.ts:58-71`
+
+---
+
+#### 两条路径的传播差异对比
+
+| 维度 | /sync 路径 | resetSync checkKey 路径 |
+|-----|-----------|------------------------|
+| **触发时机** | 日常同步 | 用户点击 Upload 按钮 |
+| **验证位置** | 服务端 validation.js | 客户端 cloud-storage.ts |
+| **错误类型** | PostError（由 throw 产生） | 返回值 { error }（无 throw） |
+| **传播机制** | sync event 事件 | thunk 返回值 |
+| **前端 UI** | 通知条（notification） | 模态框（modal） |
+| **用户操作** | Revert / Upload | 修复密钥 / 创建密钥 |
 
 ---
 
@@ -476,7 +553,11 @@ send('sync-reset')
         ├─ exportBuffer() → 将本地数据库打包为 zip
         ├─ 如果有 encryptKeyId → 使用密钥加密 zip
         ├─ POST /upload-user-file 到同步服务器
-        └─ 成功后保存 prefs：{ lastUploaded, cloudFileId, groupId: 新的 groupId }
+        │   │
+        │   └─ 服务端 app-sync.ts:386-390 处理：
+        │       ├─ if (!groupId) → 服务端 generateGroupId() 生成新 groupId
+        │       └─ filesService.update(file.id, { groupId: newGroupId })
+        └─ 客户端接收响应，保存 prefs：{ lastUploaded, cloudFileId, groupId: res.groupId }
     ↓
 返回 {} （成功）或 { error }
     ↓
@@ -486,6 +567,8 @@ send('sync-reset')
 **关键设计**：
 - `resetSync` 是**破坏性操作**：清除所有 CRDT 历史，压缩数据库
 - `/reset-user-file` 将服务端文件的 `groupId` 置为 `null`，旧 groupId 对应的同步数据被删除
+- 新 `groupId` 由**服务端 `/upload-user-file` 在检测到 `!groupId` 时调用 `generateGroupId()` 生成**，并通过响应返回给客户端
+- 客户端本地不生成 groupId，仅在请求头中传递当前 groupId（如果有）
 - 其他设备下次同步时会触发服务端 `validateSyncedFile` 检测，返回 `file-has-reset` 错误，被迫执行 Revert
 - 本地未同步的修改**不会丢失**，因为它们已经存在于本地数据库中
 
@@ -497,12 +580,14 @@ send('sync-reset')
 |-----|---------------|---------------|
 | **数据流向** | 服务器 → 本地 | 本地 → 服务器 |
 | **本地未同步修改** | 丢失 | 保留 |
-| **其他设备影响** | 无影响 | 其他设备被迫 Revert |
-| **groupId 变化** | 使用服务器的新 groupId | 创建全新的 groupId |
+| **其他设备影响** | 无影响 | 其他设备下次同步时收到 `file-has-reset`，被迫 Revert |
+| **groupId 变化** | 使用服务器的现有 groupId | 服务端 `/upload-user-file` 生成全新 groupId |
+| **groupId 生成位置** | 服务器已有 | 服务端 `generateGroupId()` |
 | **CRDT 历史** | 继承服务器的历史 | 全部清除，重新开始 |
-| **数据库操作** | 替换本地 db 文件 | 清理 tombstone，压缩 VACUUM |
+| **数据库操作** | 替换本地 db 文件 | 清理 tombstone + VACUUM 压缩 |
 | **触发动作** | `closeAndDownloadBudget` | `resetSync` |
 | **后端入口** | `download-budget` | `sync-reset` |
+| **关键 API** | `/download-user-file` | `/reset-user-file` + `/upload-user-file` |
 
 ---
 
@@ -675,7 +760,7 @@ dispatch(addNotification({ id: 'needs-revert' }))
           ┌──────────────────────────────────────────────────┐
           │ 后端 resetSync() 执行                             │
           ├──────────────────────────────────────────────────┤
-          │ 1. checkKey() 验证密钥                           │
+          │ 1. checkKey() 验证密钥 → POST /user-get-key      │
           │ 2. resetSyncState() → POST /reset-user-file      │
           │    → 服务端 groupId = null                       │
           │    → 删除旧 groupId 同步数据文件                  │
@@ -684,8 +769,10 @@ dispatch(addNotification({ id: 'needs-revert' }))
           │    DELETE tombstone = 1 的记录                   │
           │    ANALYZE + VACUUM                              │
           │ 4. 保存 prefs: 清空 groupId, 同步时间戳          │
-          │ 5. upload() → 本地文件上传到服务器               │
-          │    → 服务器接受为最新版本                        │
+          │ 5. upload() → POST /upload-user-file             │
+          │    → 服务端 if (!groupId) generateGroupId()      │
+          │    → 服务端更新 groupId                          │
+          │    → 客户端接收 res.groupId 保存到 prefs         │
           └──────────────────────────────────────────────────┘
                               ↓
           sync() → 与服务器同步新状态
@@ -703,11 +790,19 @@ dispatch(addNotification({ id: 'needs-revert' }))
 
 2. **prefsSlice 特殊处理**：重置时保留 `global` 和 `server` 偏好，确保用户登录状态、服务器配置等不丢失
 
-3. **groupId 重置机制**：`/reset-user-file` 不会创建新 groupId，而是将服务端文件的 `groupId` 置为 `null`，等待后续 `upload()` 时由客户端生成新 groupId 并上传
+3. **groupId 生成机制**：
+   - `/reset-user-file` 不会创建新 groupId，而是将服务端文件的 `groupId` 置为 `null`
+   - 新 groupId 由**服务端 `/upload-user-file` 接口内部**调用 `generateGroupId()` 生成
+   - 客户端本地不生成 groupId，仅接收响应中的 `res.groupId` 并保存到 prefs
 
-4. **Revert 时的双重 closeBudget**：前端 closeBudget 后，后端 downloadBudget 内部再次调用 closeBudget，确保状态干净
+4. **file-has-new-key 双路径设计**：
+   - /sync 路径：日常同步时由服务端验证抛出，通过 sync event 传播，显示为通知条
+   - resetSync 路径：用户点击 Upload 时由客户端 checkKey() 主动检测，通过返回值传播，显示为模态框
+   - 两条路径的错误原因相同，但触发时机、传播方式、前端 UI 完全不同
 
-5. **Upload 时的 CRDT 历史清除**：这是一个重要的优化点——重置同步时清除所有历史消息，显著减小数据库体积
+5. **Revert 时的双重 closeBudget**：前端 closeBudget 后，后端 downloadBudget 内部再次调用 closeBudget，确保状态干净
+
+6. **Upload 时的 CRDT 历史清除**：这是一个重要的优化点——重置同步时清除所有历史消息，显著减小数据库体积
 
 ### 6.2 潜在风险点
 
