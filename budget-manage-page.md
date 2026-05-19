@@ -5,10 +5,11 @@
 本文档所有结论均基于代码实证。每条结论前标注：
 - ✅ **代码证实**：有明确代码为依据
 - 🤔 **合理推断**：代码未直接说明，基于上下文的逻辑推断
+- ❌ **之前错误**：指出之前版本分析中的错误
 
 ---
 
-## 一、loadAllFiles 获取顺序（已证实）
+## 一、loadAllFiles 获取顺序（✅ 代码证实）
 
 ### ✅ 代码证实：串行执行，不是并行
 
@@ -29,35 +30,9 @@ export const loadAllFiles = createAppAsyncThunk(
 );
 ```
 
-**完整调用栈**：
-```
-loadAllFiles (thunk)
-    ↓ await send('get-budgets')
-    ↓ 等待返回...
-    ↓ await send('get-remote-files')
-    ↓ 等待返回...
-    ↓ dispatch(setAllFiles)
-        ↓ reconcileFiles 状态协调
-```
-
-### ✅ 代码证实：setAllFiles 内部调用 reconcileFiles
-
-`budgetfilesSlice.ts:453-460`：
-
-```typescript
-setAllFiles(state, action: PayloadAction<SetAllFilesPayload>) {
-  state.budgets = action.payload.budgets;
-  state.remoteFiles = action.payload.remoteFiles;
-  state.allFiles = reconcileFiles(
-    action.payload.budgets,
-    action.payload.remoteFiles,
-  );
-}
-```
-
 ---
 
-## 二、closeBudget 的异常处理边界（已证实）
+## 二、closeBudget 的异常处理边界（✅ 代码证实）
 
 ### ✅ 代码证实：前端 closeBudget 有前置条件检查
 
@@ -111,17 +86,12 @@ async function closeBudget() {
 }
 ```
 
-**异常处理边界总结**：
-| 操作 | 是否有异常保护 | 失败影响 |
-|------|---------------|----------|
-| `sheet.waitOnSpreadsheet()` | ❌ 无 | 整个 closeBudget 失败 |
-| `sheet.unloadSpreadsheet()` | ❌ 无 | 整个 closeBudget 失败 |
-| `clearFullSyncTimeout()` | ❌ 无 | 整个 closeBudget 失败 |
-| `mainApp.stopServices()` | ❌ 无 | 整个 closeBudget 失败 |
-| `db.closeDatabase()` | ❌ 无 | 整个 closeBudget 失败 |
-| `asyncStorage.setItem()` | ✅ 有 | 不影响其他步骤 |
-| `prefs.unloadPrefs()` | ❌ 无 | 整个 closeBudget 失败 |
-| `stopBackupService()` | ❌ 无 | 整个 closeBudget 失败 |
+**prefs.unloadPrefs 实现**（`prefs.ts:81-83` 代码证实）：
+```typescript
+export function unloadPrefs(): void {
+  prefs = null;  // 直接将内存变量设为 null
+}
+```
 
 ---
 
@@ -235,172 +205,232 @@ switch (file.state) {
 
 ---
 
-## 四、切换活跃预算的完整链路（代码证实）
+## 四、切换活跃预算的完整时序（✅ 代码证实，逐行追踪）
 
-### 4.1 前端触发点（✅ 代码证实）
+### 4.1 关键基础概念（✅ 代码证实）
 
-`BudgetFileSelection.tsx:598-612`：
-```typescript
-const onSelect = async (file: File) => {
-  const isRemoteFile = file.state === 'remote';
+在分析时序前，先明确几个核心操作的真实行为：
 
-  if (!id) {
-    // 分支1：当前没有打开的预算
-    if (isRemoteFile) {
-      await dispatch(downloadBudget({ cloudFileId: file.cloudFileId }));
-    } else {
-      await dispatch(loadBudget({ id: file.id }));
-    }
-  } else if (!isRemoteFile && file.id !== id) {
-    // 分支2：当前有预算，切换到另一个本地预算
-    await dispatch(closeAndLoadBudget({ fileId: file.id }));
-  } else if (isRemoteFile) {
-    // 分支3：当前有预算，下载并切换到云端预算
-    await dispatch(closeAndDownloadBudget({ cloudFileId: file.cloudFileId }));
-  }
-};
-```
-
-### 4.2 分支2：切换本地预算完整链路（✅ 代码证实）
-
-```
-前端 closeAndLoadBudget thunk (budgetfilesSlice.ts:277-283)
-    ↓
-调用 closeBudget()
-    ├─ ✅ 代码证实：resetApp() 重置 Redux 状态
-    ├─ ✅ 代码证实：queryClient.clear() 清除 React Query 缓存
-    └─ send('close-budget') 调用后端
-        ├─ 等待电子表格完成
-        ├─ 关闭数据库
-        ├─ 清除 lastBudget（有 try-catch）
-        ├─ 卸载 prefs
-        └─ 停止备份服务
-    ↓
-调用 loadBudget({ id: fileId })
-    ├─ send('load-budget', { id })
-    │   └─ 后端 loadBudget handler
-    │       ├─ ✅ 代码证实：检查 currentPrefs.id === id
-    │       │   ├─ 相同 → 直接返回（幂等性）
-    │       │   └─ 不同 → 先 closeBudget() 再 _loadBudget(id)
-    │       └─ _loadBudget(id)
-    │           ├─ 打开数据库
-    │           ├─ 版本迁移
-    │           ├─ 加载电子表格
-    │           ├─ 启动服务
-    │           └─ 启用同步
-    └─ ✅ 代码证实：loadPrefs() 刷新前端偏好设置
-```
-
-### 4.3 分支3：下载云端预算完整链路（✅ 代码证实）
-
-```
-前端 closeAndDownloadBudget thunk (budgetfilesSlice.ts:289-295)
-    ↓
-调用 closeBudget() → 同分支2
-    ↓
-调用 downloadBudget({ cloudFileId, replace: true })
-
-前端 downloadBudget thunk (budgetfilesSlice.ts:302-379)
-    ├─ 显示 "Downloading..."
-    ├─ send('download-budget', { cloudFileId })
-    │   └─ 后端 downloadBudget handler (budgetfiles/app.ts:182-216)
-    │       ├─ ✅ 代码证实：cloudStorage.download(cloudFileId)
-    │       │   ├─ 并行获取 fileInfo 和 fileBuffer
-    │       │   ├─ 解密（如有 encryptMeta）
-    │       │   └─ importBuffer 写入本地
-    │       ├─ ✅ 代码证实：await closeBudget() → 第2次调用关闭
-    │       ├─ ✅ 代码证实：await loadBudget({ id }) → 第1次加载
-    │       └─ ✅ 代码证实：await syncBudget()
-    │           └─ initialFullSync() 执行初始全量同步
-    └─ 成功后 Promise.all 并行执行：
-        ├─ loadGlobalPrefs()
-        ├─ ✅ 代码证实：loadAllFiles() → 重新获取并协调文件列表
-        └─ ✅ 代码证实：loadBudget({ id }) → 第2次调用加载
-```
-
-### 4.4 关键细节：loadBudget 的幂等性（✅ 代码证实）
-
-`budgetfiles/app.ts:226-242`：
-```typescript
-async function loadBudget({ id }) {
-  const currentPrefs = prefs.getPrefs();
-
-  if (currentPrefs) {
-    if (currentPrefs.id === id) {
-      // ✅ 代码证实：ID 相同直接返回，不重复加载
-      return {};
-    } else {
-      await closeBudget();
-    }
-  }
-
-  return _loadBudget(id);
-}
-```
-
-**这解释了为什么分支3中 loadBudget 被调用两次是安全的**：
-- 第1次：后端 downloadBudget handler 中调用，实际执行加载
-- 第2次：前端 thunk 中调用，此时 prefs.id 已匹配，直接空转返回
-
-### 4.5 关键细节：closeBudget 被调用两次（✅ 代码证实）
-
-分支3中：
-1. 前端 `closeAndDownloadBudget` thunk 中调用 `closeBudget()` → 第1次
-2. 后端 `downloadBudget` handler 中调用 `closeBudget()` → 第2次
-
-**第2次调用时**，`prefs.getPrefs()` 已被 `cloudStorage.download()` 中的 `importBuffer` 间接加载（importBuffer 写入 metadata.json，但不会加载到内存），所以：
-- 后端 `closeBudget` 没有前置检查，会执行所有步骤
-- 但此时数据库可能已被 loadBudget 打开，行为取决于各函数的实现
+| 操作 | 真实行为 | 代码位置 |
+|------|---------|----------|
+| `prefs.loadPrefs(id)` | 从文件系统读取 metadata.json → 写入内存变量 `prefs` | `prefs.ts:24-45` |
+| `prefs.unloadPrefs()` | 直接将内存变量 `prefs` 设为 `null` | `prefs.ts:81-83` |
+| `prefs.getPrefs()` | 返回内存变量 `prefs` 的当前值 | `prefs.ts:85-87` |
+| `db.openDatabase(id)` | 打开指定预算的 SQLite 数据库连接 | `db/index.ts:70-80` |
+| `db.closeDatabase()` | 关闭当前 SQLite 数据库连接 | `db/index.ts:81-83` |
+| `importBuffer()` | 解压 zip → 写入 db.sqlite 和 metadata.json 到**文件系统**，**不加载到内存** | `cloud-storage.ts:193-249` |
 
 ---
 
-## 五、cloudStorage.download 内部流程（✅ 代码证实）
+### 4.2 分支3时序追踪：当前有预算 → 下载并切换到云端预算
 
-### 5.1 并行下载优化
+这是最复杂的场景，让我们逐行追踪 prefs 内存状态和数据库状态的变化：
 
-`cloud-storage.ts:405-440`：
-```typescript
-export async function download(cloudFileId) {
-  // ✅ 代码证实：两个请求并行执行
-  const [userFileInfoRes, userFileRes] = await Promise.all([
-    fetchJSON('/get-user-file-info'),   // 获取元数据
-    fetch('/download-user-file')        // 获取 zip 文件内容
-  ]);
-  // ...
-}
+```
+初始状态：
+  ✅ prefs 内存 = 旧预算的配置
+  ✅ 数据库连接 = 旧预算已打开
+
+┌─────────────────────────────────────────────────────────────────┐
+│  前端 closeAndDownloadBudget thunk                              │
+│  (budgetfilesSlice.ts:289-295)                                   │
+└─────────────────────────────┬───────────────────────────────────┘
+                              │
+┌─────────────────────────────▼───────────────────────────────────┐
+│  第1次调用 closeBudget()                                         │
+└─────────────────────────────┬───────────────────────────────────┘
+                              │
+┌─────────────────────────────▼───────────────────────────────────┐
+│  前端 closeBudget thunk (budgetfilesSlice.ts:98-113)            │
+│  ├─ ✅ prefs.id 存在，执行关闭                                   │
+│  ├─ dispatch(resetApp()) → 重置 Redux 状态                       │
+│  ├─ queryClient.clear() → 清除 React Query 缓存                  │
+│  └─ send('close-budget') → 发送到后端                            │
+└─────────────────────────────┬───────────────────────────────────┘
+                              │
+┌─────────────────────────────▼───────────────────────────────────┐
+│  后端 closeBudget handler (budgetfiles/app.ts:257-280)          │
+│  ├─ await sheet.waitOnSpreadsheet()                              │
+│  ├─ sheet.unloadSpreadsheet()                                    │
+│  ├─ clearFullSyncTimeout()                                       │
+│  ├─ await mainApp.stopServices()                                 │
+│  ├─ db.closeDatabase() → ✅ 关闭旧数据库                          │
+│  ├─ try { asyncStorage.setItem('lastBudget', '') }               │
+│  ├─ prefs.unloadPrefs() → ✅ prefs 内存 = null                    │
+│  └─ stopBackupService()                                          │
+└─────────────────────────────┬───────────────────────────────────┘
+                              │
+                              ├─ 此时状态：
+                              │   ✅ prefs 内存 = null
+                              │   ✅ 数据库连接 = 已关闭
+                              │
+┌─────────────────────────────▼───────────────────────────────────┐
+│  调用 downloadBudget({ cloudFileId, replace: true })            │
+└─────────────────────────────┬───────────────────────────────────┘
+                              │
+┌─────────────────────────────▼───────────────────────────────────┐
+│  前端 downloadBudget thunk (budgetfilesSlice.ts:302-379)        │
+│  ├─ setAppState({ loadingText: 'Downloading...' })              │
+│  └─ send('download-budget', { cloudFileId })                    │
+└─────────────────────────────┬───────────────────────────────────┘
+                              │
+┌─────────────────────────────▼───────────────────────────────────┐
+│  后端 downloadBudget handler (budgetfiles/app.ts:182-216)        │
+│  ├─ try {                                                        │
+│  │    result = await cloudStorage.download(cloudFileId)          │
+│  │    ├─ 并行获取 fileInfo 和 fileBuffer                         │
+│  │    ├─ 解密（如有 encryptMeta）                                │
+│  │    └─ importBuffer(fileData, buffer)                          │
+│  │       ├─ 解压 zip                                             │
+│  │       ├─ 更新 metadata（设置 cloudFileId, groupId 等）        │
+│  │       ├─ ✅ 写入 db.sqlite 和 metadata.json 到文件系统         │
+│  │       └─ ✅ return { id: meta.id } → ❌ 只是写文件！不加载内存 │
+│  └─ } catch (e) { 错误处理 }                                     │
+└─────────────────────────────┬───────────────────────────────────┘
+                              │
+                              ├─ 此时状态：
+                              │   ✅ prefs 内存 = null（importBuffer 没改内存）
+                              │   ✅ 数据库连接 = 已关闭
+                              │   ✅ 文件系统 = 新预算文件已写入
+                              │
+┌─────────────────────────────▼───────────────────────────────────┐
+│  const id = result.id                                            │
+└─────────────────────────────┬───────────────────────────────────┘
+                              │
+┌─────────────────────────────▼───────────────────────────────────┐
+│  第2次调用 closeBudget()                                        │
+│  (budgetfiles/app.ts:208)                                        │
+└─────────────────────────────┬───────────────────────────────────┘
+                              │
+┌─────────────────────────────▼───────────────────────────────────┐
+│  后端 closeBudget handler                                       │
+│  ├─ await sheet.waitOnSpreadsheet() → 已经关了                   │
+│  ├─ sheet.unloadSpreadsheet() → 已经关了                        │
+│  ├─ clearFullSyncTimeout() → 已经清了                           │
+│  ├─ await mainApp.stopServices() → 已经停了                      │
+│  ├─ db.closeDatabase() → ✅ 再次关闭（已关则无操作）              │
+│  ├─ try { asyncStorage.setItem('lastBudget', '') }               │
+│  ├─ prefs.unloadPrefs() → ✅ prefs 内存 = null（已经是 null）    │
+│  └─ stopBackupService() → 已经停了                               │
+└─────────────────────────────┬───────────────────────────────────┘
+                              │
+                              ├─ 此时状态：
+                              │   ✅ prefs 内存 = null
+                              │   ✅ 数据库连接 = 已关闭
+                              │
+┌─────────────────────────────▼───────────────────────────────────┐
+│  第1次调用 loadBudget({ id })                                    │
+│  (budgetfiles/app.ts:209)                                        │
+└─────────────────────────────┬───────────────────────────────────┘
+                              │
+┌─────────────────────────────▼───────────────────────────────────┐
+│  后端 loadBudget handler (budgetfiles/app.ts:226-242)            │
+│  ├─ currentPrefs = prefs.getPrefs() → ✅ 返回 null                │
+│  ├─ currentPrefs 为假，跳过 id 检查和 closeBudget                │
+│  └─ await _loadBudget(id)                                        │
+│     ├─ await prefs.loadPrefs(id) → ✅ 从文件读取，prefs 内存 = 新预算配置 │
+│     ├─ await db.openDatabase(id) → ✅ 打开新预算数据库            │
+│     ├─ ... 版本迁移、加载电子表格、启动服务等 ...                 │
+│     └─ setSyncingMode('enabled') → 启用同步                       │
+└─────────────────────────────┬───────────────────────────────────┘
+                              │
+                              ├─ 此时状态：
+                              │   ✅ prefs 内存 = 新预算配置
+                              │   ✅ 数据库连接 = 新预算已打开
+                              │
+┌─────────────────────────────▼───────────────────────────────────┐
+│  调用 syncBudget()                                               │
+│  (budgetfiles/app.ts:210)                                        │
+│  └─ initialFullSync() → ✅ 执行初始全量同步                        │
+└─────────────────────────────┬───────────────────────────────────┘
+                              │
+┌─────────────────────────────▼───────────────────────────────────┐
+│  后端 downloadBudget handler 返回 { id } → 成功                   │
+└─────────────────────────────┬───────────────────────────────────┘
+                              │
+┌─────────────────────────────▼───────────────────────────────────┐
+│  前端 downloadBudget thunk 成功后，Promise.all 并行执行：        │
+│  ├─ loadGlobalPrefs()                                           │
+│  ├─ loadAllFiles() → ✅ 重新获取并协调文件列表                    │
+│  └─ 第2次调用 loadBudget({ id })                                 │
+│     └─ 前端 loadBudget thunk                                    │
+│        └─ send('load-budget', { id })                            │
+│           └─ 后端 loadBudget handler                             │
+│              ├─ currentPrefs = prefs.getPrefs() → ✅ 返回新预算配置 │
+│              ├─ currentPrefs.id === id → ✅ true                 │
+│              └─ return {} → ⚠️ 幂等性检查生效，直接空转返回！      │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-### 5.2 importBuffer 写入逻辑
+### 4.3 时序关键结论（✅ 代码证实）
 
-`cloud-storage.ts:193-249`：
-```typescript
-export async function importBuffer(fileData, buffer) {
-  // 1. 解压 zip
-  const dbEntry = entries.find(e => e.entryName.includes('db.sqlite'));
-  const metaEntry = entries.find(e => e.entryName.includes('metadata.json'));
+| 调用次数 | 函数 | prefs 内存状态（调用前） | 数据库状态（调用前） | 实际行为 |
+|---------|------|-------------------------|---------------------|----------|
+| 第1次 | `closeBudget()` | 旧预算配置 | 旧预算已打开 | 正常执行所有关闭步骤 |
+| 第2次 | `closeBudget()` | null | 已关闭 | 重复执行，大部分是无操作 |
+| 第1次 | `loadBudget({ id })` | null | 已关闭 | 真正执行加载，prefs 和数据库都打开 |
+| 第2次 | `loadBudget({ id })` | 新预算配置 | 新预算已打开 | 幂等性检查生效，直接空转返回 |
 
-  // 2. ✅ 代码证实：更新 metadata，用服务器的数据覆盖
-  meta = {
-    ...meta,
-    cloudFileId: fileData.fileId,      // 服务器返回的 fileId
-    groupId: fileData.groupId,          // 服务器返回的 groupId
-    lastUploaded: monthUtils.currentDay(),
-    encryptKeyId: fileData.encryptMeta ? fileData.encryptMeta.keyId : null,
-  };
+### 4.4 ❌ 之前分析的错误修正
 
-  // 3. ✅ 代码证实：目录已存在时只删 db 和 meta，保留备份
-  if (await fs.exists(budgetDir)) {
-    // 不删除整个目录，保留备份
-    if (await fs.exists(dbFile)) await fs.removeFile(dbFile);
-    if (await fs.exists(metaFile)) await fs.removeFile(metaFile);
-  }
+1. **错误**：认为 `importBuffer` 会加载 prefs 到内存
+   - **修正**：`importBuffer` 只写入文件系统，不修改内存状态。prefs 内存是 `null`，直到 `_loadBudget` 调用 `prefs.loadPrefs(id)`。
 
-  // 4. 写入新文件
-  await fs.writeFile(dbFile, dbContent);
-  await fs.writeFile(metaFile, JSON.stringify(meta));
+2. **错误**：认为第2次 `closeBudget` 时 prefs 已有值
+   - **修正**：第2次 `closeBudget` 时 prefs 仍然是 `null`，因为 `importBuffer` 没有加载内存。
 
-  return { id: meta.id };
-}
+3. **错误**：没有明确区分「文件系统写入」和「内存加载」是两个独立操作
+   - **修正**：`importBuffer` 写文件，`prefs.loadPrefs()` 读文件到内存，这是两个独立步骤。
+
+---
+
+## 五、其他分支时序（✅ 代码证实）
+
+### 5.1 分支1：无打开预算 → 加载本地预算
+
+```
+初始状态：prefs 内存 = null，数据库 = 已关闭
+
+前端 loadBudget thunk
+    ↓
+send('load-budget', { id })
+    ↓
+后端 loadBudget handler
+    ├─ currentPrefs = prefs.getPrefs() → null
+    └─ _loadBudget(id)
+        ├─ prefs.loadPrefs(id) → prefs 内存 = 预算配置
+        ├─ db.openDatabase(id) → 数据库打开
+        └─ ... 后续加载 ...
+    ↓
+前端 loadPrefs() → 刷新前端偏好设置
+```
+
+### 5.2 分支2：有打开预算 → 切换到另一个本地预算
+
+```
+初始状态：prefs 内存 = 旧预算配置，数据库 = 旧预算已打开
+
+前端 closeAndLoadBudget thunk
+    ↓
+closeBudget()
+    ├─ resetApp() + queryClient.clear()
+    └─ send('close-budget')
+        └─ 后端 closeBudget handler
+            ├─ db.closeDatabase() → 关闭旧数据库
+            └─ prefs.unloadPrefs() → prefs 内存 = null
+    ↓
+此时状态：prefs 内存 = null，数据库 = 已关闭
+    ↓
+loadBudget({ id: fileId })
+    └─ send('load-budget', { id })
+        └─ 后端 loadBudget handler
+            ├─ currentPrefs = null
+            └─ _loadBudget(id)
+                ├─ prefs.loadPrefs(id) → prefs 内存 = 新预算配置
+                ├─ db.openDatabase(id) → 新数据库打开
+                └─ ... 后续加载 ...
+    ↓
+前端 loadPrefs()
 ```
 
 ---
@@ -446,15 +476,24 @@ export async function importBuffer(fileData, buffer) {
 loadBudget   closeAndLoad     closeAndDownload
     │               │               │
     │               ├─ closeBudget  ├─ closeBudget (第1次)
-    │               └─ loadBudget   └─ downloadBudget
-    │                               ├─ cloudStorage.download
-    │                               ├─ closeBudget (第2次) ✅
-    │                               ├─ loadBudget (第1次) ✅
-    │                               ├─ syncBudget ✅
+    │               │               │  prefs: 旧→null
+    │               │               │  DB: 已打开→已关闭
+    │               └─ loadBudget   ├─ downloadBudget
+    │                               │  ├─ cloudStorage.download
+    │                               │  │  └─ importBuffer → 写文件
+    │                               │  │     ⚠️ 不加载内存
+    │                               │  ├─ closeBudget (第2次)
+    │                               │  │  prefs: null→null
+    │                               │  │  DB: 已关闭→已关闭
+    │                               │  ├─ loadBudget (第1次)
+    │                               │  │  prefs: null→新配置
+    │                               │  │  DB: 已关闭→已打开
+    │                               │  └─ syncBudget
     │                               └─ 前端并行:
     │                                  loadGlobalPrefs
     │                                  loadAllFiles
-    │                                  loadBudget (第2次) → 空转 ✅
+    │                                  loadBudget (第2次)
+    │                                    → 幂等检查，空转返回 ✅
     │
     └───────────────┬───────────────┘
                     ▼
@@ -474,6 +513,7 @@ loadBudget   closeAndLoad     closeAndDownload
 | 下载时保留备份 | `cloud-storage.ts:230-240` | 目录已存在时只删 db 和 meta，不删整个目录 |
 | asyncStorage 异常保护 | `budgetfiles/app.ts:269-275` | 写入失败不影响整体关闭流程 |
 | 并行下载优化 | `cloud-storage.ts:437-440` | 文件内容和元数据并行请求 |
+| prefs.id 强制覆盖 | `prefs.ts:43` | 无论文件里存什么 id，强制使用目录名 |
 
 ### ✅ 代码证实的潜在问题
 
@@ -481,7 +521,7 @@ loadBudget   closeAndLoad     closeAndDownload
 |------|---------|------|
 | detached 状态 UI 误导 | `BudgetFileSelection.tsx:187-214` | 缺失 case 'detached'，错误显示为 Syncing |
 | closeBudget 大部分步骤无保护 | `budgetfiles/app.ts:257-279` | 8 个步骤中只有 1 个有 try-catch |
-| 分支3中 closeBudget 两次调用 | `budgetfiles/app.ts:208` | 前端和后端各调用一次，第二次可能有副作用 |
+| 分支3中 closeBudget 两次调用 | `budgetfiles/app.ts:208` | 前端和后端各调用一次，第二次是无操作 |
 | broken 文件仍可点击 | `budgetfilesSlice.ts:613-615` | 只是移到末尾，没有禁用点击 |
 | loadAllFiles 串行执行 | `budgetfilesSlice.ts:40-41` | 两个 await 串行，比并行慢 |
 
@@ -491,7 +531,7 @@ loadBudget   closeAndLoad     closeAndDownload
 |------|------|--------|
 | detached 状态实际同步功能异常 | groupId 是 CRDT 同步组标识，不匹配意味着同步历史断裂 | 高 |
 | broken 文件点击后会出错 | 云端已不存在该文件，同步操作会失败 | 高 |
-| 第2次 closeBudget 调用是冗余的 | 第1次关闭后资源已释放，第2次可能是防御性编程 | 中 |
+| 第2次 closeBudget 调用是防御性编程 | 第1次关闭后资源已释放，第2次调用是为了确保状态干净 | 中 |
 | loadAllFiles 串行是历史遗留代码 | 没有明显理由必须串行，可能可以优化为并行 | 中 |
 
 ---
@@ -501,6 +541,8 @@ loadBudget   closeAndLoad     closeAndDownload
 | 文件路径 | 关键代码段 | 行号 |
 |----------|-----------|------|
 | `packages/loot-core/src/types/file.ts` | FileState 类型定义 | 5-11 |
+| `packages/loot-core/src/server/prefs.ts` | prefs 内存操作 | 22-87 |
+| `packages/loot-core/src/server/db/index.ts` | 数据库打开/关闭 | 70-83 |
 | `packages/desktop-client/src/budgetfiles/budgetfilesSlice.ts` | loadAllFiles 串行实现 | 37-47 |
 | `packages/desktop-client/src/budgetfiles/budgetfilesSlice.ts` | closeBudget 前端实现 | 98-113 |
 | `packages/desktop-client/src/budgetfiles/budgetfilesSlice.ts` | reconcileFiles 算法 | 516-616 |
@@ -513,6 +555,7 @@ loadBudget   closeAndLoad     closeAndDownload
 | `packages/loot-core/src/server/budgetfiles/app.ts` | closeBudget 后端实现 | 257-280 |
 | `packages/loot-core/src/server/budgetfiles/app.ts` | loadBudget 幂等性检查 | 226-237 |
 | `packages/loot-core/src/server/budgetfiles/app.ts` | downloadBudget 后端链路 | 182-216 |
+| `packages/loot-core/src/server/budgetfiles/app.ts` | _loadBudget 内部实现 | 508-640 |
 | `packages/loot-core/src/server/cloud-storage.ts` | listRemoteFiles 返回 null | 374-403 |
 | `packages/loot-core/src/server/cloud-storage.ts` | download 并行请求 | 405-440 |
-| `packages/loot-core/src/server/cloud-storage.ts` | importBuffer 保留备份 | 230-240 |
+| `packages/loot-core/src/server/cloud-storage.ts` | importBuffer 只写文件 | 193-249 |
