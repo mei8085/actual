@@ -680,20 +680,56 @@ useEffect 执行，注入初始主题 CSS
 
 ---
 
-## 七、关键文件索引
+## 七、主题状态变更的实际影响范围（精确统计）
 
-| 文件路径 | 作用 |
-|---------|------|
-| `packages/loot-core/src/types/prefs.ts` | 定义 GlobalPrefs、Theme、DarkTheme 类型 |
-| `packages/loot-core/src/server/preferences/app.ts` | 后端持久化逻辑（load/save global prefs） |
-| `packages/desktop-client/src/prefs/prefsSlice.ts` | Redux 状态管理（load/save actions） |
-| `packages/desktop-client/src/hooks/useGlobalPref.ts` | 全局偏好 Hook（读 + 写） |
-| `packages/desktop-client/src/hooks/useMetadataPref.ts` | 预算元数据 Hook |
-| `packages/desktop-client/src/style/theme.tsx` | ThemeStyle + CustomThemeStyle + 迁移逻辑 |
-| `packages/desktop-client/src/style/customThemes.ts` | 自定义主题工具函数（验证、解析、迁移） |
-| `packages/component-library/src/theme.ts` | 组件库主题映射（theme 对象） |
-| `packages/component-library/src/themes/*.css` | CSS 变量定义（palette + 三套主题） |
-| `packages/desktop-client/src/components/App.tsx` | 应用入口，主题组件注入位置 |
+### 7.1 订阅点分类统计
+
+首先明确概念：
+- **Hook 定义**：只是定义函数，本身不订阅状态（不计入）
+- **组件/Hook 调用**：实际调用 Hook，会订阅状态变化（计入）
+
+**Hook 定义（不计入）**：
+| Hook | 定义位置 | 说明 |
+|------|---------|------|
+| `useTheme()` | `theme.tsx:36-39` | 内部调用 `useGlobalPref('theme')` |
+| `usePreferredDarkTheme()` | `theme.tsx:41-45` | 内部调用 `useGlobalPref('preferredDarkTheme')` |
+
+**实际订阅组件/Hook（计入，去重后共 10 个）**：
+
+| 序号 | 组件/Hook | 文件位置 | 订阅内容 | 场景 |
+|------|-----------|----------|----------|------|
+| 1 | `ThemeStyle` | `theme.tsx:95-174` | `useTheme()` + `usePreferredDarkTheme()` + `installedCustomLightTheme` + `installedCustomDarkTheme` | 预算打开/未打开 |
+| 2 | `useMigrateLegacyOverride` | `theme.tsx:53-89` | `customCssOverride` + `installedCustomLightTheme` + `installedCustomDarkTheme` | 预算打开/未打开 |
+| 3 | `CustomThemeStyle` | `theme.tsx:183-247` | `useTheme()` + `installedCustomLightTheme` + `installedCustomDarkTheme` + `customCssOverride` | 预算打开/未打开 |
+| 4 | `useMetaThemeColor` | `hooks/useMetaThemeColor.ts:13-27` | `useTheme()` + `usePreferredDarkTheme()` | 预算打开/未打开 |
+| 5 | `useTagCSS` | `hooks/useTagCSS.ts:11-44` | `useTheme()` | 预算内 |
+| 6 | `ThemeSettings` | `settings/Themes.tsx:42-200+` | `useTheme()` + `usePreferredDarkTheme()` + `customCssOverride` | 预算内 |
+| 7 | `ThemeInstaller` | `settings/ThemeInstaller.tsx` | `customCssOverride` | 预算内 |
+| 8 | `FormulaEditor` | `formula/FormulaEditor.tsx:37` | `useTheme()` | 预算内 |
+| 9 | `ThemeSelector` | `ThemeSelector.tsx:22-75` | `useTheme()` | 预算内 |
+| 10 | `App.tsx` | `App.tsx:195` | `useTheme()` | 预算打开/未打开 |
+
+### 7.2 按场景分类
+
+| 场景 | 会重新渲染的组件/Hook | 数量 |
+|------|-----------------------|------|
+| 预算未打开（管理页） | `ThemeStyle`, `useMigrateLegacyOverride`, `CustomThemeStyle`, `useMetaThemeColor`, `App.tsx` | 5 |
+| 预算已打开（预算页） | 全部 10 个 | 10 |
+
+### 7.3 不会重新渲染但样式会自动更新的组件
+
+所有使用 `theme` 对象引用 CSS 变量的组件（数量很多）：
+- 浏览器自动更新 CSS 变量值
+- 不需要 React 重渲染
+- 这是 CSS 变量方案的一大优势
+
+### 7.4 性能影响
+
+主题变化的性能影响很小：
+- 最多 10 个组件/Hook 重渲染
+- 浏览器重新解析 CSS 变量
+- 大部分组件不需要重渲染
+- 实际感知不到性能影响
 
 ---
 
@@ -703,14 +739,72 @@ useEffect 执行，注入初始主题 CSS
 
 将主题从**应用级别**改为**预算文件级别**，每个预算文件可以有独立的主题设置。切换预算文件时，主题自动切换。
 
-### 8.2 改造步骤
+### 8.2 共用主题解析策略（预算打开/未打开场景）
+
+采用**混合模式**，同时支持全局默认主题和预算独立主题：
+
+```
+主题解析优先级（从高到低）：
+1. 当前加载预算的 MetadataPrefs.theme（如果有值）
+2. GlobalPrefs.theme（全局默认主题）
+3. 硬编码默认值 'auto'
+```
+
+**主题解析策略实现**：
+
+```typescript
+// packages/desktop-client/src/hooks/useBudgetTheme.ts
+import { useGlobalPref } from './useGlobalPref';
+import { useMetadataPref } from './useMetadataPref';
+import type { Theme, DarkTheme } from '@actual-app/core/types/prefs';
+
+/**
+ * 预算级主题 Hook：优先使用预算的主题设置，回退到全局默认
+ */
+export function useBudgetTheme() {
+  const [budgetTheme, setBudgetTheme] = useMetadataPref('theme');
+  const [globalTheme, setGlobalTheme] = useGlobalPref('theme');
+  
+  // 优先级：预算主题 > 全局主题 > 默认 'auto'
+  const activeTheme = budgetTheme ?? globalTheme ?? 'auto';
+  
+  // 根据修改来源决定写入哪里
+  const setTheme = (newTheme: Theme, scope: 'budget' | 'global' = 'budget') => {
+    if (scope === 'budget') {
+      setBudgetTheme(newTheme);
+    } else {
+      setGlobalTheme(newTheme);
+    }
+  };
+  
+  return [activeTheme, setTheme] as const;
+}
+
+export function useBudgetPreferredDarkTheme() {
+  const [budgetDarkTheme, setBudgetDarkTheme] = useMetadataPref('preferredDarkTheme');
+  const [globalDarkTheme, setGlobalDarkTheme] = useGlobalPref('preferredDarkTheme');
+  
+  const activeDarkTheme = budgetDarkTheme ?? globalDarkTheme ?? 'dark';
+  
+  const setPreferredDarkTheme = (newTheme: DarkTheme, scope: 'budget' | 'global' = 'budget') => {
+    if (scope === 'budget') {
+      setBudgetDarkTheme(newTheme);
+    } else {
+      setGlobalDarkTheme(newTheme);
+    }
+  };
+  
+  return [activeDarkTheme, setPreferredDarkTheme] as const;
+}
+```
+
+### 8.3 改造步骤（共 13 步）
 
 #### 步骤 1：扩展 MetadataPrefs 类型
 
 **文件**：`packages/loot-core/src/types/prefs.ts`
 
 ```typescript
-// 在 MetadataPrefs 中添加主题相关字段
 export type MetadataPrefs = Partial<{
   budgetName: string;
   id: string;
@@ -732,47 +826,28 @@ export type MetadataPrefs = Partial<{
 }>;
 ```
 
-#### 步骤 2：修改后端 metadata 加载/保存逻辑
+#### 步骤 2：创建预算级主题 Hook
 
-**文件**：`packages/loot-core/src/server/prefs.ts`
+**文件**：`packages/desktop-client/src/hooks/useBudgetTheme.ts`（新建）
 
-当前 `loadPrefs` 和 `savePrefs` 已经支持任意 `MetadataPrefs` 字段，不需要修改。但需要确保主题字段能正确序列化/反序列化。
+实现上文中的 `useBudgetTheme` 和 `useBudgetPreferredDarkTheme`，采用混合模式解析策略。
 
-#### 步骤 3：创建预算级主题 Hook
+#### 步骤 3：修改主题相关 Hook
 
-**文件**：新建 `packages/desktop-client/src/hooks/useBudgetTheme.ts`（或修改现有文件）
+**文件**：`packages/desktop-client/src/style/theme.tsx`
 
 ```typescript
-import type { Theme, DarkTheme } from '@actual-app/core/types/prefs';
-
-import { useMetadataPref } from './useMetadataPref';
-
-export function useBudgetTheme() {
-  const [theme = 'auto', setThemePref] = useMetadataPref('theme');
+// 替换 useGlobalPref 为 useMetadataPref（或新的 useBudgetTheme）
+export function useTheme() {
+  // 从 useGlobalPref('theme') 改为 useBudgetTheme()
+  const [theme = 'auto', setThemePref] = useBudgetTheme();
   return [theme, setThemePref] as const;
 }
 
-export function useBudgetPreferredDarkTheme() {
-  const [darkTheme = 'dark', setDarkTheme] = useMetadataPref('preferredDarkTheme');
+export function usePreferredDarkTheme() {
+  // 从 useGlobalPref('preferredDarkTheme') 改为 useBudgetPreferredDarkTheme()
+  const [darkTheme = 'dark', setDarkTheme] = useBudgetPreferredDarkTheme();
   return [darkTheme, setDarkTheme] as const;
-}
-
-export function useBudgetCustomTheme() {
-  const [installedCustomLightTheme, setInstalledCustomLightTheme] = 
-    useMetadataPref('installedCustomLightTheme');
-  const [installedCustomDarkTheme, setInstalledCustomDarkTheme] = 
-    useMetadataPref('installedCustomDarkTheme');
-  const [customCssOverride, setCustomCssOverride] = 
-    useMetadataPref('customCssOverride');
-  
-  return {
-    installedCustomLightTheme,
-    setInstalledCustomLightTheme,
-    installedCustomDarkTheme,
-    setInstalledCustomDarkTheme,
-    customCssOverride,
-    setCustomCssOverride,
-  };
 }
 ```
 
@@ -780,90 +855,83 @@ export function useBudgetCustomTheme() {
 
 **文件**：`packages/desktop-client/src/style/theme.tsx`
 
-将 `useGlobalPref` 替换为 `useMetadataPref`：
+将所有 `useGlobalPref('installedCustomLightTheme')` 等调用替换为 `useMetadataPref` 或对应的预算级 Hook。
+
+#### 步骤 5：修改所有订阅主题的组件
+
+除了 `ThemeStyle` 和 `CustomThemeStyle`，还有 7 个组件/hook 也直接订阅主题状态，需要一并修改：
+
+| 组件/Hook | 当前使用 | 需要修改为 |
+|-----------|----------|-----------|
+| `ThemeSettings` | `useTheme()` | 预算级主题 Hook |
+| `ThemeInstaller` | `useGlobalPref('customCssOverride')` | 预算级主题 Hook |
+| `ThemeSelector` | `useTheme()` | 预算级主题 Hook |
+| `FormulaEditor` | `useTheme()` | 预算级主题 Hook |
+| `App.tsx:195` | `useTheme()` | 预算级主题或全局默认 |
+| `useMetaThemeColor` | `useTheme()` | 预算级主题 Hook |
+| `useTagCSS` | `useTheme()` | 预算级主题 Hook |
+
+#### 步骤 6：处理管理页主题来源
+
+管理页（预算未打开时）没有 `MetadataPrefs`，需要特殊处理：
+
+**方案**：在 `useBudgetTheme` 中检测预算是否已加载，如果没有加载则直接使用全局主题：
 
 ```typescript
-export function useTheme() {
-  // 从 useGlobalPref 改为 useMetadataPref
-  const [theme = 'auto', setThemePref] = useMetadataPref('theme');
-  return [theme, setThemePref] as const;
-}
-
-export function usePreferredDarkTheme() {
-  // 从 useGlobalPref 改为 useMetadataPref
-  const [darkTheme = 'dark', setDarkTheme] = useMetadataPref('preferredDarkTheme');
-  return [darkTheme, setDarkTheme] as const;
-}
-
-export function ThemeStyle() {
-  const [activeTheme] = useTheme();
-  const [darkThemePreference] = usePreferredDarkTheme();
-  // 从 useGlobalPref 改为 useMetadataPref
-  const [installedCustomLightThemeJson] = useMetadataPref('installedCustomLightTheme');
-  const [installedCustomDarkThemeJson] = useMetadataPref('installedCustomDarkTheme');
-  // ... 其余逻辑不变
-}
-
-export function CustomThemeStyle() {
-  useMigrateLegacyOverride();
-  const [activeTheme] = useTheme();
-  // 从 useGlobalPref 改为 useMetadataPref
-  const [installedCustomLightThemeJson] = useMetadataPref('installedCustomLightTheme');
-  const [installedCustomDarkThemeJson] = useMetadataPref('installedCustomDarkTheme');
-  const [customCssOverride] = useMetadataPref('customCssOverride');
-  // ... 其余逻辑不变
+export function useBudgetTheme() {
+  const [budgetTheme, setBudgetTheme] = useMetadataPref('theme');
+  const [globalTheme, setGlobalTheme] = useGlobalPref('theme');
+  const budgetId = useMetadataPref('id'); // 用来检测预算是否加载
+  
+  // 如果没有预算 ID（管理页），只使用全局主题
+  if (!budgetId) {
+    return [globalTheme ?? 'auto', (t) => setGlobalTheme(t)] as const;
+  }
+  
+  // 有预算时，使用混合模式
+  const activeTheme = budgetTheme ?? globalTheme ?? 'auto';
+  // ...
 }
 ```
 
-#### 步骤 5：修改迁移逻辑（可选）
+#### 步骤 7：调整主题设置页面的访问性
 
-如果需要支持旧数据迁移，可以修改 `useMigrateLegacyOverride` 从 GlobalPrefs 读取旧值，写入 MetadataPrefs。
+当前 `ThemeSettings` 只在预算内可见（`settings/index.tsx:240`）。改造后需要考虑：
 
-#### 步骤 6：确保加载预算时触发主题更新
+1. **在管理页也提供主题设置**（作为新预算的默认主题）
+2. **在设置页面增加范围选择**：用户可以选择"仅当前预算"还是"全局默认"
 
-**文件**：`packages/desktop-client/src/components/App.tsx`
+#### 步骤 8：在创建预算时的主题选择
 
-当前架构下，加载预算时 Redux state `prefs.local` 会更新，`useMetadataPref` 会自动返回新值，`ThemeStyle` 的 useEffect 会自动重新执行，主题会自动切换。不需要额外修改。
+新预算创建时：
+- 默认继承全局主题设置
+- 或者提供主题选择器让用户选择
 
-**验证流程**：
-```
-加载预算文件 A
-    ↓
-loadPrefs() 读取 budget-A/metadata.json
-    ↓
-setPrefs() 更新 Redux state.prefs.local
-    ↓
-useMetadataPref('theme') 返回预算 A 的主题设置
-    ↓
-ThemeStyle useEffect 重新执行
-    ↓
-注入预算 A 的主题 CSS
-    ↓
-切换到预算文件 B
-    ↓
-loadPrefs() 读取 budget-B/metadata.json
-    ↓
-setPrefs() 更新 Redux state.prefs.local
-    ↓
-useMetadataPref('theme') 返回预算 B 的主题设置
-    ↓
-ThemeStyle useEffect 重新执行
-    ↓
-注入预算 B 的主题 CSS
+#### 步骤 9：处理关闭预算时的主题切换
+
+当前 `closeBudget` 会调用 `resetApp()`，但 `resetApp` 保留了 `global` 状态（`prefsSlice.ts:186-189`）：
+```typescript
+builder.addCase(resetApp, state => ({
+  ...initialState,
+  global: state.global || initialState.global,
+  server: state.server || initialState.server,
+}));
 ```
 
-#### 步骤 7：更新设置 UI
+关闭预算后：
+- 切换回全局默认主题（由于 `useBudgetTheme` 检测到没有 budgetId，自动使用全局主题）
+- 不需要额外修改，混合模式自动处理
 
-修改主题设置页面，让用户知道主题是**当前预算文件**的设置，而非全局设置。可以添加一个选项："应用到所有预算文件"。
+#### 步骤 10：数据迁移策略
 
-#### 步骤 8：数据迁移（可选）
-
-如果需要将用户现有的全局主题设置迁移为默认预算主题，可以在应用启动时执行一次性迁移：
+将现有用户的全局主题迁移到预算文件：
 
 ```typescript
-// 在加载第一个预算时，如果 metadata.json 没有主题设置，
-// 从 global-store.json 复制过来
-async function migrateGlobalThemeToBudget(budgetId: string) {
+// packages/desktop-client/src/prefs/prefsSlice.ts
+// 在 loadPrefs 成功后执行一次性迁移
+
+// 首次打开预算时，如果预算没有主题设置，从全局主题复制
+async function migrateThemeFromGlobalToBudget(budgetId: string) {
   const globalPrefs = await send('load-global-prefs');
   const metadataPrefs = await send('load-prefs');
   
@@ -879,24 +947,133 @@ async function migrateGlobalThemeToBudget(budgetId: string) {
 }
 ```
 
-### 8.3 改造注意事项
+#### 步骤 11：修改 Legacy Override 迁移逻辑
+
+`useMigrateLegacyOverride` 目前只迁移到 `GlobalPrefs`，需要支持迁移到 `MetadataPrefs`。
+
+#### 步骤 12：更新 ThemeSettings UI
+
+在设置页面增加：
+- 范围选择器（仅当前预算 / 全局默认）
+- 应用到所有预算的按钮
+
+#### 步骤 13：测试验证
+
+测试以下场景：
+- 未打开预算时，主题来自全局设置
+- 打开预算 A，设置主题 A，关闭后回到管理页，主题切回全局
+- 打开预算 B，设置主题 B，切换到预算 A，主题自动切换到 A
+- 新创建的预算默认继承全局主题
+- 关闭预算时，主题正确切回全局
+
+### 8.4 改造注意事项
 
 1. **向后兼容**：旧的 `metadata.json` 没有主题字段，需要提供默认值（`'auto'`）
-2. **全局主题的取舍**：改造后，`GlobalPrefs` 中的主题字段可以保留作为默认值，也可以移除
-3. **设置 UI 提示**：需要明确告诉用户主题是"当前预算"的设置
+2. **全局主题的取舍**：保留 `GlobalPrefs.theme` 作为默认值和管理页主题
+3. **设置 UI 提示**：明确告诉用户主题是"当前预算"还是"全局默认"的设置
 4. **性能**：每次切换预算都会重新注入主题 CSS，这是正常的，不会有性能问题
 5. **自定义主题文件大小**：如果用户安装了包含内嵌字体的自定义主题，`metadata.json` 会变大，但这是可接受的
 
-### 8.4 替代方案：混合模式
+### 8.5 改造骨架代码总结
 
-如果不想完全去掉全局主题，可以实现混合模式：
-- 全局主题作为默认设置
-- 每个预算可以选择"继承全局主题"或"使用独立主题"
-- 在 `MetadataPrefs` 中添加 `useCustomTheme: boolean` 字段控制
+以下是改造的核心骨架，可直接参考实现：
+
+```typescript
+// ─────────────────────────────────────────────────────
+// 1. 类型扩展 (prefs.ts)
+// ─────────────────────────────────────────────────────
+export type MetadataPrefs = Partial<{
+  // ... 原有字段 ...
+  theme: Theme;
+  preferredDarkTheme: DarkTheme;
+  installedCustomLightTheme?: string;
+  installedCustomDarkTheme?: string;
+  customCssOverride?: string;
+}>;
+
+// ─────────────────────────────────────────────────────
+// 2. 预算级主题 Hook (useBudgetTheme.ts)
+// ─────────────────────────────────────────────────────
+export function useBudgetTheme() {
+  const [budgetTheme, setBudgetTheme] = useMetadataPref('theme');
+  const [globalTheme, setGlobalTheme] = useGlobalPref('theme');
+  const [budgetId] = useMetadataPref('id');
+  
+  if (!budgetId) {
+    return [globalTheme ?? 'auto', (t: Theme) => setGlobalTheme(t)] as const;
+  }
+  
+  const activeTheme = budgetTheme ?? globalTheme ?? 'auto';
+  const setTheme = (newTheme: Theme, scope: 'budget' | 'global' = 'budget') => {
+    scope === 'budget' ? setBudgetTheme(newTheme) : setGlobalTheme(newTheme);
+  };
+  
+  return [activeTheme, setTheme] as const;
+}
+
+// ─────────────────────────────────────────────────────
+// 3. 修改 theme.tsx 中的 useTheme
+// ─────────────────────────────────────────────────────
+export function useTheme() {
+  return useBudgetTheme();
+}
+
+// ─────────────────────────────────────────────────────
+// 4. 修改所有订阅点（10 个组件/Hook）
+// ─────────────────────────────────────────────────────
+// 将 useGlobalPref 替换为 useMetadataPref 或预算级 Hook
+```
 
 ---
 
-## 九、常见问题解答
+## 九、关键边界场景深入分析
+
+### 9.1 预算未打开时管理页主题来源与实际行为
+
+**问题**：没有打开预算文件时，管理页（ManagementApp）的主题从哪里来？
+
+**代码证据链**：
+
+1. **主题注入时机**（`App.tsx:227-228`）：
+   ```tsx
+   <ThemeStyle />
+   <CustomThemeStyle />
+   ```
+   这两个组件在应用根组件中渲染，**无论是否打开预算都会渲染**。
+
+2. **全局偏好加载时机**（`App.tsx:91`）：
+   ```typescript
+   await dispatch(loadGlobalPrefs());
+   ```
+   全局偏好（包括主题）在应用启动时就加载了，在加载预算之前。
+
+3. **管理页也使用主题**（`ManagementApp.tsx:7, 45, 69`）：
+   ```tsx
+   <View style={{ height: '100%', color: theme.pageText }}>
+   // 版本号颜色使用 theme.pageTextSubdued
+   useMetaThemeColor(isNarrowWidth ? theme.mobileConfigServerViewTheme : undefined);
+   ```
+   管理页也使用 `theme` 对象引用 CSS 变量。
+
+**实际行为结论**：
+
+| 场景 | 主题来源 | 能否修改主题 |
+|------|---------|-------------|
+| 未打开预算（管理页） | `global-store.json` 中的全局主题设置 | ❌ 不能（设置页面只在预算内可见） |
+| 已打开预算（预算页） | `global-store.json` 中的全局主题设置 | ✅ 可以（通过设置页面） |
+
+**重要发现**：
+- 即使没有预算，主题 CSS 变量也会被注入并生效
+- 但用户无法在管理页修改主题（设置页面 `ThemeSettings` 只在 `FinancesApp` 内的 `Settings` 组件中渲染（`settings/index.tsx:240`））
+- `ThemeSelector` 快速切换按钮也只在预算内的标题栏中
+
+### 9.2 预算文件粒度方案的补充改动点
+
+之前的 8 步方案遗漏了以下关键改动点，已补充到本章的第 6-13 步中。
+
+---
+
+## 十、常见问题解答
 
 ### Q: 为什么不使用 React Context 传递主题？
 A: 因为主题是通过 CSS 变量实现的，一旦注入到 `<style>` 标签中就是全局的。组件只需要通过 `theme` 对象引用 CSS 变量名，不需要通过 Context 获取当前主题值。这种方式比 Context 更简单、性能更好。
@@ -908,16 +1085,17 @@ A: `ThemeStyle` 使用 JavaScript 监听是因为需要切换基础主题 CSS（
 A: 主题是 UI 层面的设置，不属于业务数据。存储在 `metadata.json` 中更合适，因为它是预算文件的元数据，不需要同步到其他设备（当然如果需要也可以同步）。
 
 ### Q: 切换主题时所有组件都会重新渲染吗？
-A: 不会全部重新渲染，但比之前认为的要多。**会重新渲染的组件和 Hook**（直接订阅主题状态的有 9 个：
+A: 不会全部重新渲染。**会重新渲染的组件和 Hook**（直接订阅主题状态的）有 10 个：
 1. `ThemeStyle` - 核心主题注入组件
-2. `CustomThemeStyle` - 自定义主题注入组件
-3. `ThemeSettings` - 设置页面（预算内可见）
-4. `ThemeInstaller` - 自定义主题安装器
-5. `ThemeSelector` - 快速主题切换按钮
-6. `FormulaEditor` - 公式编辑器
-7. `App.tsx` - 根组件（设置 `data-theme` 属性）
-8. `useMetaThemeColor` hook - 更新浏览器主题色 meta 标签
-9. `useTagCSS` hook - 生成标签 CSS 样式
+2. `useMigrateLegacyOverride` - 迁移逻辑 Hook
+3. `CustomThemeStyle` - 自定义主题注入组件
+4. `useMetaThemeColor` - 更新浏览器主题色 meta 标签
+5. `useTagCSS` - 生成标签 CSS 样式
+6. `ThemeSettings` - 设置页面（预算内可见）
+7. `ThemeInstaller` - 自定义主题安装器
+8. `FormulaEditor` - 公式编辑器
+9. `ThemeSelector` - 快速主题切换按钮
+10. `App.tsx` - 根组件
 
 **不会重新渲染但样式会自动更新**：
 - 所有使用 `theme` 对象引用 CSS 变量的组件（通过浏览器自动更新 CSS 变量值）
@@ -925,147 +1103,27 @@ A: 不会全部重新渲染，但比之前认为的要多。**会重新渲染的
 
 ---
 
-## 十、关键边界场景深入分析
+## 十一、关键文件索引
 
-### 10.1 预算未打开时管理页主题来源与实际行为
-
-**问题：没有打开预算文件时，管理页（ManagementApp）的主题从哪里来？
-
-**代码证据链：
-
-1. **主题注入时机**（`App.tsx:227-228`）
-   ```tsx
-   <ThemeStyle />
-   <CustomThemeStyle />
-   ```
-   这两个组件在应用根组件中渲染，**无论是否打开预算都会渲染。
-
-2. **全局偏好加载时机**（`App.tsx:91`）
-   ```typescript
-   await dispatch(loadGlobalPrefs());
-   ```
-   全局偏好（包括主题）在应用启动时就加载了，在加载预算之前。
-
-3. **管理页也使用主题**（`ManagementApp.tsx:7, 45, 69`）
-   ```tsx
-   <View style={{ height: '100%', color: theme.pageText }}>
-   // 版本号颜色使用 theme.pageTextSubdued
-   useMetaThemeColor(isNarrowWidth ? theme.mobileConfigServerViewTheme : undefined);
-   ```
-   管理页也使用 `theme` 对象引用 CSS 变量。
-
-**实际行为结论：
-
-| 场景 | 主题来源 | 能否修改主题 |
-|--------|-----------|-------------|
-| 未打开预算（管理页） | `global-store.json` 中的全局主题设置 | ❌ 不能（设置页面只在预算内可见 |
-| 已打开预算（预算页） | `global-store.json` 中的全局主题设置 | ✅ 可以（通过设置页面） |
-
-**重要发现**：
-- 即使没有预算，主题 CSS 变量也会被注入并生效
-- 但用户无法在管理页修改主题（设置页面 `ThemeSettings` 只在 `FinancesApp` 内的 `Settings` 组件中渲染（`settings/index.tsx:240`）
-- `ThemeSelector` 快速切换按钮也只在预算内的标题栏中
-
----
-
-### 10.2 预算文件粒度主题方案的补充改动点
-
-之前的 8 步方案遗漏了以下关键改动点：
-
-#### 补充步骤 9：处理管理页主题来源
-
-**问题**：如果主题是预算文件粒度，未打开预算时管理页的主题从哪里来？
-
-**方案 A（推荐）：保留全局主题作为默认值
-- 保留 `GlobalPrefs.theme` 作为默认主题
-- 预算文件的 `MetadataPrefs.theme` 优先级更高
-- 未打开预算时使用全局主题
-- 打开预算时，如果预算有主题设置则使用预算的，否则使用全局主题
-
-**方案 B：管理页使用固定主题
-- 未打开预算时固定使用亮色主题或系统默认
-- 打开预算后切换到预算的主题
-
-#### 补充步骤 10：调整主题设置页面的访问性
-
-当前 `ThemeSettings` 只在预算内可见（`settings/index.tsx:240`）。如果主题是预算粒度，需要考虑：
-
-1. **是否在管理页也提供主题设置**：
-   - 作为新预算的默认主题设置
-   - 或者管理页可以修改全局默认主题
-
-2. **在创建预算时的主题选择**：
-   - 新预算默认继承全局主题
-   - 或者提供主题选择器让用户选择
-
-#### 补充步骤 11：修改所有订阅主题的组件
-
-除了 `ThemeStyle` 和 `CustomThemeStyle`，还有 7 个组件/hook 也直接订阅主题状态，需要一并修改：
-
-| 组件/Hook | 当前使用 | 需要修改为 |
-|-----------|----------|-----------|
-| `ThemeSettings` | `useTheme()` | 预算级主题 Hook |
-| `ThemeInstaller` | `useGlobalPref('customCssOverride') | 预算级主题 Hook |
-| `ThemeSelector` | `useTheme()` | 预算级主题 Hook |
-| `FormulaEditor` | `useTheme()` | 预算级主题 Hook |
-| `App.tsx:195` | `useTheme()` | 预算级主题或全局默认 |
-| `useMetaThemeColor` | `useTheme()` | 预算级主题 Hook |
-| `useTagCSS` | `useTheme()` | 预算级主题 Hook |
-
-#### 补充步骤 12：处理关闭预算时的主题切换
-
-当前 `closeBudget` 会调用 `resetApp()`，但 `resetApp` 保留了 `global` 状态（`prefsSlice.ts:186-189`）：
-```typescript
-builder.addCase(resetApp, state => ({
-  ...initialState,
-  global: state.global || initialState.global,
-  server: state.server || initialState.server,
-}));
-```
-
-如果主题改为预算粒度，关闭预算后需要：
-- 切换回全局默认主题
-- 或者保留最后一个预算的主题（取决于产品决策）
-
-#### 补充步骤 13：数据迁移策略
-
-将现有用户的全局主题迁移到预算文件：
-- 首次打开预算时，如果预算没有主题设置，从全局主题复制到预算的 `metadata.json`
-- 或者只在用户修改主题时才写入预算文件
-
----
-
-### 10.3 主题状态变更的实际影响范围（纠正之前的结论）
-
-**之前的错误结论**："只有 `ThemeStyle` 和 `CustomThemeStyle` 会重新渲染"
-
-**实际影响范围**：
-
-#### 直接订阅主题状态的组件/Hook（**会重新渲染**：
-
-| 组件/Hook | 文件位置 | 订阅内容 |
-|------------|----------|-----------|
-| `useTheme() | `theme.tsx:36-39 | `useGlobalPref('theme') |
-| `usePreferredDarkTheme() | `theme.tsx:41-45 | `useGlobalPref('preferredDarkTheme') |
-| `ThemeStyle` | `theme.tsx:95-174 | `useTheme() + `usePreferredDarkTheme() + 2个自定义主题 pref |
-| `CustomThemeStyle` | `theme.tsx:183-247 | `useTheme() + 3个自定义主题 pref |
-| `ThemeSettings` | `settings/Themes.tsx:42-200+ | `useTheme() + `usePreferredDarkTheme() + 3个自定义主题 pref |
-| `ThemeInstaller` | `settings/ThemeInstaller.tsx` | `useGlobalPref('customCssOverride') |
-| `ThemeSelector` | `ThemeSelector.tsx:22-75 | `useTheme()` |
-| `FormulaEditor` | `formula/FormulaEditor.tsx:37 | `useTheme()` |
-| `App.tsx` | `App.tsx:195 | `useTheme()` |
-| `useMetaThemeColor` | `hooks/useMetaThemeColor.ts:13-27 | `useTheme() + `usePreferredDarkTheme() |
-| `useTagCSS` | `hooks/useTagCSS.ts:11-44 | `useTheme()` |
-
-**总计**：11 个组件/Hook 直接订阅主题状态，主题变化时都会重新渲染。
-
-#### 不会重新渲染但样式会自动更新的组件：
-
-所有使用 `theme` 对象引用 CSS 变量的组件（数量很多，但浏览器自动更新 CSS 变量值，不需要 React 重渲染。这是 CSS 变量方案的一大优势。
-
-**主题变化的性能影响：
-- 11 个组件重渲染
-- 浏览器重新解析 CSS 变量
-- 大部分组件不需要重渲染
-
-这个影响很小，性能影响可以忽略不计
+| 文件路径 | 作用 |
+|---------|------|
+| `packages/loot-core/src/types/prefs.ts` | 定义 GlobalPrefs、Theme、DarkTheme 类型 |
+| `packages/loot-core/src/server/preferences/app.ts` | 后端持久化逻辑（load/save global prefs） |
+| `packages/loot-core/src/server/prefs.ts` | 后端 metadata prefs 逻辑（load/save budget prefs） |
+| `packages/desktop-client/src/prefs/prefsSlice.ts` | Redux 状态管理（load/save actions） |
+| `packages/desktop-client/src/hooks/useGlobalPref.ts` | 全局偏好 Hook（读 + 写） |
+| `packages/desktop-client/src/hooks/useMetadataPref.ts` | 预算元数据 Hook |
+| `packages/desktop-client/src/style/theme.tsx` | ThemeStyle + CustomThemeStyle + 迁移逻辑 |
+| `packages/desktop-client/src/style/customThemes.ts` | 自定义主题工具函数（验证、解析、迁移） |
+| `packages/desktop-client/src/hooks/useMetaThemeColor.ts` | 浏览器主题色 meta 标签 Hook |
+| `packages/desktop-client/src/hooks/useTagCSS.ts` | 标签样式 Hook |
+| `packages/component-library/src/theme.ts` | 组件库主题映射（theme 对象） |
+| `packages/component-library/src/themes/*.css` | CSS 变量定义（palette + 三套主题） |
+| `packages/desktop-client/src/components/App.tsx` | 应用入口，主题组件注入位置 |
+| `packages/desktop-client/src/components/FinancesApp.tsx` | 预算页根组件 |
+| `packages/desktop-client/src/components/manager/ManagementApp.tsx` | 管理页根组件 |
+| `packages/desktop-client/src/components/settings/index.tsx` | 设置页面入口 |
+| `packages/desktop-client/src/components/settings/Themes.tsx` | 主题设置页面 |
+| `packages/desktop-client/src/components/settings/ThemeInstaller.tsx` | 自定义主题安装器 |
+| `packages/desktop-client/src/components/ThemeSelector.tsx` | 快速主题切换按钮 |
+| `packages/desktop-client/src/components/formula/FormulaEditor.tsx` | 公式编辑器 |
