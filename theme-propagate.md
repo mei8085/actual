@@ -739,66 +739,255 @@ useEffect 执行，注入初始主题 CSS
 
 将主题从**应用级别**改为**预算文件级别**，每个预算文件可以有独立的主题设置。切换预算文件时，主题自动切换。
 
-### 8.2 共用主题解析策略（预算打开/未打开场景）
+### 8.2 预算开关场景的代码流分析（基于真实代码）
 
-采用**混合模式**，同时支持全局默认主题和预算独立主题：
+在设计改造方案前，先理解当前预算加载/卸载的完整代码流：
+
+#### 8.2.1 预算加载流程
 
 ```
-主题解析优先级（从高到低）：
-1. 当前加载预算的 MetadataPrefs.theme（如果有值）
-2. GlobalPrefs.theme（全局默认主题）
-3. 硬编码默认值 'auto'
+用户选择预算文件
+    ↓
+dispatch(loadBudget({ id: budgetId }))
+    ↓
+send('load-budget', { id }) 加载预算数据库
+    ↓
+成功后 dispatch(loadPrefs())  [budgetfilesSlice.ts:91]
+    ↓
+send('load-prefs') 读取该预算的 metadata.json
+    ↓
+setPrefs({ local: prefs, global, synced })  [prefsSlice.ts:53-55]
+    ↓
+Redux state.prefs.local 从 {} → 包含 { id: 'xxx', ... }
+    ↓
+useMetadataPref('id') 返回 budgetId
+    ↓
+AppInner 组件检测到 budgetId，渲染 <FinancesApp />  [App.tsx:155]
 ```
 
-**主题解析策略实现**：
+**关键状态变化**：`state.prefs.local` 从空对象变为包含预算元数据的对象。
+
+#### 8.2.2 预算关闭流程
+
+```
+用户点击关闭预算
+    ↓
+dispatch(closeBudget())
+    ↓
+dispatch(resetApp())  [budgetfilesSlice.ts:103]
+    ↓
+extraReducers 处理 resetApp，重置 state  [prefsSlice.ts:186-190]
+    ↓
+state.prefs.local 重置为 {}（但 global 保留）
+    ↓
+useMetadataPref('id') 返回 undefined
+    ↓
+AppInner 组件检测到没有 budgetId，渲染 <ManagementApp />  [App.tsx:155]
+```
+
+**关键状态变化**：`state.prefs.local` 从包含预算元数据的对象变为空对象。
+
+#### 8.2.3 预算是否已加载的准确判断
+
+**之前的错误**：直接用 `useMetadataPref('id')` 判断预算是否加载。
+
+**正确的判断**：`useMetadataPref('id')` 的返回值有三种状态：
+
+| 状态 | 返回值 | 说明 |
+|------|--------|------|
+| 预算未加载 | `undefined` | `state.prefs.local` 是空对象 `{}` |
+| 预算已加载 | `'xxx'`（字符串） | `state.prefs.local` 包含 `{ id: 'xxx' }` |
+| 加载中 | 可能是 `undefined` | 异步加载过程中 |
+
+**正确的判断代码**：
+```typescript
+const [budgetId] = useMetadataPref('id');
+const isBudgetLoaded = typeof budgetId === 'string' && budgetId.length > 0;
+```
+
+### 8.3 共用主题解析策略（修正版）
+
+采用**混合模式**，同时支持全局默认主题和预算独立主题。根据预算是否加载，自动切换解析逻辑。
+
+#### 8.3.1 解析优先级
+
+```
+预算已加载场景（isBudgetLoaded = true）：
+  优先级从高到低：
+  1. 当前预算的 MetadataPrefs.theme（如果有值）
+  2. GlobalPrefs.theme（全局默认主题）
+  3. 硬编码默认值 'auto'
+
+预算未加载场景（isBudgetLoaded = false）：
+  优先级从高到低：
+  1. GlobalPrefs.theme（全局默认主题）
+  2. 硬编码默认值 'auto'
+```
+
+#### 8.3.2 读写分流策略
+
+| 场景 | 读取来源 | 写入目标 |
+|------|---------|---------|
+| 预算已加载 | 预算主题 → 全局主题 → 默认 | 用户可选：写入预算 或 写入全局 |
+| 预算未加载 | 全局主题 → 默认 | 只能写入全局 |
+
+#### 8.3.3 完整实现代码
 
 ```typescript
 // packages/desktop-client/src/hooks/useBudgetTheme.ts
-import { useGlobalPref } from './useGlobalPref';
-import { useMetadataPref } from './useMetadataPref';
+import { useMemo } from 'react';
+
 import type { Theme, DarkTheme } from '@actual-app/core/types/prefs';
 
+import { useGlobalPref } from './useGlobalPref';
+import { useMetadataPref } from './useMetadataPref';
+
 /**
- * 预算级主题 Hook：优先使用预算的主题设置，回退到全局默认
+ * 预算级主题 Hook：智能检测预算是否加载，自动切换解析策略
+ * 
+ * - 预算已加载：优先使用预算主题，回退到全局主题
+ * - 预算未加载：只使用全局主题
  */
 export function useBudgetTheme() {
+  // 读取预算主题（从 metadata.json）
   const [budgetTheme, setBudgetTheme] = useMetadataPref('theme');
+  // 读取全局主题（从 global-store.json）
   const [globalTheme, setGlobalTheme] = useGlobalPref('theme');
+  // 检测预算是否已加载（关键：判断 budgetId 是否为有效字符串）
+  const [budgetId] = useMetadataPref('id');
   
-  // 优先级：预算主题 > 全局主题 > 默认 'auto'
-  const activeTheme = budgetTheme ?? globalTheme ?? 'auto';
+  // 预算是否已加载
+  const isBudgetLoaded = typeof budgetId === 'string' && budgetId.length > 0;
   
-  // 根据修改来源决定写入哪里
-  const setTheme = (newTheme: Theme, scope: 'budget' | 'global' = 'budget') => {
-    if (scope === 'budget') {
-      setBudgetTheme(newTheme);
+  // 计算当前激活的主题（useMemo 缓存，避免不必要的重计算）
+  const activeTheme = useMemo(() => {
+    if (isBudgetLoaded) {
+      // 预算已加载：预算主题 > 全局主题 > 默认 'auto'
+      return budgetTheme ?? globalTheme ?? 'auto';
     } else {
-      setGlobalTheme(newTheme);
+      // 预算未加载：全局主题 > 默认 'auto'
+      return globalTheme ?? 'auto';
     }
-  };
+  }, [isBudgetLoaded, budgetTheme, globalTheme]);
   
-  return [activeTheme, setTheme] as const;
+  // 写入主题的智能函数
+  const setTheme = useCallback(
+    (newTheme: Theme, scope: 'budget' | 'global' = 'budget') => {
+      if (!isBudgetLoaded) {
+        // 预算未加载时，强制写入全局
+        setGlobalTheme(newTheme);
+        return;
+      }
+      
+      // 预算已加载时，根据 scope 决定写入哪里
+      if (scope === 'budget') {
+        setBudgetTheme(newTheme);
+      } else {
+        setGlobalTheme(newTheme);
+      }
+    },
+    [isBudgetLoaded, setBudgetTheme, setGlobalTheme],
+  );
+  
+  return [activeTheme, setTheme, isBudgetLoaded] as const;
 }
 
+/**
+ * 预算级暗色主题偏好 Hook
+ */
 export function useBudgetPreferredDarkTheme() {
   const [budgetDarkTheme, setBudgetDarkTheme] = useMetadataPref('preferredDarkTheme');
   const [globalDarkTheme, setGlobalDarkTheme] = useGlobalPref('preferredDarkTheme');
+  const [budgetId] = useMetadataPref('id');
   
-  const activeDarkTheme = budgetDarkTheme ?? globalDarkTheme ?? 'dark';
+  const isBudgetLoaded = typeof budgetId === 'string' && budgetId.length > 0;
   
-  const setPreferredDarkTheme = (newTheme: DarkTheme, scope: 'budget' | 'global' = 'budget') => {
-    if (scope === 'budget') {
-      setBudgetDarkTheme(newTheme);
+  const activeDarkTheme = useMemo(() => {
+    if (isBudgetLoaded) {
+      return budgetDarkTheme ?? globalDarkTheme ?? 'dark';
     } else {
-      setGlobalDarkTheme(newTheme);
+      return globalDarkTheme ?? 'dark';
     }
-  };
+  }, [isBudgetLoaded, budgetDarkTheme, globalDarkTheme]);
   
-  return [activeDarkTheme, setPreferredDarkTheme] as const;
+  const setPreferredDarkTheme = useCallback(
+    (newTheme: DarkTheme, scope: 'budget' | 'global' = 'budget') => {
+      if (!isBudgetLoaded) {
+        setGlobalDarkTheme(newTheme);
+        return;
+      }
+      if (scope === 'budget') {
+        setBudgetDarkTheme(newTheme);
+      } else {
+        setGlobalDarkTheme(newTheme);
+      }
+    },
+    [isBudgetLoaded, setBudgetDarkTheme, setGlobalDarkTheme],
+  );
+  
+  return [activeDarkTheme, setPreferredDarkTheme, isBudgetLoaded] as const;
+}
+
+/**
+ * 预算级自定义主题 Hook
+ */
+export function useBudgetCustomTheme() {
+  const [budgetLight, setBudgetLight] = useMetadataPref('installedCustomLightTheme');
+  const [budgetDark, setBudgetDark] = useMetadataPref('installedCustomDarkTheme');
+  const [budgetOverride, setBudgetOverride] = useMetadataPref('customCssOverride');
+  
+  const [globalLight, setGlobalLight] = useGlobalPref('installedCustomLightTheme');
+  const [globalDark, setGlobalDark] = useGlobalPref('installedCustomDarkTheme');
+  const [globalOverride, setGlobalOverride] = useGlobalPref('customCssOverride');
+  
+  const [budgetId] = useMetadataPref('id');
+  const isBudgetLoaded = typeof budgetId === 'string' && budgetId.length > 0;
+  
+  const activeLightTheme = useMemo(() => {
+    return isBudgetLoaded ? budgetLight ?? globalLight : globalLight;
+  }, [isBudgetLoaded, budgetLight, globalLight]);
+  
+  const activeDarkTheme = useMemo(() => {
+    return isBudgetLoaded ? budgetDark ?? globalDark : globalDark;
+  }, [isBudgetLoaded, budgetDark, globalDark]);
+  
+  const activeOverride = useMemo(() => {
+    return isBudgetLoaded ? budgetOverride ?? globalOverride : globalOverride;
+  }, [isBudgetLoaded, budgetOverride, globalOverride]);
+  
+  return {
+    // 读取
+    installedCustomLightTheme: activeLightTheme,
+    installedCustomDarkTheme: activeDarkTheme,
+    customCssOverride: activeOverride,
+    isBudgetLoaded,
+    // 写入
+    setInstalledCustomLightTheme: (value: string | undefined, scope: 'budget' | 'global' = 'budget') => {
+      if (!isBudgetLoaded || scope === 'global') {
+        setGlobalLight(value);
+      } else {
+        setBudgetLight(value);
+      }
+    },
+    setInstalledCustomDarkTheme: (value: string | undefined, scope: 'budget' | 'global' = 'budget') => {
+      if (!isBudgetLoaded || scope === 'global') {
+        setGlobalDark(value);
+      } else {
+        setBudgetDark(value);
+      }
+    },
+    setCustomCssOverride: (value: string | undefined, scope: 'budget' | 'global' = 'budget') => {
+      if (!isBudgetLoaded || scope === 'global') {
+        setGlobalOverride(value);
+      } else {
+        setBudgetOverride(value);
+      }
+    },
+  };
 }
 ```
 
-### 8.3 改造步骤（共 13 步）
+### 8.4 改造步骤（共 15 步，详细可落地）
 
 #### 步骤 1：扩展 MetadataPrefs 类型
 
@@ -817,7 +1006,7 @@ export type MetadataPrefs = Partial<{
   lastScheduleRun: string;
   userId: string;
   
-  // 新增：预算文件级主题设置
+  // ── 新增：预算文件级主题设置 ──
   theme: Theme;
   preferredDarkTheme: DarkTheme;
   installedCustomLightTheme?: string;
@@ -830,157 +1019,295 @@ export type MetadataPrefs = Partial<{
 
 **文件**：`packages/desktop-client/src/hooks/useBudgetTheme.ts`（新建）
 
-实现上文中的 `useBudgetTheme` 和 `useBudgetPreferredDarkTheme`，采用混合模式解析策略。
+实现上文中的 `useBudgetTheme`、`useBudgetPreferredDarkTheme`、`useBudgetCustomTheme`。
 
-#### 步骤 3：修改主题相关 Hook
+#### 步骤 3：修改 theme.tsx 中的基础 Hook
 
 **文件**：`packages/desktop-client/src/style/theme.tsx`
 
 ```typescript
-// 替换 useGlobalPref 为 useMetadataPref（或新的 useBudgetTheme）
+// 替换 useGlobalPref 为 useBudgetTheme
 export function useTheme() {
-  // 从 useGlobalPref('theme') 改为 useBudgetTheme()
-  const [theme = 'auto', setThemePref] = useBudgetTheme();
+  // 只返回 [theme, setTheme]，丢弃 isBudgetLoaded（保持向后兼容）
+  const [theme, setThemePref] = useBudgetTheme();
   return [theme, setThemePref] as const;
 }
 
 export function usePreferredDarkTheme() {
-  // 从 useGlobalPref('preferredDarkTheme') 改为 useBudgetPreferredDarkTheme()
-  const [darkTheme = 'dark', setDarkTheme] = useBudgetPreferredDarkTheme();
+  const [darkTheme, setDarkTheme] = useBudgetPreferredDarkTheme();
   return [darkTheme, setDarkTheme] as const;
 }
 ```
 
-#### 步骤 4：修改 ThemeStyle 和 CustomThemeStyle
+#### 步骤 4：修改 ThemeStyle 组件
 
 **文件**：`packages/desktop-client/src/style/theme.tsx`
 
-将所有 `useGlobalPref('installedCustomLightTheme')` 等调用替换为 `useMetadataPref` 或对应的预算级 Hook。
-
-#### 步骤 5：修改所有订阅主题的组件
-
-除了 `ThemeStyle` 和 `CustomThemeStyle`，还有 7 个组件/hook 也直接订阅主题状态，需要一并修改：
-
-| 组件/Hook | 当前使用 | 需要修改为 |
-|-----------|----------|-----------|
-| `ThemeSettings` | `useTheme()` | 预算级主题 Hook |
-| `ThemeInstaller` | `useGlobalPref('customCssOverride')` | 预算级主题 Hook |
-| `ThemeSelector` | `useTheme()` | 预算级主题 Hook |
-| `FormulaEditor` | `useTheme()` | 预算级主题 Hook |
-| `App.tsx:195` | `useTheme()` | 预算级主题或全局默认 |
-| `useMetaThemeColor` | `useTheme()` | 预算级主题 Hook |
-| `useTagCSS` | `useTheme()` | 预算级主题 Hook |
-
-#### 步骤 6：处理管理页主题来源
-
-管理页（预算未打开时）没有 `MetadataPrefs`，需要特殊处理：
-
-**方案**：在 `useBudgetTheme` 中检测预算是否已加载，如果没有加载则直接使用全局主题：
+将所有 `useGlobalPref('installedCustomLightTheme')` 等调用替换为 `useBudgetCustomTheme`：
 
 ```typescript
-export function useBudgetTheme() {
-  const [budgetTheme, setBudgetTheme] = useMetadataPref('theme');
-  const [globalTheme, setGlobalTheme] = useGlobalPref('theme');
-  const budgetId = useMetadataPref('id'); // 用来检测预算是否加载
+export function ThemeStyle() {
+  const [activeTheme] = useTheme();
+  const [darkThemePreference] = usePreferredDarkTheme();
   
-  // 如果没有预算 ID（管理页），只使用全局主题
-  if (!budgetId) {
-    return [globalTheme ?? 'auto', (t) => setGlobalTheme(t)] as const;
-  }
+  // 使用预算级自定义主题 Hook
+  const {
+    installedCustomLightTheme: installedCustomLightThemeJson,
+    installedCustomDarkTheme: installedCustomDarkThemeJson,
+  } = useBudgetCustomTheme();
   
-  // 有预算时，使用混合模式
-  const activeTheme = budgetTheme ?? globalTheme ?? 'auto';
-  // ...
+  const [themeColors, setThemeColors] = useState<string | undefined>(undefined);
+  
+  // ... 其余逻辑不变 ...
 }
 ```
 
-#### 步骤 7：调整主题设置页面的访问性
+#### 步骤 5：修改 CustomThemeStyle 组件
 
-当前 `ThemeSettings` 只在预算内可见（`settings/index.tsx:240`）。改造后需要考虑：
+**文件**：`packages/desktop-client/src/style/theme.tsx`
 
-1. **在管理页也提供主题设置**（作为新预算的默认主题）
-2. **在设置页面增加范围选择**：用户可以选择"仅当前预算"还是"全局默认"
-
-#### 步骤 8：在创建预算时的主题选择
-
-新预算创建时：
-- 默认继承全局主题设置
-- 或者提供主题选择器让用户选择
-
-#### 步骤 9：处理关闭预算时的主题切换
-
-当前 `closeBudget` 会调用 `resetApp()`，但 `resetApp` 保留了 `global` 状态（`prefsSlice.ts:186-189`）：
 ```typescript
-builder.addCase(resetApp, state => ({
-  ...initialState,
-  global: state.global || initialState.global,
-  server: state.server || initialState.server,
-}));
+export function CustomThemeStyle() {
+  useMigrateLegacyOverride();
+  
+  const [activeTheme] = useTheme();
+  
+  // 使用预算级自定义主题 Hook
+  const {
+    installedCustomLightTheme: installedCustomLightThemeJson,
+    installedCustomDarkTheme: installedCustomDarkThemeJson,
+    customCssOverride,
+  } = useBudgetCustomTheme();
+  
+  // ... 其余逻辑不变 ...
+}
 ```
 
-关闭预算后：
-- 切换回全局默认主题（由于 `useBudgetTheme` 检测到没有 budgetId，自动使用全局主题）
-- 不需要额外修改，混合模式自动处理
+#### 步骤 6：修改 useMigrateLegacyOverride Hook
 
-#### 步骤 10：数据迁移策略
+**文件**：`packages/desktop-client/src/style/theme.tsx`
 
-将现有用户的全局主题迁移到预算文件：
+支持迁移到预算级主题：
 
 ```typescript
-// packages/desktop-client/src/prefs/prefsSlice.ts
-// 在 loadPrefs 成功后执行一次性迁移
-
-// 首次打开预算时，如果预算没有主题设置，从全局主题复制
-async function migrateThemeFromGlobalToBudget(budgetId: string) {
-  const globalPrefs = await send('load-global-prefs');
-  const metadataPrefs = await send('load-prefs');
+function useMigrateLegacyOverride() {
+  const {
+    customCssOverride,
+    installedCustomLightTheme: installedCustomLightThemeJson,
+    installedCustomDarkTheme: installedCustomDarkThemeJson,
+    isBudgetLoaded,
+    setCustomCssOverride,
+    setInstalledCustomLightTheme,
+    setInstalledCustomDarkTheme,
+  } = useBudgetCustomTheme();
   
-  if (!metadataPrefs.theme && globalPrefs.theme) {
-    await send('save-prefs', {
-      theme: globalPrefs.theme,
-      preferredDarkTheme: globalPrefs.preferredDarkTheme,
-      installedCustomLightTheme: globalPrefs.installedCustomLightTheme,
-      installedCustomDarkTheme: globalPrefs.installedCustomDarkTheme,
-      customCssOverride: globalPrefs.customCssOverride,
+  useEffect(() => {
+    // 如果预算已加载，先尝试迁移到预算级；否则迁移到全局
+    const scope = isBudgetLoaded ? 'budget' : 'global';
+    
+    const result = migrateLegacyOverride({
+      existingOverride: customCssOverride,
+      lightJson: installedCustomLightThemeJson,
+      darkJson: installedCustomDarkThemeJson,
     });
-  }
+    
+    if (!result) return;
+    
+    setCustomCssOverride(result.override, scope);
+    if (result.newLightJson !== installedCustomLightThemeJson) {
+      setInstalledCustomLightTheme(result.newLightJson, scope);
+    }
+    if (result.newDarkJson !== installedCustomDarkThemeJson) {
+      setInstalledCustomDarkTheme(result.newDarkJson, scope);
+    }
+  }, [
+    customCssOverride,
+    installedCustomLightThemeJson,
+    installedCustomDarkThemeJson,
+    isBudgetLoaded,
+    setCustomCssOverride,
+    setInstalledCustomLightTheme,
+    setInstalledCustomDarkTheme,
+  ]);
 }
 ```
 
-#### 步骤 11：修改 Legacy Override 迁移逻辑
+#### 步骤 7：修改 useMetaThemeColor Hook
 
-`useMigrateLegacyOverride` 目前只迁移到 `GlobalPrefs`，需要支持迁移到 `MetadataPrefs`。
+**文件**：`packages/desktop-client/src/hooks/useMetaThemeColor.ts`
 
-#### 步骤 12：更新 ThemeSettings UI
+```typescript
+// 将 useTheme() 和 usePreferredDarkTheme() 直接使用（因为我们已经在 theme.tsx 中修改了这两个 Hook）
+```
 
-在设置页面增加：
-- 范围选择器（仅当前预算 / 全局默认）
-- 应用到所有预算的按钮
+不需要额外修改，因为 `useTheme()` 已经改为使用 `useBudgetTheme()`。
 
-#### 步骤 13：测试验证
+#### 步骤 8：修改 useTagCSS Hook
+
+**文件**：`packages/desktop-client/src/hooks/useTagCSS.ts`
+
+```typescript
+// 不需要修改，useTheme() 已经改为使用预算级 Hook
+```
+
+#### 步骤 9：修改 ThemeSettings 组件
+
+**文件**：`packages/desktop-client/src/components/settings/Themes.tsx`
+
+增加范围选择器，让用户选择写入预算还是全局：
+
+```typescript
+export function ThemeSettings() {
+  const [theme, switchTheme] = useTheme();
+  const [darkTheme, switchDarkTheme] = usePreferredDarkTheme();
+  
+  // 获取预算加载状态
+  const [, , isBudgetLoaded] = useBudgetTheme();
+  
+  // 新增：当前写入范围
+  const [scope, setScope] = useState<'budget' | 'global'>('budget');
+  
+  // 切换主题时带上 scope
+  const handleSwitchTheme = (newTheme: Theme) => {
+    switchTheme(newTheme, scope);
+  };
+  
+  // 切换暗色主题偏好时带上 scope
+  const handleSwitchDarkTheme = (newTheme: DarkTheme) => {
+    switchDarkTheme(newTheme, scope);
+  };
+  
+  return (
+    <Setting>
+      {/* 新增：范围选择器（仅预算已加载时显示） */}
+      {isBudgetLoaded && (
+        <View style={{ flexDirection: 'row', gap: 10, marginBottom: 15 }}>
+          <Button
+            variant={scope === 'budget' ? 'primary' : 'normal'}
+            onPress={() => setScope('budget')}
+          >
+            <Trans>仅当前预算</Trans>
+          </Button>
+          <Button
+            variant={scope === 'global' ? 'primary' : 'normal'}
+            onPress={() => setScope('global')}
+          >
+            <Trans>全局默认</Trans>
+          </Button>
+        </View>
+      )}
+      
+      {/* 原有主题选择逻辑，使用 handleSwitchTheme 替代 switchTheme */}
+    </Setting>
+  );
+}
+```
+
+#### 步骤 10：修改 ThemeInstaller 组件
+
+**文件**：`packages/desktop-client/src/components/settings/ThemeInstaller.tsx`
+
+使用预算级自定义主题 Hook。
+
+#### 步骤 11：修改 ThemeSelector 组件
+
+**文件**：`packages/desktop-client/src/components/ThemeSelector.tsx`
+
+```typescript
+// 不需要修改，useTheme() 已经改为使用预算级 Hook
+```
+
+#### 步骤 12：修改 FormulaEditor 组件
+
+**文件**：`packages/desktop-client/src/components/formula/FormulaEditor.tsx`
+
+```typescript
+// 不需要修改，useTheme() 已经改为使用预算级 Hook
+```
+
+#### 步骤 13：修改 App.tsx 中的主题使用
+
+**文件**：`packages/desktop-client/src/components/App.tsx:195`
+
+```typescript
+// 不需要修改，useTheme() 已经改为使用预算级 Hook
+```
+
+#### 步骤 14：添加数据迁移逻辑
+
+**文件**：`packages/desktop-client/src/prefs/prefsSlice.ts`
+
+在 `loadPrefs` 成功后执行一次性迁移，将全局主题复制到预算：
+
+```typescript
+export const loadPrefs = createAppAsyncThunk(
+  `${sliceName}/loadPrefs`,
+  async (_, { dispatch, getState }) => {
+    const prefs = await send('load-prefs');
+    
+    // ... 原有逻辑 ...
+    
+    // 新增：迁移全局主题到预算（如果预算没有主题设置）
+    if (prefs && prefs.id) {
+      const globalPrefs = getState().prefs.global;
+      const needsMigration = !prefs.theme && globalPrefs.theme;
+      
+      if (needsMigration) {
+        await send('save-prefs', {
+          id: prefs.id,
+          theme: globalPrefs.theme,
+          preferredDarkTheme: globalPrefs.preferredDarkTheme ?? 'dark',
+          installedCustomLightTheme: globalPrefs.installedCustomLightTheme,
+          installedCustomDarkTheme: globalPrefs.installedCustomDarkTheme,
+          customCssOverride: globalPrefs.customCssOverride,
+        });
+        
+        // 重新加载 prefs 以获取最新状态
+        const updatedPrefs = await send('load-prefs');
+        dispatch(setPrefs({
+          local: updatedPrefs,
+          global: globalPrefs,
+          synced: getState().prefs.synced,
+        }));
+      }
+    }
+    
+    return prefs;
+  },
+);
+```
+
+#### 步骤 15：测试验证
 
 测试以下场景：
-- 未打开预算时，主题来自全局设置
-- 打开预算 A，设置主题 A，关闭后回到管理页，主题切回全局
-- 打开预算 B，设置主题 B，切换到预算 A，主题自动切换到 A
-- 新创建的预算默认继承全局主题
-- 关闭预算时，主题正确切回全局
 
-### 8.4 改造注意事项
+| 测试场景 | 预期结果 |
+|---------|---------|
+| 未打开预算时，修改主题 | 写入 global-store.json，管理页主题变化 |
+| 打开预算 A，选择"仅当前预算"修改主题 | 写入预算 A 的 metadata.json，预算页主题变化 |
+| 打开预算 A，选择"全局默认"修改主题 | 写入 global-store.json，所有预算的主题都变化（除非预算有独立设置） |
+| 关闭预算 A，回到管理页 | 主题自动切回全局设置 |
+| 打开预算 B（新预算，没有主题设置） | 使用全局主题设置 |
+| 打开预算 B，设置独立主题 | 写入预算 B 的 metadata.json |
+| 在预算 A 和预算 B 之间切换 | 主题自动切换到对应预算的设置 |
+| 系统主题变化（auto 模式） | 预算有独立设置时使用预算的 auto，否则使用全局的 auto |
 
-1. **向后兼容**：旧的 `metadata.json` 没有主题字段，需要提供默认值（`'auto'`）
-2. **全局主题的取舍**：保留 `GlobalPrefs.theme` 作为默认值和管理页主题
-3. **设置 UI 提示**：明确告诉用户主题是"当前预算"还是"全局默认"的设置
+### 8.5 改造注意事项
+
+1. **向后兼容**：旧的 `metadata.json` 没有主题字段，`useBudgetTheme` 会自动回退到全局主题
+2. **全局主题的保留**：`GlobalPrefs.theme` 作为默认值和管理页主题，不删除
+3. **设置 UI 提示**：明确告诉用户当前设置的是"当前预算"还是"全局默认"
 4. **性能**：每次切换预算都会重新注入主题 CSS，这是正常的，不会有性能问题
 5. **自定义主题文件大小**：如果用户安装了包含内嵌字体的自定义主题，`metadata.json` 会变大，但这是可接受的
+6. **迁移的幂等性**：数据迁移只在预算没有主题设置时执行，不会重复迁移
 
-### 8.5 改造骨架代码总结
+### 8.6 改造骨架代码总结
 
 以下是改造的核心骨架，可直接参考实现：
 
 ```typescript
 // ─────────────────────────────────────────────────────
-// 1. 类型扩展 (prefs.ts)
+// 1. 类型扩展 (packages/loot-core/src/types/prefs.ts)
 // ─────────────────────────────────────────────────────
 export type MetadataPrefs = Partial<{
   // ... 原有字段 ...
@@ -992,36 +1319,55 @@ export type MetadataPrefs = Partial<{
 }>;
 
 // ─────────────────────────────────────────────────────
-// 2. 预算级主题 Hook (useBudgetTheme.ts)
+// 2. 预算级主题 Hook (packages/desktop-client/src/hooks/useBudgetTheme.ts)
 // ─────────────────────────────────────────────────────
 export function useBudgetTheme() {
   const [budgetTheme, setBudgetTheme] = useMetadataPref('theme');
   const [globalTheme, setGlobalTheme] = useGlobalPref('theme');
   const [budgetId] = useMetadataPref('id');
   
-  if (!budgetId) {
-    return [globalTheme ?? 'auto', (t: Theme) => setGlobalTheme(t)] as const;
-  }
+  // 关键：准确判断预算是否已加载
+  const isBudgetLoaded = typeof budgetId === 'string' && budgetId.length > 0;
   
-  const activeTheme = budgetTheme ?? globalTheme ?? 'auto';
-  const setTheme = (newTheme: Theme, scope: 'budget' | 'global' = 'budget') => {
-    scope === 'budget' ? setBudgetTheme(newTheme) : setGlobalTheme(newTheme);
-  };
+  const activeTheme = useMemo(() => {
+    return isBudgetLoaded
+      ? budgetTheme ?? globalTheme ?? 'auto'
+      : globalTheme ?? 'auto';
+  }, [isBudgetLoaded, budgetTheme, globalTheme]);
   
-  return [activeTheme, setTheme] as const;
+  const setTheme = useCallback(
+    (newTheme: Theme, scope: 'budget' | 'global' = 'budget') => {
+      if (!isBudgetLoaded) {
+        setGlobalTheme(newTheme);
+      } else if (scope === 'budget') {
+        setBudgetTheme(newTheme);
+      } else {
+        setGlobalTheme(newTheme);
+      }
+    },
+    [isBudgetLoaded, setBudgetTheme, setGlobalTheme],
+  );
+  
+  return [activeTheme, setTheme, isBudgetLoaded] as const;
 }
 
 // ─────────────────────────────────────────────────────
-// 3. 修改 theme.tsx 中的 useTheme
+// 3. 修改 theme.tsx 中的 useTheme (packages/desktop-client/src/style/theme.tsx)
 // ─────────────────────────────────────────────────────
 export function useTheme() {
-  return useBudgetTheme();
+  const [theme, setTheme] = useBudgetTheme();
+  return [theme, setTheme] as const;
 }
 
 // ─────────────────────────────────────────────────────
-// 4. 修改所有订阅点（10 个组件/Hook）
+// 4. 修改 ThemeSettings 增加范围选择器
 // ─────────────────────────────────────────────────────
-// 将 useGlobalPref 替换为 useMetadataPref 或预算级 Hook
+// 见步骤 9 的代码
+
+// ─────────────────────────────────────────────────────
+// 5. 在 loadPrefs 中添加数据迁移逻辑
+// ─────────────────────────────────────────────────────
+// 见步骤 14 的代码
 ```
 
 ---
