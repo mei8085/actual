@@ -204,11 +204,15 @@ app.exit()       // 立即退出
 - 前端监听：`packages/desktop-client/src/sync-events.ts:249-283`
 
 **重要事实澄清**：
-> ⚠️ `file-has-reset` 和 `file-has-new-key` 错误**完全由服务端验证并返回**，不是客户端本地 `_fullSync` 函数判定的。客户端仅负责转发错误事件。
+> ⚠️ `file-has-reset` 错误**仅由服务端 `/sync` 接口验证并返回**，不是客户端本地判定的。
 
-> ⚠️ 新 `groupId` 由**服务端 `/upload-user-file` 接口内部生成并通过响应返回**，不是客户端本地生成的。客户端仅在请求头中传递当前 groupId（如果有）。
+> ⚠️ `file-has-new-key` 错误有**两条独立触发路径**：
+> - 路径一（日常同步）：服务端 `/sync` 接口验证返回
+> - 路径二（用户点击 Upload）：客户端 `checkKey()` 主动检测返回
 
-**完整检测链路**：
+> ⚠️ 新 `groupId` 由**服务端 `/upload-user-file` 接口内部生成并通过响应返回**，不是客户端本地生成的。
+
+**完整检测链路（file-has-reset + file-has-new-key 路径一）**：
 
 ```
 客户端 sync() 被调用
@@ -232,7 +236,7 @@ throw new PostError('file-has-reset')  // 错误原因直接来自响应文本
     app.events.emit('sync', { type: 'error', subtype: e.reason })
     ↓
 前端 sync-events.ts 监听到 sync-event:
-    event.type === 'error' && event.subtype === 'file-has-reset'
+    event.type === 'error' && event.subtype === 'file-has-reset' / 'file-has-new-key'
     ↓
 构造 notification 并 dispatch(addNotification({ id: 'needs-revert' }))
     ↓
@@ -251,78 +255,118 @@ UI 显示："Syncing has been reset on this cloud file"
 
 ---
 
-### 2.1.1 file-has-new-key 的两条入口路径
+### 2.1.1 file-has-new-key 错误的两条独立触发路径
 
-`file-has-new-key` 错误有两条完全独立的触发路径，传播到前端的方式也不同：
-
-#### 路径一：/sync 同步请求路径（日常同步触发）
-
-**完整调用链**：
-```
-客户端 sync() → POST /sync
-    ↓
-服务端 validateSyncedFile(groupId, keyId, currentFile)
-    ↓
-keyId ≠ currentFile.encryptKeyId → return 'file-has-new-key'
-    ↓
-服务端响应 HTTP 400, body: "file-has-new-key"
-    ↓
-客户端 postBinary() 抛出 PostError('file-has-new-key')
-    ↓
-sync/index.ts:652 捕获 → emit('sync', { type: 'error', subtype: 'file-has-new-key' })
-    ↓
-前端 sync-events.ts → 显示 "Syncing has been reset" 通知
-```
-
-**代码位置**：
-- 服务端验证：`packages/sync-server/src/app-sync/validation.js:42-44`
-- 服务端响应：`packages/sync-server/src/app-sync.ts:177-182`
-- 客户端转发：`packages/loot-core/src/server/sync/index.ts:642-653`
+`file-has-new-key` 表示**本地使用的加密密钥 ID 与服务端注册的密钥 ID 不匹配**。该错误有两条完全独立的触发路径，在触发时机、验证位置、传播模式和前端表现上均有显著差异。
 
 ---
 
-#### 路径二：resetSync 的 checkKey 路径（用户点击 Upload 时触发）
+#### 路径一：/sync 同步请求路径（日常同步触发）
+
+**触发场景**：用户打开预算后自动同步，或手动点击同步按钮时。
+
+**完整调用链**：
+```
+客户端 sync() → _fullSync() → POST /sync 到服务端
+    ↓
+服务端 app-sync.ts:177 调用 validateSyncedFile(groupId, keyId, currentFile)
+    ↓
+服务端 validation.js:42-44 验证：
+    if (keyId !== currentFile.encryptKeyId) → return 'file-has-new-key'
+    ↓
+服务端响应 HTTP 400，body 为纯文本："file-has-new-key"
+    ↓
+客户端 postBinary() → throwIfNot200() 检测到 400
+    ↓
+throw new PostError('file-has-new-key')
+    ↓
+客户端 sync/index.ts:652 捕获：
+    app.events.emit('sync', { type: 'error', subtype: 'file-has-new-key' })
+    ↓
+前端 sync-events.ts:254 监听 sync-event
+    ↓
+event.type === 'error' && event.subtype === 'file-has-new-key'
+    ↓
+dispatch(addNotification({ id: 'needs-revert' }))
+    ↓
+UI 显示：通知条 "Syncing has been reset on this cloud file"
+```
+
+**关键特征**：
+- **触发时机**：被动触发，由日常同步流程触发
+- **验证位置**：服务端 `validation.js`
+- **错误类型**：`PostError`（由 throw 产生，异常路径）
+- **传播机制**：Node.js EventEmitter 的 `sync` 事件
+- **前端 UI**：通知条（notification），显示 Revert / Upload 两个按钮
+
+**代码位置**：
+- 服务端验证逻辑：`packages/sync-server/src/app-sync/validation.js:42-44`
+- 服务端响应逻辑：`packages/sync-server/src/app-sync.ts:177-182`
+- 客户端错误转发：`packages/loot-core/src/server/sync/index.ts:642-653`
+- 前端通知显示：`packages/desktop-client/src/sync-events.ts:254-283`
+
+---
+
+#### 路径二：resetSync 的 checkKey 路径（用户点击 Upload 时主动检测）
+
+**触发场景**：用户在 "Syncing has been reset" 通知条中点击 "upload this file" 链接时。
 
 **完整调用链**：
 ```
 用户点击 "upload this file" → dispatch(resetSync())
     ↓
-前端 appSlice.ts:50 → send('sync-reset')
+前端 appSlice.ts:50 → send('sync-reset') 调用后端
     ↓
-后端 reset.ts:13-22 → if (!keyState) { const { valid } = await cloudStorage.checkKey() }
+后端 reset.ts:13-22：
+    if (!keyState) {  // 没有传入新密钥状态时
+        const { valid, error } = await cloudStorage.checkKey()
+    }
     ↓
 checkKey() → POST /user-get-key 获取服务端当前 keyId
     ↓
-cloud-storage.ts:91-95 → res.id == encryptKeyId?
+cloud-storage.ts:91-95 比较：
+    valid = (res.id == encryptKeyId) && (encryptKeyId == null || encryption.hasKey(encryptKeyId))
     ↓
 不匹配 → return { valid: false }
     ↓
 reset.ts:21 → return { error: { reason: 'file-has-new-key' } }
     ↓
-前端 appSlice.ts:58 → if (error.reason === 'file-has-new-key')
+前端 appSlice.ts:58 接收返回值：
+    if (error.reason === 'file-has-new-key')
     ↓
 dispatch(pushModal({ modal: { name: 'fix-encryption-key' } }))
     ↓
-UI 显示：弹出修复加密密钥模态框（不是通知条）
+UI 显示：弹出 "修复加密密钥" 模态框
 ```
+
+**关键特征**：
+- **触发时机**：主动触发，由用户点击 Upload 操作触发
+- **验证位置**：客户端 `cloud-storage.ts` 的 `checkKey()` 函数
+- **错误类型**：返回值 `{ error }`（正常返回，无 throw）
+- **传播机制**：async thunk 的返回值，通过 Redux 状态传递
+- **前端 UI**：模态框（modal），引导用户修复或创建密钥
 
 **代码位置**：
 - checkKey 实现：`packages/loot-core/src/server/cloud-storage.ts:71-97`
-- checkKey 调用：`packages/loot-core/src/server/sync/reset.ts:13-22`
-- 前端模态框：`packages/desktop-client/src/app/appSlice.ts:58-71`
+- checkKey 调用点：`packages/loot-core/src/server/sync/reset.ts:13-22`
+- 前端模态框触发：`packages/desktop-client/src/app/appSlice.ts:58-71`
 
 ---
 
-#### 两条路径的传播差异对比
+#### 两条路径的核心差异对比
 
-| 维度 | /sync 路径 | resetSync checkKey 路径 |
-|-----|-----------|------------------------|
-| **触发时机** | 日常同步 | 用户点击 Upload 按钮 |
-| **验证位置** | 服务端 validation.js | 客户端 cloud-storage.ts |
-| **错误类型** | PostError（由 throw 产生） | 返回值 { error }（无 throw） |
-| **传播机制** | sync event 事件 | thunk 返回值 |
+| 对比维度 | 路径一：/sync 同步请求 | 路径二：resetSync checkKey |
+|---------|----------------------|---------------------------|
+| **触发时机** | 日常同步（被动） | 用户点击 Upload（主动） |
+| **验证位置** | 服务端 `validation.js` | 客户端 `cloud-storage.ts` |
+| **触发 API** | `/sync` | `/user-get-key` |
+| **错误类型** | `PostError`（throw 抛出） | 返回值 `{ error }`（无 throw） |
+| **传播机制** | `sync` event 事件 | Redux thunk 返回值 |
 | **前端 UI** | 通知条（notification） | 模态框（modal） |
-| **用户操作** | Revert / Upload | 修复密钥 / 创建密钥 |
+| **用户操作选项** | Revert / Upload | 修复密钥 / 创建密钥 |
+| **错误语义** | 同步失败，需要用户决策 | 上传前预检失败，需要先修复密钥 |
+
+> 💡 **设计意图**：路径一是同步过程中的被动检测，提示用户同步已中断；路径二是上传前的主动预检，防止用户用错误密钥加密的文件覆盖服务器。
 
 ---
 
