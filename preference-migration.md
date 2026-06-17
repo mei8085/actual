@@ -328,15 +328,16 @@ COMMIT;
 
 | 原始 value 值 | 匹配条件 | 规整后 value | 说明 |
 |--------------|----------|-------------|------|
-| `'report'` | `id='budgetType' AND value='report'` | `'tracking'` | 旧术语 `report` → 新术语 `tracking` |
-| 任意其他值（含 NULL、空字符串、`'envelope'`、乱码等） | `ELSE` 分支 | `'envelope'` | 全部降级为默认值 |
+| `'report'` | `id='budgetType' AND value='report'` | `'tracking'` | 旧术语 `report` 重命名为新术语 `tracking` |
+| 任意其他值（含 `'envelope'`、`'tracking'`、NULL、空字符串、乱码等） | `ELSE` 分支 | `'envelope'` | 统一设为默认值 |
 
-> **⚠️ 关键注意**：CASE WHEN 的 `ELSE` 分支过于激进——连合法的 `'tracking'` 值也会被覆盖为 `'envelope'`。这是因为迁移执行时 `preferences` 表中 `id='budgetType'` 的行一定存在（1723665565000 迁移已插入），但 UPDATE 语句不区分"合法的 tracking"和"非法的其他值"。
+> **⚠️ 关键注意**：CASE WHEN 只有 `WHEN value = 'report'` 这一个显式分支，ELSE 把**所有其他值**（包括合法的 `'tracking'`）都覆写为 `'envelope'`。这并非"把非法值规整到 envelope"，而是"只保留 report→tracking 的语义映射，其余一律归零到 envelope"。迁移执行时 `preferences` 表中 `id='budgetType'` 的行一定存在（1723665565000 迁移已插入），所以该行一定会被 UPDATE 命中。
 
 **为什么这个迁移在生产环境是安全的？**
-- 该迁移发布时，`'tracking'` 这个新值还没有在用户数据库中广泛出现
-- 绝大多数用户仍使用默认的 `'envelope'`，少数用户使用旧的 `'report'`
-- 即使用户已升级到 `'tracking'`，被错改回 `'envelope'` 也不会导致数据损坏，只是需要用户在设置中切回
+- 该迁移发布时，`'tracking'` 这个新值还没有在用户数据库中广泛出现——因为 `'tracking'` 就是本迁移引入的术语
+- 迁移前用户数据库中只存在 `'envelope'` 和 `'report'` 两种值
+- `report` → `tracking` 是语义映射，`envelope` → `envelope` 是幂等写入，两者都正确
+- 即使用户在迁移发布前已经手动存了 `'tracking'`，被改回 `'envelope'` 也不会导致数据损坏，只是需要用户在设置中切回
 
 ### 3.6 迁移脚本 #3：CSV 跳过行偏好 key 改名（ID: 1762178745667）
 
