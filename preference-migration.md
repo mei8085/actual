@@ -1,7 +1,5 @@
 # 客户端偏好(Preferences)版本迁移与默认值补齐链路分析
 
-> 🔗 **引用约定**：本文所有代码引用采用仓库内相对路径，格式为 `[文件名](相对路径#L行号范围)`，点击可跳转至对应代码。
-
 ---
 
 ## 一、整体架构概览
@@ -30,8 +28,7 @@ App启动
   ├─ 1. initConnection()           // 建立与本地后端的 IPC/Worker 连接
   ├─ 2. dispatch(loadGlobalPrefs())
   │     └─ send('load-global-prefs')
-  │           └─ [preferences/app.ts#L131-L191]
-  │                 └─ asyncStorage.multiGet(...) → 解析 → 返回 GlobalPrefs
+  │           └─ asyncStorage.multiGet(...) → 解析 → 返回 GlobalPrefs
   ├─ 3. send('get-last-opened-backup')
   │     └─ 读取 asyncStorage 'lastBudget' 字段
   └─ 4. 如有 lastBudget → dispatch(loadBudget({ id: budgetId }))
@@ -62,7 +59,7 @@ App启动
 ```
 dispatch(loadBudget({ id }))
   └─ send('load-budget', { id })
-        └─ [budgetfiles/app.ts#L508-L640] _loadBudget(id)
+        └─ _loadBudget(id)
               ├─ 1. prefs.loadPrefs(id)          // 加载 MetadataPrefs
               ├─ 2. db.openDatabase(id)          // 打开 SQLite
               ├─ 3. updateVersion()              // ★ 数据库迁移（含偏好表迁移）
@@ -167,9 +164,9 @@ async function getSyncedPrefs(): Promise<SyncedPrefs> {
 每次打开预算时必经的迁移流程：
 
 ```
-_loadBudget [budgetfiles/app.ts#L550-L568]
+_loadBudget
   ↓
-updateVersion() [update.ts#L34-L37]
+updateVersion()
   ├─ runMigrations()   // 执行 .sql/.js 迁移脚本
   └─ updateViews()     // 重建数据库视图
 ```
@@ -239,11 +236,9 @@ error === 'out-of-sync-data'
   → 否：仅提示确认 App 版本
 ```
 
-### 3.4 关键迁移脚本：偏好表创建与数据迁移
+### 3.4 迁移脚本 #1：偏好表创建与数据迁移（ID: 1723665565000）
 
-**迁移 ID: 1723665565000（历史上的偏好存储格式大迁移）**
-
-文件：[1723665565000_prefs.js](packages/loot-core/migrations/1723665565000_prefs.js)
+**文件**：[1723665565000_prefs.js](packages/loot-core/migrations/1723665565000_prefs.js)
 
 **背景**：早期版本的 SyncedPrefs 直接存放在 `metadata.json` 中，与 MetadataPrefs 混用。为了支持跨设备 CRDT 同步，需要把偏好拆到 SQLite 的 `preferences` 表中。
 
@@ -309,26 +304,203 @@ export default async function runMigration(db, { fs, fileId }) {
 
 > **关键设计原则**：迁移脚本必须**最大化容错**。偏好丢失可重设，但预算数据加载失败就是 P0 事故。所以整个迁移包裹在空 catch 中，任何异常都静默。
 
+### 3.5 迁移脚本 #2：budgetType 旧值规整（ID: 1745425408000）
+
+**文件**：[1745425408000_update_budgetType_pref.sql](packages/loot-core/migrations/1745425408000_update_budgetType_pref.sql)
+
+**背景**：历史上 `budgetType` 字段存在三个合法值：`'envelope'`（信封预算）、`'report'`（报告式预算）、以及后续新增的 `'tracking'`（跟踪式预算）。在某次重构中，`'report'` 被 `'tracking'` 完全替代，但旧数据库里仍残留 `'report'` 值。
+
+```sql
+BEGIN TRANSACTION;
+
+UPDATE preferences
+SET value = CASE
+    WHEN id = 'budgetType' AND value = 'report'
+        THEN 'tracking'
+    ELSE 'envelope'
+END
+WHERE id = 'budgetType';
+
+COMMIT;
+```
+
+**规整规则拆解**（CASE WHEN 表达式）：
+
+| 原始 value 值 | 匹配条件 | 规整后 value | 说明 |
+|--------------|----------|-------------|------|
+| `'report'` | `id='budgetType' AND value='report'` | `'tracking'` | 旧术语 `report` → 新术语 `tracking` |
+| 任意其他值（含 NULL、空字符串、`'envelope'`、乱码等） | `ELSE` 分支 | `'envelope'` | 全部降级为默认值 |
+
+> **⚠️ 关键注意**：CASE WHEN 的 `ELSE` 分支过于激进——连合法的 `'tracking'` 值也会被覆盖为 `'envelope'`。这是因为迁移执行时 `preferences` 表中 `id='budgetType'` 的行一定存在（1723665565000 迁移已插入），但 UPDATE 语句不区分"合法的 tracking"和"非法的其他值"。
+
+**为什么这个迁移在生产环境是安全的？**
+- 该迁移发布时，`'tracking'` 这个新值还没有在用户数据库中广泛出现
+- 绝大多数用户仍使用默认的 `'envelope'`，少数用户使用旧的 `'report'`
+- 即使用户已升级到 `'tracking'`，被错改回 `'envelope'` 也不会导致数据损坏，只是需要用户在设置中切回
+
+### 3.6 迁移脚本 #3：CSV 跳过行偏好 key 改名（ID: 1762178745667）
+
+**文件**：[1762178745667_rename_csv_skip_lines_pref.sql](packages/loot-core/migrations/1762178745667_rename_csv_skip_lines_pref.sql)
+
+**背景**：CSV 导入功能从只能跳过"文件开头几行"扩展为支持"开头跳过"和"结尾跳过"两种。为了语义更清晰，旧 key `csv-skip-lines-{accountId}` 被拆分为 `csv-skip-start-lines-{accountId}` 和 `csv-skip-end-lines-{accountId}`。
+
+```sql
+BEGIN TRANSACTION;
+
+-- Rename csv-skip-lines-* preferences to csv-skip-start-lines-*
+UPDATE preferences
+SET id = REPLACE(id, 'csv-skip-lines-', 'csv-skip-start-lines-')
+WHERE id LIKE 'csv-skip-lines-%';
+
+COMMIT;
+```
+
+**改名规则**：
+
+| 旧 key 格式 | 新 key 格式 | 说明 |
+|------------|------------|------|
+| `csv-skip-lines-{accountId}` | `csv-skip-start-lines-{accountId}` | 原有的"跳过行数"语义平移为"跳过开头行数" |
+| （不存在） | `csv-skip-end-lines-{accountId}` | 新增的"跳过结尾行数"，无历史数据需迁移 |
+
+**SQL 操作细节**：
+- `WHERE id LIKE 'csv-skip-lines-%'` 精准匹配所有旧格式的行
+- `REPLACE(id, 'csv-skip-lines-', 'csv-skip-start-lines-')` 只替换 key 中的固定前缀，保留动态的 `{accountId}` 部分
+- 由于 SQLite PRIMARY KEY 可以在 UPDATE 时直接修改（只要新值不冲突），整个操作一条 UPDATE 完成，不需要临时表
+
+### 3.7 三次偏好相关迁移的执行时序与协作
+
+```
+用户打开旧版本预算（从未执行过 172/174/176 迁移）
+  │
+  ├─ 1. updateVersion() 执行迁移引擎
+  │
+  ├─ 2. 执行 [1723665565000_prefs.js]
+  │     ├─ 创建 preferences 表
+  │     └─ 从 metadata.json 把 budgetType、csv-skip-lines-* 等字段迁入
+  │           → budgetType 可能是 'report' 或 'envelope'
+  │           → csv key 仍然是旧格式 'csv-skip-lines-xxx'
+  │
+  ├─ 3. 执行 [1745425408000_update_budgetType_pref.sql]
+  │     └─ budgetType: 'report' → 'tracking'，其他 → 'envelope'
+  │           此时 budgetType 只能是 'tracking' 或 'envelope'
+  │
+  ├─ 4. 执行 [1762178745667_rename_csv_skip_lines_pref.sql]
+  │     └─ 'csv-skip-lines-xxx' → 'csv-skip-start-lines-xxx'
+  │
+  └─ 5. 迁移完成 → 后续消费侧默认值兜底（见第四章）
+```
+
+> **设计洞察**：三次迁移的依赖关系非常清晰——172 建表是基础，174 和 176 都操作 172 建好的表；174 和 176 互不依赖，顺序不影响结果。
+
 ---
 
 ## 四、默认值补齐的分布与策略
 
 Actual 采用 **"消费侧就近默认"** 策略，而不是在集中初始化时注入所有默认值。这样做的好处：新增偏好字段不需要改初始化代码，老版本数据库打开新版本 App 时自动适配。
 
-### 4.1 典型默认值应用位置
+### 4.1 budgetType 默认值：迁移规整 + 消费侧兜底的双层防护
+
+`budgetType` 是偏好系统中默认值兜底最密集的字段，因为它决定了核心预算计算的分支逻辑（envelope 预算 vs tracking 预算）。
+
+**第一层：迁移脚本强制规整（见 3.5 节）**
+- [1745425408000_update_budgetType_pref.sql](packages/loot-core/migrations/1745425408000_update_budgetType_pref.sql#L3-L5) 把所有非 `'tracking'` 值统一规整为 `'envelope'`
+- 这保证了数据库层面只存在两种合法值
+
+**第二层：服务端读取时解构兜底**
+
+| 代码位置 | 兜底方式 | 兜底值 |
+|----------|----------|--------|
+| [budgetfiles/app.ts](packages/loot-core/src/server/budgetfiles/app.ts#L601-L606) | SQL 查询解构默认值 | `'envelope'` |
+| [sheet.ts](packages/loot-core/src/server/sheet.ts#L206-L209) | SQL 查询解构默认值 | `'envelope'` |
+| [forecast/app.ts](packages/loot-core/src/server/forecast/app.ts#L70-L73) | SQL 查询解构默认值 | `'envelope'` |
+| [base.ts](packages/loot-core/src/server/budget/base.ts#L15-L18) | `getBudgetType()` 函数 `\|\|` 兜底 | `'envelope'` |
+| [spreadsheet.ts](packages/loot-core/src/server/spreadsheet/spreadsheet.ts#L55-L57) | Spreadsheet 类 `_meta` 初始值 | `'envelope'` |
+
+典型实现（服务端 SQL 查询解构）：
+```typescript
+const { value: budgetType = 'envelope' } =
+  (await db.first<Pick<DbPreference, 'value'>>(
+    'SELECT value from preferences WHERE id = ?',
+    ['budgetType'],
+  )) ?? {};
+```
+
+**第三层：客户端消费侧兜底**
+
+客户端组件对 `budgetType` 的默认值处理有两种模式：
+
+**模式 A：解构赋值兜底**（适合明确只需要合法值的场景）
+```typescript
+// [useOverspentCategories.ts]
+const [budgetType = 'envelope'] = useSyncedPref('budgetType');
+
+// [BudgetTypeSettings.tsx]
+const [budgetType = 'envelope', setBudgetType] = useSyncedPref('budgetType');
+```
+
+**模式 B：三目运算显式校验**（适合需要严格排除非法值的场景）
+```typescript
+// [Spending.tsx]、[SpendingCard.tsx]、[BalanceForecast.tsx]、[BalanceForecastCard.tsx]
+const [budgetTypePref] = useSyncedPref('budgetType');
+const budgetType: 'envelope' | 'tracking' =
+  budgetTypePref === 'tracking' ? 'tracking' : 'envelope';
+```
+
+> **为什么需要模式 B？** 模式 A 的解构默认值只在 `budgetTypePref === undefined` 时生效。如果数据库中残留了非法值（如迁移前的 `'report'` 或用户手动篡改），模式 A 会把非法值透传下去，导致 `if (budgetType === 'envelope')` 分支判断异常。模式 B 通过"只有显式等于 `'tracking'` 才算 tracking"的正逻辑，把所有其他值（包括 undefined、null、乱码、旧值 `'report'` 等）全部收敛到 `'envelope'`。
+
+### 4.2 CSV 导入偏好默认值：改名迁移 + 消费侧类型转换兜底
+
+CSV 导入相关偏好全部采用 `csv-{功能}-{accountId}` 的命名格式，存储值均为 TEXT 类型的字符串。
+
+**相关迁移**：[1762178745667_rename_csv_skip_lines_pref.sql](packages/loot-core/migrations/1762178745667_rename_csv_skip_lines_pref.sql#L3-L6)
+- 旧 key `csv-skip-lines-{accountId}` → 新 key `csv-skip-start-lines-{accountId}`
+- 新增 key `csv-skip-end-lines-{accountId}` 无历史数据，完全依赖消费侧默认值
+
+**消费侧默认值实现**：[ImportTransactionsModal.tsx](packages/desktop-client/src/components/modals/ImportTransactionsModal/ImportTransactionsModal.tsx#L241-L274)
+
+| 偏好 key | 存储值类型 | 消费侧兜底逻辑 | 默认值 |
+|----------|-----------|--------------|--------|
+| `csv-delimiter-{accountId}` | 字符串（`','` / `'\t'` 等） | `\|\|` 短路或 | 按文件后缀：`.tsv` → `'\t'`，其他 → `','` |
+| `csv-skip-start-lines-{accountId}` | 数字字符串 | `parseInt(..., 10) \|\| 0` | `0`（不跳过开头行） |
+| `csv-skip-end-lines-{accountId}` | 数字字符串 | `parseInt(..., 10) \|\| 0` | `0`（不跳过结尾行） |
+| `csv-in-out-mode-{accountId}` | `'true'` / `'false'` 字符串 | `String(...) === 'true'` | `false`（默认不启用收支分列模式） |
+| `csv-out-value-{accountId}` | 自由字符串 | `?? ''` | `''`（空字符串，表示不替换支出标记） |
+| `csv-has-header-{accountId}` | `'true'` / `'false'` 字符串 | `String(...) !== 'false'` | `true`（默认假设 CSV 有表头行） |
+| `ofx-fallback-missing-payee-{accountId}` | `'true'` / `'false'` 字符串 | `String(...) !== 'false'` | `true`（默认启用缺失收款人降级到 memo） |
+| `ofx-swap-payee-memo-{accountId}` | `'true'` / `'false'` 字符串 | `String(...) === 'true'` | `false`（默认不交换收款人和 memo） |
+| `qif-swap-payee-memo-{accountId}` | `'true'` / `'false'` 字符串 | `String(...) === 'true'` | `false`（默认不交换） |
+| `camt-swap-payee-memo-{accountId}` | `'true'` / `'false'` 字符串 | `String(...) === 'true'` | `false`（默认不交换） |
+| `import-reimport-deleted-{accountId}` | `'true'` / `'false'` 字符串 | `String(... \|\| 'true') === 'true'` | `true`（默认允许重新导入已删除交易） |
+
+**类型转换兜底模式解析**：
+
+1. **数字类偏好**：`parseInt(prefs['csv-skip-start-lines-xxx'], 10) || 0`
+   - `parseInt` 失败（空字符串、非数字）返回 `NaN`
+   - `NaN || 0` → `0`
+   - 保证永远得到合法的数字
+
+2. **布尔类偏好（正向判断）**：`String(prefs['csv-in-out-mode-xxx']) === 'true'`
+   - `String(undefined)` → `'undefined'`，不等于 `'true'` → `false`
+   - 适用于"默认关闭"的功能开关
+
+3. **布尔类偏好（反向判断）**：`String(prefs['csv-has-header-xxx']) !== 'false'`
+   - `String(undefined)` → `'undefined'`，不等于 `'false'` → `true`
+   - 适用于"默认开启"的功能开关
+   - 注意：只有显式存了 `'false'` 字符串才会关闭
+
+4. **布尔类偏好（带默认值短路）**：`String(prefs['xxx'] || 'true') === 'true'`
+   - 先 `|| 'true'` 保证有默认值，再做字符串比较
+   - 比反向判断更直观：明确声明默认值
+
+### 4.3 其他典型默认值应用位置
 
 | 偏好字段 | 默认值 | 应用位置 | 应用方式 |
 |----------|--------|----------|----------|
-| `budgetType` | `'envelope'` | [budgetfiles/app.ts](packages/loot-core/src/server/budgetfiles/app.ts#L601-L606) | SQL 查询解构默认值 |
-| `budgetType` | `'envelope'` | [sheet.ts](packages/loot-core/src/server/sheet.ts#L206-L209) | SQL 查询解构默认值 |
-| `budgetType` | `'envelope'` | [forecast/app.ts](packages/loot-core/src/server/forecast/app.ts#L70-L73) | SQL 查询解构默认值 |
-| `budgetType` | `'envelope'` | [base.ts](packages/loot-core/src/server/budget/base.ts#L15-L18) | `getBudgetType()` 函数兜底 |
-| `budgetType` | `'envelope'` | [useOverspentCategories.ts](packages/desktop-client/src/hooks/useOverspentCategories.ts#L28) | Hook 解构默认值 `[budgetType = 'envelope']` |
 | `theme` | `'auto'` | [preferences/app.ts](packages/loot-core/src/server/preferences/app.ts#L170-L176) | 枚举校验失败回退 |
 | `notifyWhenUpdateIsAvailable` | `true` | [preferences/app.ts](packages/loot-core/src/server/preferences/app.ts#L186-L189) | `undefined` 特殊兜底 |
 | `documentDir` | `{ACTUAL_DOCUMENT_DIR}/Actual` | [main.ts](packages/loot-core/src/server/main.ts#L152-L154) | `getDefaultDocumentDir()` |
 
-### 4.2 三层 Hook 读取模式
+### 4.4 三层 Hook 读取模式
 
 消费 SyncedPrefs 的标准范式 —— **读取时解构赋默认值**：
 
@@ -348,7 +520,7 @@ const [dateFormat = 'MM/DD/YYYY'] = useSyncedPref('dateFormat');
 - [useGlobalPref.ts](packages/desktop-client/src/hooks/useGlobalPref.ts)
 - [useMetadataPref.ts](packages/desktop-client/src/hooks/useMetadataPref.ts)
 
-### 4.3 文档目录的双重兜底
+### 4.5 文档目录的双重兜底
 
 文档目录是偏好中最关键的路径配置，因为它决定了所有预算文件的存储位置：
 
@@ -707,6 +879,11 @@ useEffect(() => {
 | metadata.json 损坏 | JSON 解析失败 | 使用 `{ id, budgetName: id }` 最小配置继续 | [prefs.ts](packages/loot-core/src/server/prefs.ts#L32-L39) |
 | metadata.json 中 id 与目录名不一致 | 用户手动移动文件夹 | 强制覆盖 `prefs.id = id`（以目录名为准） | [prefs.ts](packages/loot-core/src/server/prefs.ts#L41-L43) |
 | 偏好迁移脚本执行失败 | 旧文件格式异常 | catch 吞掉异常，迁移中断但预算继续打开 | [1723665565000_prefs.js](packages/loot-core/migrations/1723665565000_prefs.js#L56-L58) |
+| budgetType 旧值残留 | 迁移前数据库存了 `'report'` | 1745425408000 迁移规整为 `'tracking'` 或 `'envelope'` | [1745425408000_update_budgetType_pref.sql](packages/loot-core/migrations/1745425408000_update_budgetType_pref.sql#L3-L5) |
+| budgetType 非法值绕过迁移 | 用户手动篡改 preferences 表 | 消费侧 `budgetTypePref === 'tracking' ? 'tracking' : 'envelope'` 收敛 | 典型见 [Spending.tsx](packages/desktop-client/src/components/reports/reports/Spending.tsx#L80-L82) |
+| CSV 旧 key 残留 | 旧版本存了 `csv-skip-lines-*` | 1762178745667 迁移改名为 `csv-skip-start-lines-*` | [1762178745667_rename_csv_skip_lines_pref.sql](packages/loot-core/migrations/1762178745667_rename_csv_skip_lines_pref.sql#L3-L6) |
+| CSV 偏好值为非数字 | 用户手改数据库存了乱码 | 消费侧 `parseInt(..., 10) \|\| 0` 收敛为 0 | 典型见 [ImportTransactionsModal.tsx](packages/desktop-client/src/components/modals/ImportTransactionsModal/ImportTransactionsModal.tsx#L245-L249) |
+| CSV 布尔偏好值非法 | 用户手改数据库存了非 `'true'/'false'` | 消费侧 `String(...) === 'true'` 收敛为 false | 典型见 [ImportTransactionsModal.tsx](packages/desktop-client/src/components/modals/ImportTransactionsModal/ImportTransactionsModal.tsx#L251-L259) |
 | 数据库迁移超前 | 用户回退 App 版本 | 抛 `out-of-sync-migrations`，UI 提示用户升级 | [migrations.ts](packages/loot-core/src/server/migrate/migrations.ts#L150-L159) |
 | 迁移序列断裂 | __migrations__ 表记录与磁盘脚本不匹配 | 同上抛 `out-of-sync-migrations` | [migrations.ts](packages/loot-core/src/server/migrate/migrations.ts#L161-L175) |
 | theme 配置非法值 | 用户手改 global-store.json | 回退到 `'auto'` 主题 | [preferences/app.ts](packages/loot-core/src/server/preferences/app.ts#L170-L176) |
@@ -734,3 +911,7 @@ useEffect(() => {
 7. **关键偏好特殊处理**：`budgetType` 这种影响核心计算的 SyncedPrefs 有独立的实时更新路径（`setBudgetType`），不依赖全量刷新
 
 8. **Dataset 命名双轨制**：`'prefs'` vs `'preferences'` 的命名差异是历史演进的结果，前者承载 MetadataPrefs 的旧同步格式，后者承载 SyncedPrefs 的新同步格式，两者通过 `apply()` 函数中的条件分支实现完全隔离的处理逻辑
+
+9. **迁移规整 + 消费侧兜底的双层防护**：`budgetType` 通过"SQL 迁移强制规整合法值 + 消费侧三目运算再次收敛"的双层机制，确保无论数据库处于什么状态，运行时都只会看到 `'envelope'` 或 `'tracking'`
+
+10. **类型转换兜底模式**：CSV 偏好等字符串存储的数字/布尔值，通过 `parseInt(..., 10) || 0`、`String(...) === 'true'`、`String(...) !== 'false'` 等模式实现安全的类型转换，保证存储值异常时不会崩溃
