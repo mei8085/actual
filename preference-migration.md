@@ -382,8 +382,8 @@ COMMIT;
   │           → csv key 仍然是旧格式 'csv-skip-lines-xxx'
   │
   ├─ 3. 执行 [1745425408000_update_budgetType_pref.sql]
-  │     └─ budgetType: 'report' → 'tracking'，其他 → 'envelope'
-  │           此时 budgetType 只能是 'tracking' 或 'envelope'
+  │     └─ budgetType: 'report' → 'tracking'，其余值（含 'envelope'）→ 'envelope'
+  │           迁移后 budgetType 为 'tracking' 或 'envelope'
   │
   ├─ 4. 执行 [1762178745667_rename_csv_skip_lines_pref.sql]
   │     └─ 'csv-skip-lines-xxx' → 'csv-skip-start-lines-xxx'
@@ -399,25 +399,30 @@ COMMIT;
 
 Actual 采用 **"消费侧就近默认"** 策略，而不是在集中初始化时注入所有默认值。这样做的好处：新增偏好字段不需要改初始化代码，老版本数据库打开新版本 App 时自动适配。
 
-### 4.1 budgetType 默认值：迁移规整 + 消费侧兜底的双层防护
+### 4.1 budgetType 的四层防护：各自的覆盖范围不同
 
-`budgetType` 是偏好系统中默认值兜底最密集的字段，因为它决定了核心预算计算的分支逻辑（envelope 预算 vs tracking 预算）。
+`budgetType` 是偏好系统中默认值兜底最密集的字段，因为它决定了核心预算计算的分支逻辑（envelope 预算 vs tracking 预算）。代码中存在**四种不同的防护机制**，它们的作用时机和覆盖范围各不相同，不能笼统地说"运行时一定收敛"。
 
-**第一层：迁移脚本强制规整（见 3.5 节）**
-- [1745425408000_update_budgetType_pref.sql](packages/loot-core/migrations/1745425408000_update_budgetType_pref.sql#L3-L5) 把所有非 `'tracking'` 值统一规整为 `'envelope'`
-- 这保证了数据库层面只存在两种合法值
+#### 第一层：一次性迁移规整
 
-**第二层：服务端读取时解构兜底**
+[1745425408000_update_budgetType_pref.sql](packages/loot-core/migrations/1745425408000_update_budgetType_pref.sql#L3-L5) 在版本升级时执行一次：`report` → `tracking`，其余值（含 `envelope`、`tracking`、NULL、乱码等）→ `envelope`。
 
-| 代码位置 | 兜底方式 | 兜底值 |
+- **作用时机**：仅版本升级时执行一次
+- **覆盖范围**：数据库中 `preferences` 表的 `budgetType` 行
+- **无法覆盖的场景**：迁移已执行过的数据库不会再跑；用户事后手动篡改数据库写入非法值；迁移脚本自身被 catch 吞掉（1723665565000 的异常兜底）导致 preferences 表不存在
+- **副作用**：ELSE 分支会把合法的 `'tracking'` 也覆写为 `'envelope'`（见 3.5 节分析）
+
+#### 第二层：服务端 SQL 查询解构默认值
+
+| 代码位置 | 代码模式 | 兜底值 |
 |----------|----------|--------|
-| [budgetfiles/app.ts](packages/loot-core/src/server/budgetfiles/app.ts#L601-L606) | SQL 查询解构默认值 | `'envelope'` |
-| [sheet.ts](packages/loot-core/src/server/sheet.ts#L206-L209) | SQL 查询解构默认值 | `'envelope'` |
-| [forecast/app.ts](packages/loot-core/src/server/forecast/app.ts#L70-L73) | SQL 查询解构默认值 | `'envelope'` |
-| [base.ts](packages/loot-core/src/server/budget/base.ts#L15-L18) | `getBudgetType()` 函数 `\|\|` 兜底 | `'envelope'` |
-| [spreadsheet.ts](packages/loot-core/src/server/spreadsheet/spreadsheet.ts#L55-L57) | Spreadsheet 类 `_meta` 初始值 | `'envelope'` |
+| [budgetfiles/app.ts](packages/loot-core/src/server/budgetfiles/app.ts#L601-L606) | `const { value: budgetType = 'envelope' } = db.first(...) ?? {}` | `'envelope'` |
+| [sheet.ts](packages/loot-core/src/server/sheet.ts#L206-L209) | `const { value: budgetType = 'envelope' } = db.first(...) ?? {}` | `'envelope'` |
+| [forecast/app.ts](packages/loot-core/src/server/forecast/app.ts#L70-L73) | `const { value: budgetType = 'envelope' } = db.first(...) ?? {}` | `'envelope'` |
+| [base.ts](packages/loot-core/src/server/budget/base.ts#L15-L18) | `return meta.budgetType \|\| 'envelope'` | `'envelope'` |
+| [spreadsheet.ts](packages/loot-core/src/server/spreadsheet/spreadsheet.ts#L55-L57) | `this._meta = { budgetType: 'envelope' }` | `'envelope'` |
 
-典型实现（服务端 SQL 查询解构）：
+典型实现：
 ```typescript
 const { value: budgetType = 'envelope' } =
   (await db.first<Pick<DbPreference, 'value'>>(
@@ -426,20 +431,13 @@ const { value: budgetType = 'envelope' } =
   )) ?? {};
 ```
 
-**第三层：客户端消费侧兜底**
+- **作用时机**：每次打开预算或 spreadsheet 加载时
+- **覆盖范围**：仅当 `preferences` 表中不存在 `id='budgetType'` 的行（`db.first` 返回 `null`），或该行的 `value` 列为 `NULL`（解构赋值到 `{ value: null }`，`null ?? 'envelope'` 仍不触发默认值，但 `{ value: undefined }` 或 `{}` 会触发）
+- **无法覆盖的场景**：行存在且 `value` 为非空非法字符串（如 `'report'`、`'foobar'`），解构默认值不会生效，非法值会被原样透传
+- **关键限制**：这是**缺失兜底**而非**非法值校验**，它只管"没读到值"的情况
 
-客户端组件对 `budgetType` 的默认值处理有两种模式：
+#### 第三层：客户端显式校验（三目运算白名单）
 
-**模式 A：解构赋值兜底**（适合明确只需要合法值的场景）
-```typescript
-// [useOverspentCategories.ts]
-const [budgetType = 'envelope'] = useSyncedPref('budgetType');
-
-// [BudgetTypeSettings.tsx]
-const [budgetType = 'envelope', setBudgetType] = useSyncedPref('budgetType');
-```
-
-**模式 B：三目运算显式校验**（适合需要严格排除非法值的场景）
 ```typescript
 // [Spending.tsx]、[SpendingCard.tsx]、[BalanceForecast.tsx]、[BalanceForecastCard.tsx]
 const [budgetTypePref] = useSyncedPref('budgetType');
@@ -447,7 +445,40 @@ const budgetType: 'envelope' | 'tracking' =
   budgetTypePref === 'tracking' ? 'tracking' : 'envelope';
 ```
 
-> **为什么需要模式 B？** 模式 A 的解构默认值只在 `budgetTypePref === undefined` 时生效。如果数据库中残留了非法值（如迁移前的 `'report'` 或用户手动篡改），模式 A 会把非法值透传下去，导致 `if (budgetType === 'envelope')` 分支判断异常。模式 B 通过"只有显式等于 `'tracking'` 才算 tracking"的正逻辑，把所有其他值（包括 undefined、null、乱码、旧值 `'report'` 等）全部收敛到 `'envelope'`。
+- **作用时机**：组件渲染时，持续生效
+- **覆盖范围**：**全覆盖**——无论数据库存了什么值（`undefined`、`'report'`、`'foobar'`、甚至空字符串），只要不是显式等于 `'tracking'`，一律收敛到 `'envelope'`
+- **覆盖不了的场景**：服务端代码路径（预算计算、forecast 等）不经过客户端组件，显式校验对服务端无效
+- **本质**：这是唯一能做到"运行时对非法值收敛"的层级，但**仅限客户端渲染路径**
+
+#### 第四层：客户端普通解构默认值
+
+```typescript
+// [useOverspentCategories.ts]
+const [budgetType = 'envelope'] = useSyncedPref('budgetType');
+
+// [BudgetTypeSettings.tsx]
+const [budgetType = 'envelope', setBudgetType] = useSyncedPref('budgetType');
+
+// [CustomReport.tsx]、[GetCardData.tsx]
+const [budgetType = 'envelope'] = useSyncedPref('budgetType');
+```
+
+- **作用时机**：组件渲染时，持续生效
+- **覆盖范围**：仅当 Redux store 中 `prefs.synced.budgetType === undefined`（即该 key 从未被设置过）
+- **无法覆盖的场景**：`budgetType` 为非 `undefined` 的非法值时，解构默认值不触发，非法值被原样透传
+- **与第三层的区别**：第三层是显式校验（只认 `'tracking'`），第四层是缺失兜底（只防 `undefined`）
+
+#### 四层防护的覆盖范围对比
+
+| 非法值场景 | 迁移规整 | 服务端默认值 | 客户端显式校验 | 客户端解构默认值 |
+|-----------|---------|------------|--------------|----------------|
+| `budgetType` 行不存在 | ❌（表不存在时迁移也可能失败） | ✅ `db.first` 返回 null | ✅ `undefined !== 'tracking'` → `envelope` | ✅ `undefined` 触发默认值 |
+| `budgetType` 值为 `NULL` | ❌（迁移只执行一次） | ⚠️ 取决于解构写法（`null ?? 'envelope'` 不生效） | ✅ `null !== 'tracking'` → `envelope` | ❌ `null` 不触发默认值 |
+| `budgetType` 值为 `'report'` | ✅（迁移执行时转为 `tracking`） | ❌ 原样透传 | ✅ `'report' !== 'tracking'` → `envelope` | ❌ `'report'` 不触发默认值 |
+| `budgetType` 值为乱码 | ❌（迁移已执行过） | ❌ 原样透传 | ✅ 乱码 `!== 'tracking'` → `envelope` | ❌ 乱码不触发默认值 |
+| `budgetType` 值为 `tracking` | ❌（ELSE 分支覆写为 `envelope`） | ✅ 原样透传 | ✅ `'tracking' === 'tracking'` → `tracking` | ✅ `'tracking'` 原样使用 |
+
+> **核心结论**：只有客户端显式校验（第三层）能做到"运行时对非法值收敛"。服务端代码路径（预算计算、spreadsheet 等）没有等价的显式校验——它们依赖迁移规整和缺失兜底，对"行存在但值为非法字符串"的场景**不会自动收敛**。因此迁移脚本的一次性规整对服务端路径至关重要，如果迁移被跳过或数据库被事后篡改，服务端可能拿到非法值。
 
 ### 4.2 CSV 导入偏好默认值：改名迁移 + 消费侧类型转换兜底
 
